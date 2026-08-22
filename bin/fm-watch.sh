@@ -79,6 +79,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 mkdir -p "$STATE"
 
+FLOWY_COMPLETION_OUTBOX="$SCRIPT_DIR/fm-completion-outbox.sh"
+
 # The native event fast-path and only its true dependencies have one narrow
 # production owner. The Herdr event-wait smoke test consumes this same owner
 # without sourcing the entire watcher graph.
@@ -971,6 +973,17 @@ while :; do
   # No conversation scraping; unresolved records are never silently expired.
   fm_pending_reply_tick "$STATE" || true
 
+  # Flowy completion delivery is a durable outbox, so retrying belongs on EVERY
+  # pass rather than on the status signal that first recorded a result. The
+  # signal path below only records; a POST that failed there (or in an earlier
+  # watcher generation, or before a restart) is retried from here until it gets
+  # a 2xx, which is why advancing the seen marker after one attempt can no
+  # longer strand a captain-visible result. It is a no-op with nothing pending.
+  if [ -x "$FLOWY_COMPLETION_OUTBOX" ]; then
+    FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$FLOWY_COMPLETION_OUTBOX" --drain \
+      || triage_log "Flowy completion outbox has undelivered results"
+  fi
+
   # Process-to-event liveness repair. This never discovers a result by polling:
   # each registered source has its own child blocking on that source, and this
   # only republishes results already captured durably and restarts a source
@@ -1084,6 +1097,27 @@ while :; do
 $pending
 EOF
     reason="signal:$files"
+    # Record every terminal result this signal carries into the durable Flowy
+    # outbox BEFORE the triage below advances the seen markers. Recording is a
+    # local write that cannot fail on the network, and the per-pass drain above
+    # owns getting it delivered, so a result is never lost to one bad POST.
+    flowy_result_files=""
+    while IFS=$(printf '\t') read -r sf sig f; do
+      [ -n "$sf" ] || continue
+      case "$f" in "$STATE"/*.status) ;; *) continue ;; esac
+      case " $flowy_result_files " in *" $f "*) continue ;; esac
+      case "$(last_status_line "$f")" in
+        done:*|failed:*|blocked:*|needs-decision:*)
+          flowy_result_files="$flowy_result_files $f"
+          if [ -x "$FLOWY_COMPLETION_OUTBOX" ]; then
+            FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$FLOWY_COMPLETION_OUTBOX" --status "$f" \
+              || triage_log "Flowy completion outbox has undelivered results for $(basename "$f")"
+          fi
+          ;;
+      esac
+    done <<EOF
+$pending
+EOF
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
     #   - the away-mode daemon owns triage (afk) and wants every wake;
     #   - any status file carries a captain-relevant verb;

@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+# Durably deliver a captain-visible crew result to Flowy.
+#
+# Usage:
+#   fm-completion-outbox.sh --status STATUS_FILE [--dry-run]
+#   fm-completion-outbox.sh --drain [--dry-run]
+#
+# Delivery is a two-stage durable outbox, never one best-effort POST.
+#
+# RECORD (--status). Only the final non-empty status line is considered, and
+# only done:, failed:, blocked:, and needs-decision: are results; anything else
+# is a silent no-op. A result becomes an immutable record at
+# state/flowy-outbox/pending/<task>.<digest> BEFORE any network call, where
+# <digest> covers the result line. Re-recording an identical result is a no-op,
+# and a second distinct result for the same task gets its own record, so no
+# result can overwrite another. --status then drains.
+#
+# DRAIN (--drain, and implicitly after --status). Every pending record is
+# POSTed as JSON to the URL in config/grok-flowy-webhook, authenticated with the
+# Keychain Bearer key for service firstmate-flowy-webhook. No environment
+# variable configures the endpoint. A record retires ONLY on HTTP 2xx, at which
+# point its per-record receipt is written to
+# state/flowy-outbox/delivered/<task>.<digest>.md. Any other outcome - a non-2xx
+# code, a transport failure, a missing URL file, an unavailable key - leaves the
+# record pending, so the next drain retries it and delivery state survives a
+# restart. A receipt therefore never exists without a 2xx.
+#
+# state/flowy-last.md is refreshed after a delivery as an aggregate DISPLAY
+# snapshot and is never delivery authority. Its pending: line lists the task ids
+# whose results are still undelivered, or (none).
+#
+# --dry-run reports what it would record and send and writes nothing at all: no
+# record, no receipt, no aggregate snapshot, and no network or Keychain call.
+#
+# Exit 0 when nothing is left pending, 1 when a record is still pending or the
+# run could not complete, 2 on usage.
+set -eu
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
+
+# The portable lock helpers are the repo's one owner of dead-owner takeover, so
+# a drain killed mid-POST cannot wedge every later delivery behind its lock.
+# shellcheck source=bin/fm-wake-lib.sh
+. "$SCRIPT_DIR/fm-wake-lib.sh"
+
+OUTBOX="$STATE/flowy-outbox"
+PENDING_DIR="$OUTBOX/pending"
+DELIVERED_DIR="$OUTBOX/delivered"
+DRAIN_LOCK="$OUTBOX/.drain.lock"
+SNAPSHOT="$STATE/flowy-last.md"
+WEBHOOK_FILE="$CONFIG/grok-flowy-webhook"
+KEYCHAIN_SERVICE=firstmate-flowy-webhook
+KEYCHAIN_ACCOUNT=flowy
+HTTP_TIMEOUT=${FM_FLOWY_HTTP_TIMEOUT:-20}
+
+usage() {
+  echo "usage: fm-completion-outbox.sh --status STATUS_FILE [--dry-run]" >&2
+  echo "       fm-completion-outbox.sh --drain [--dry-run]" >&2
+  exit 2
+}
+
+# The header comment above is this script's full contract, so --help prints it
+# rather than a second copy that could drift from it.
+help() {
+  sed -n '2,/^set -eu$/p' "${BASH_SOURCE[0]}" | sed -e '$d' -e 's/^# \{0,1\}//'
+  exit 0
+}
+
+note() { echo "fm-completion-outbox: $*" >&2; }
+
+status_file=
+mode=
+dry_run=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --status)
+      [ "$#" -ge 2 ] || usage
+      [ -z "$mode" ] || usage
+      mode=status
+      status_file=$2
+      shift 2
+      ;;
+    --drain)
+      [ -z "$mode" ] || usage
+      mode=drain
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help) help ;;
+    *) usage ;;
+  esac
+done
+[ -n "$mode" ] || usage
+
+digest_of() {  # <text>
+  local sum
+  if command -v shasum >/dev/null 2>&1; then
+    sum=$(printf '%s' "$1" | shasum -a 256) || return 1
+  else
+    sum=$(printf '%s' "$1" | sha256sum) || return 1
+  fi
+  printf '%s' "${sum%% *}" | cut -c1-12
+}
+
+# A record field may contain '=' or a tab, so each is read by stripping its own
+# key prefix rather than by splitting the line.
+record_field() {  # <record> <key>
+  sed -n "s/^$2=//p" "$1" | head -n 1
+}
+
+# Prefer a durable deliverable the captain can open over the status log itself,
+# and keep the path home-relative so no fixture or private absolute path is
+# published to Flowy.
+artifact_for() {  # <task> <status-file>
+  if [ -f "$FM_HOME/data/$1/report.md" ]; then
+    printf 'data/%s/report.md' "$1"
+  else
+    printf '%s' "${2#"$FM_HOME"/}"
+  fi
+}
+
+pending_records() {
+  local record
+  for record in "$PENDING_DIR"/*; do
+    [ -f "$record" ] || continue
+    printf '%s\n' "$record"
+  done
+}
+
+pending_task_ids() {
+  local record ids="" task
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    task=$(record_field "$record" task)
+    [ -n "$task" ] || continue
+    case " $ids " in *" $task "*) continue ;; esac
+    ids="$ids $task"
+  done <<EOF
+$(pending_records)
+EOF
+  if [ -z "$ids" ]; then
+    printf '(none)'
+  else
+    printf '%s' "${ids# }" | tr ' ' ','
+  fi
+}
+
+record_result() {  # <status-file>
+  local file=$1 result task digest record artifact tmp
+  [ -f "$file" ] && [ ! -L "$file" ] || {
+    note "status file is unavailable or unsafe: $file"
+    return 1
+  }
+  case "$file" in
+    "$STATE"/*.status) ;;
+    *)
+      note "status file is outside state: $file"
+      return 1
+      ;;
+  esac
+
+  result=$(awk 'NF { line=$0 } END { print line }' "$file")
+  case "$result" in
+    done:*|failed:*|blocked:*|needs-decision:*) ;;
+    *) return 0 ;;
+  esac
+
+  task=$(basename "$file" .status)
+  digest=$(digest_of "$result") || {
+    note "cannot digest the result for $task"
+    return 1
+  }
+  record="$PENDING_DIR/$task.$digest"
+  artifact=$(artifact_for "$task" "$file")
+
+  if [ "$dry_run" -eq 1 ]; then
+    printf 'DRY RUN: would record %s result for %s (%s)\n' "${result%%:*}" "$task" "$artifact" >&2
+    return 0
+  fi
+
+  mkdir -p "$PENDING_DIR" "$DELIVERED_DIR"
+  # Immutable: an existing record or an existing receipt for this exact result
+  # is already the durable truth, and rewriting either would reopen the
+  # overwrite hole this outbox exists to close.
+  if [ -e "$record" ] || [ -e "$DELIVERED_DIR/$task.$digest.md" ]; then
+    return 0
+  fi
+  tmp=$(umask 077; mktemp "$PENDING_DIR/.record.XXXXXX") || {
+    note "cannot create a pending record for $task"
+    return 1
+  }
+  {
+    printf 'task=%s\n' "$task"
+    printf 'digest=%s\n' "$digest"
+    printf 'recorded=%s\n' "$(date +%s)"
+    printf 'artifact=%s\n' "$artifact"
+    printf 'status=%s\n' "$file"
+    printf 'result=%s\n' "$result"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$record"
+}
+
+webhook_url() {
+  local url
+  [ -r "$WEBHOOK_FILE" ] || {
+    note "missing Flowy webhook URL at $WEBHOOK_FILE"
+    return 1
+  }
+  url=$(tr -d '\r\n' < "$WEBHOOK_FILE")
+  case "$url" in
+    https://*|http://*) printf '%s' "$url" ;;
+    *)
+      note "Flowy webhook URL is invalid"
+      return 1
+      ;;
+  esac
+}
+
+# Never printed, never written to state, never recorded in a receipt.
+webhook_key() {
+  local key
+  key=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$KEYCHAIN_ACCOUNT" -w 2>/dev/null || true)
+  # The account-qualified entry is the documented one; the same service without
+  # an account is the older entry and is read only when that is absent.
+  [ -n "$key" ] || key=$(security find-generic-password -s "$KEYCHAIN_SERVICE" -w 2>/dev/null || true)
+  [ -n "$key" ] || {
+    note "Flowy webhook key is unavailable"
+    return 1
+  }
+  printf '%s' "$key"
+}
+
+# Set by deliver_record on success so the aggregate snapshot describes the last
+# result that actually reached Flowy, never one that merely reached disk.
+DELIVERED_TASK=
+DELIVERED_RESULT=
+DELIVERED_ARTIFACT=
+
+deliver_record() {  # <record> <url> <key>
+  local record=$1 url=$2 key=$3 base task digest result artifact recorded payload code receipt tmp
+  base=$(basename "$record")
+  task=$(record_field "$record" task)
+  digest=$(record_field "$record" digest)
+  result=$(record_field "$record" result)
+  artifact=$(record_field "$record" artifact)
+  recorded=$(record_field "$record" recorded)
+  if [ -z "$task" ] || [ -z "$result" ]; then
+    note "pending record is unreadable and was left in place: $record"
+    return 1
+  fi
+  receipt="$DELIVERED_DIR/$base.md"
+  # A crash between writing the receipt and retiring the record must not re-POST
+  # an already-delivered result.
+  if [ -f "$receipt" ]; then
+    rm -f "$record"
+    DELIVERED_TASK=$task
+    DELIVERED_RESULT=$result
+    DELIVERED_ARTIFACT=$artifact
+    return 0
+  fi
+
+  payload=$(jq -cn \
+    --arg source flowy-completion-outbox \
+    --arg event result \
+    --arg task "$task" \
+    --arg digest "$digest" \
+    --arg result "$result" \
+    --arg artifact "$artifact" \
+    --arg recorded "$recorded" \
+    '{source:$source,event:$event,task:$task,digest:$digest,result:$result,artifact:$artifact,recorded:$recorded}') || {
+    note "cannot build the payload for $task"
+    return 1
+  }
+
+  code=$(printf '%s' "$payload" | curl --silent --show-error --max-time "$HTTP_TIMEOUT" \
+    --output /dev/null --write-out '%{http_code}' \
+    --request POST "$url" \
+    --header "Authorization: Bearer $key" \
+    --header 'Content-Type: application/json' \
+    --data-binary @-) || code=
+  case "$code" in
+    2??) ;;
+    *)
+      note "Flowy webhook returned ${code:-no response} for $task; result stays pending"
+      return 1
+      ;;
+  esac
+
+  tmp=$(umask 077; mktemp "$DELIVERED_DIR/.receipt.XXXXXX") || {
+    note "delivered $task but cannot write its receipt"
+    return 1
+  }
+  {
+    printf 'FM->Flowy\n'
+    printf 'files: %s\n' "$artifact"
+    printf 'status: %s: %s\n' "$task" "$result"
+    printf 'delivered: HTTP %s\n' "$code"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$receipt"
+  rm -f "$record"
+  DELIVERED_TASK=$task
+  DELIVERED_RESULT=$result
+  DELIVERED_ARTIFACT=$artifact
+}
+
+write_snapshot() {  # <task> <result> <artifact>
+  local task=$1 result=$2 artifact=$3 tmp
+  tmp=$(umask 077; mktemp "$STATE/.flowy-last.XXXXXX") || {
+    note "cannot refresh the display snapshot"
+    return 1
+  }
+  {
+    printf 'FM->Flowy\n'
+    # Heartbeat state is the Flowy ACK gate's fact, not this script's. The line
+    # is carried through unchanged from the snapshot's existing shape.
+    printf 'HEARTBEAT: OFF (Captain ACK)\n'
+    printf 'files: %s\n' "$artifact"
+    printf 'status: %s: %s\n' "$task" "$result"
+    printf 'pending: %s\n' "$(pending_task_ids)"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$SNAPSHOT"
+}
+
+drain() {
+  local records record url key delivered=0 remaining=0 rc=0
+
+  records=$(pending_records)
+  [ -n "$records" ] || return 0
+
+  if [ "$dry_run" -eq 1 ]; then
+    while IFS= read -r record; do
+      [ -n "$record" ] || continue
+      printf 'DRY RUN: would POST %s\n' "$(basename "$record")" >&2
+    done <<EOF
+$records
+EOF
+    return 0
+  fi
+
+  # One drain at a time, so two passes cannot both POST the same record.
+  if ! fm_lock_try_acquire "$DRAIN_LOCK"; then
+    note "another drain holds the outbox lock; results stay pending"
+    return 1
+  fi
+  trap 'fm_lock_release "$DRAIN_LOCK"' EXIT
+
+  # Re-read under the lock so this pass sees every record written since the
+  # cheap pre-lock check, including one a concurrent recorder just landed.
+  records=$(pending_records)
+
+  url=$(webhook_url) || rc=1
+  if [ "$rc" -eq 0 ]; then
+    key=$(webhook_key) || rc=1
+  fi
+  if [ "$rc" -ne 0 ]; then
+    fm_lock_release "$DRAIN_LOCK"
+    trap - EXIT
+    return 1
+  fi
+
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    [ -f "$record" ] || continue
+    if deliver_record "$record" "$url" "$key"; then
+      delivered=$((delivered + 1))
+    else
+      remaining=$((remaining + 1))
+    fi
+  done <<EOF
+$records
+EOF
+
+  if [ "$delivered" -gt 0 ]; then
+    write_snapshot "$DELIVERED_TASK" "$DELIVERED_RESULT" "$DELIVERED_ARTIFACT" || rc=1
+  fi
+  [ "$remaining" -eq 0 ] || rc=1
+
+  fm_lock_release "$DRAIN_LOCK"
+  trap - EXIT
+  return "$rc"
+}
+
+rc=0
+if [ "$mode" = status ]; then
+  record_result "$status_file" || rc=1
+fi
+drain || rc=1
+exit "$rc"
