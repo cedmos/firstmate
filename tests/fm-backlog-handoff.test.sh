@@ -280,22 +280,25 @@ SH
   assert_present "$home/state/.backlog-handoff-design.wake-pending" \
     "post-move crash lost receiver wake intent"
   prepared_state=$(cat "$home/state/.backlog-handoff-design.wake-pending")
-  cat > "$sub/data/backlog.md" <<'EOF'
+  cat > "$home/data/backlog.md" <<'EOF'
 ## Queued
-- [ ] crash-item - survive the post-move crash (repo: alpha)
-- [ ] unrelated-ready - already durable from another handoff (repo: alpha)
+- [ ] unrelated-move - still waiting in the main backlog (repo: alpha)
 
 ## Done
 EOF
   rc=0
-  FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design unrelated-ready \
+  FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design unrelated-move \
     > "$TMP_ROOT/move-crash-unrelated.out" 2>&1 || rc=$?
-  [ "$rc" -ne 0 ] || fail "unrelated handoff discarded a post-move prepared wake"
+  [ "$rc" -ne 0 ] || fail "unrelated moving handoff discarded a post-move prepared wake"
   assert_contains "$(cat "$TMP_ROOT/move-crash-unrelated.out")" \
     'belongs to a different routed batch' \
     "unrelated handoff did not surface the unresolved prepared batch"
   [ "$(cat "$home/state/.backlog-handoff-design.wake-pending")" = "$prepared_state" ] \
-    || fail "unrelated handoff changed the post-move prepared wake"
+    || fail "unrelated moving handoff changed the post-move prepared wake"
+  assert_grep 'unrelated-move' "$home/data/backlog.md" \
+    "unrelated moving handoff changed its source item before resolving the older wake"
+  assert_no_grep 'unrelated-move' "$sub/data/backlog.md" \
+    "unrelated moving handoff moved work despite the unresolved older wake"
 
   : > "$TMP_ROOT/default-tmux.log"
   FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design crash-item \

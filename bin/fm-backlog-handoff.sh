@@ -844,7 +844,11 @@ fi
 WAKE_PENDING_MARKER="$STATE/.backlog-handoff-$ID.wake-pending"
 if [ -e "$WAKE_PENDING_MARKER" ] || [ -L "$WAKE_PENDING_MARKER" ]; then
   case "$(cat "$WAKE_PENDING_MARKER" 2>/dev/null || true)" in
-    prepared:*) receiver_wake_discard_prepared "$ID" || exit 1 ;;
+    prepared:*:"$REQUESTED_BATCH") receiver_wake_discard_prepared "$ID" || exit 1 ;;
+    prepared:*)
+      echo "error: a prepared receiver wake for secondmate $ID belongs to a different routed batch; retry that original handoff before moving ${TO_MOVE[*]}" >&2
+      exit 1
+      ;;
     *)
       wake_pending_secondmate_receiver "$ID" || {
         echo "error: previous receiver wake for secondmate $ID is unresolved; nothing new was moved" >&2
