@@ -413,7 +413,7 @@ export default function (pi: ExtensionAPI) {
   function enqueueWake(message: string): void {
     branchChain = branchChain
       .then(async () => {
-        if (shuttingDown) return;
+        if (shuttingDown) throw new Error("supervision session shut down before handling the accepted wake");
         const session = await ensureBranch();
         await flushMirror(session);
         await session.prompt(
@@ -421,7 +421,6 @@ export default function (pi: ExtensionAPI) {
         );
       })
       .catch((error: unknown) => {
-        if (shuttingDown) return;
         fallbackToMain(message, error instanceof Error ? error.message : String(error));
       });
   }

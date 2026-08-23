@@ -39,6 +39,21 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 mkdir -p "$STATE"
 
+if [ "${FM_LEASE_SERIALIZED:-}" != 1 ]; then
+  exec python3 -c '
+import fcntl
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.set_inheritable(fd, True)
+env = dict(os.environ)
+env["FM_LEASE_SERIALIZED"] = "1"
+os.execvpe(sys.argv[2], sys.argv[2:], env)
+' "$STATE/.fm-lease.lock" "$0" "$@"
+fi
+
 usage() {
   echo "usage: fm-lease.sh claim|release <task> [--actor main|branch] | check <task> | sweep" >&2
   exit 2

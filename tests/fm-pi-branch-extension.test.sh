@@ -92,6 +92,12 @@ export async function createAgentSession(options) {
     async prompt(text) {
       session.ops.push({ kind: "prompt", text });
       (globalThis.__fmPrompts ??= []).push(text);
+      if (globalThis.__fmBlockPrompt) {
+        await new Promise((resolve, reject) => {
+          session.resolvePrompt = resolve;
+          session.rejectPrompt = reject;
+        });
+      }
     },
     async sendCustomMessage(message, opts) {
       session.ops.push({ kind: "custom", message, opts });
@@ -99,6 +105,8 @@ export async function createAgentSession(options) {
     },
     dispose() {
       session.disposed = true;
+      session.rejectPrompt?.(new Error("stub session disposed"));
+      session.rejectPrompt = null;
     },
   };
   (globalThis.__fmSessions ??= []).push(session);
@@ -439,6 +447,37 @@ EOF
   pass "branch gating (config, afk) binds and a broken branch falls back to main"
 }
 
+test_accepted_wakes_fall_back_during_shutdown() {
+  local repo home out status
+  repo="$TMP_ROOT/shutdown-root"
+  home="$TMP_ROOT/shutdown-home"
+  mkdir -p "$home/state" "$home/config"
+  install_pi_branch_extension_fixture "$repo"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, mainUserMessages }; })()`);
+const { fire, dispatch, settle, mainUserMessages } = globalThis.__t;
+globalThis.__fmBlockPrompt = true;
+if (!dispatch("signal: active during shutdown").accepted) throw new Error("active wake was not accepted");
+if (!dispatch("signal: queued during shutdown").accepted) throw new Error("queued wake was not accepted");
+await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "active branch prompt");
+fire("session_shutdown");
+await settle(() => mainUserMessages.length === 2, "shutdown fallbacks");
+const delivered = mainUserMessages.map((item) => item.content).join("\n");
+if (!delivered.includes("signal: active during shutdown")) throw new Error("active accepted wake was lost");
+if (!delivered.includes("signal: queued during shutdown")) throw new Error("queued accepted wake was lost");
+if (mainUserMessages.some((item) => item.options.deliverAs !== "followUp")) {
+  throw new Error("shutdown fallback must deliver as a follow-up");
+}
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "accepted wakes must fall back during session shutdown: $out"
+  pass "accepted active and queued wakes fall back to main during session shutdown"
+}
+
 test_branch_mirror_filters_order_and_cursor() {
   local repo home out status
   repo="$TMP_ROOT/mirror-root"
@@ -561,5 +600,6 @@ EOF
 test_branch_dispatch_two_stage_filter_and_prefix_contract
 test_branch_cache_key_is_per_home_stable
 test_branch_gating_config_afk_and_fallback
+test_accepted_wakes_fall_back_during_shutdown
 test_branch_mirror_filters_order_and_cursor
 test_branch_session_persists_across_process_restarts

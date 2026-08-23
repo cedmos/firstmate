@@ -14,8 +14,8 @@
 # CONTRACT.
 #   - Lease file: $STATE/.lease-<task>, one line "<actor>\t<pid>\t<epoch>".
 #     Written atomically (temp + ln for claim, temp + mv for a same-actor
-#     refresh); a claim races only against the sibling actor in the same pi
-#     process, never against another firstmate home.
+#     refresh). Lease commands in one home serialize through the advisory
+#     state/.fm-lease.lock before inspecting or changing any lease.
 #   - Actors: exactly "main" and "branch". The current actor is
 #     $FM_SUPERVISION_ACTOR when set, else "main". The branch's shell gets
 #     FM_SUPERVISION_ACTOR=branch injected deterministically by the Pi branch
@@ -31,8 +31,9 @@
 #     recovery path.
 #   - Guard semantics (fm_lease_guard): no lease, a same-actor lease, or a
 #     provably stale lease passes; a live lease held by the OTHER actor
-#     refuses with exit FM_LEASE_REFUSE_EXIT. A home that never runs the Pi
-#     branch never has lease files and never sets FM_SUPERVISION_ACTOR, so the
+#     refuses with exit FM_LEASE_REFUSE_EXIT. Stale records are removed by a
+#     claim or session-start sweep. A home that never runs the Pi branch never
+#     has lease files and never sets FM_SUPERVISION_ACTOR, so the
 #     guard is a no-op there - non-Pi behavior is unchanged by construction.
 #   - Role partition (fm_lease_forbid_branch): actions MAIN alone owns -
 #     merging a PR, landing local-only work, spawning workers - refuse the
@@ -128,7 +129,7 @@ fm_lease_guard() {
   local task=$1 action=$2 actor
   fm_lease_valid_id "$task" || return 0
   actor=$(fm_lease_actor) || exit "$FM_LEASE_REFUSE_EXIT"
-  fm_lease_live "$task" || { fm_lease_clear_stale "$task"; return 0; }
+  fm_lease_live "$task" || return 0
   [ "$FM_LEASE_ACTOR" != "$actor" ] || return 0
   echo "error: $action refused - task '$task' is leased to the $FM_LEASE_ACTOR supervision actor (state/.lease-$task); retry after it releases, or clear a wedged lease with bin/fm-lease.sh release $task --actor $FM_LEASE_ACTOR" >&2
   exit "$FM_LEASE_REFUSE_EXIT"

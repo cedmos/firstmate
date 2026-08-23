@@ -125,6 +125,29 @@ test_lease_exclusivity_release_stale_and_sweep() {
   FM_HOME="$home" FM_SUPERVISION_ACTOR=branch FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim task-1 \
     || fail "same-actor refresh was refused"
 
+  for round in $(seq 1 12); do
+    task="race-$round"
+    (FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim "$task" --actor main \
+      >"$home/main-$round.out" 2>&1; echo $? >"$home/main-$round.status") &
+    main_pid=$!
+    (FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim "$task" --actor branch \
+      >"$home/branch-$round.out" 2>&1; echo $? >"$home/branch-$round.status") &
+    branch_pid=$!
+    wait "$main_pid" "$branch_pid"
+    main_status=$(cat "$home/main-$round.status")
+    branch_status=$(cat "$home/branch-$round.status")
+    case "$main_status:$branch_status" in
+      0:6|6:0) ;;
+      *) fail "concurrent claims did not produce one winner for $task: main=$main_status branch=$branch_status" ;;
+    esac
+    out=$(FM_HOME="$home" "$ROOT/bin/fm-lease.sh" check "$task") || fail "concurrent winner left no lease for $task"
+    case "$main_status:$out" in
+      0:"main "*) ;;
+      6:"branch "*) ;;
+      *) fail "lease holder disagreed with the concurrent winner for $task: $out" ;;
+    esac
+  done
+
   # Release by holder name; release of an unheld lease stays a silent no-op.
   FM_HOME="$home" "$ROOT/bin/fm-lease.sh" release task-1 --actor branch || fail "release failed"
   FM_HOME="$home" "$ROOT/bin/fm-lease.sh" check task-1 >/dev/null && fail "released lease still reported"
