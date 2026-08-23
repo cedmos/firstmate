@@ -948,8 +948,19 @@ flowy_run_bounded_drain() {  # <bound-seconds>
 # a blackholed endpoint - or several records answering 503 slowly - can never
 # push the poll loop past its own interval and delay the next signal scan.
 flowy_drain_bound() {
-  local bound=${FM_FLOWY_DRAIN_SECONDS:-}
-  [ -n "$bound" ] || bound=$((POLL * 2 / 3))
+  local bound=${FM_FLOWY_DRAIN_SECONDS:-} whole
+  if [ -z "$bound" ]; then
+    # FM_POLL is a documented knob that accepts fractional seconds, and an
+    # arithmetic expansion on one is an expansion ERROR: bash abandons the rest
+    # of this function, so the caller gets an EMPTY ceiling and the guards below
+    # never run. An empty bound makes the deadline the current second, and the
+    # drain is torn down before it can POST anything. So derive the ceiling from
+    # POLL's whole-second part; any sub-second poll lands on the same one-second
+    # floor that POLL=1 already gets.
+    whole=${POLL%%.*}
+    case "$whole" in ''|*[!0-9]*) whole=0 ;; esac
+    bound=$((whole * 2 / 3))
+  fi
   case "$bound" in ''|*[!0-9]*) bound=1 ;; esac
   [ "$bound" -ge 1 ] || bound=1
   printf '%s' "$bound"

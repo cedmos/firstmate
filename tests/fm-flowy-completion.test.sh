@@ -713,6 +713,41 @@ test_a_hung_endpoint_cannot_stall_the_poll_loop() {
   pass "a hung endpoint cannot stall the poll loop past the per-pass drain's ceiling"
 }
 
+# FM_POLL is a documented knob that takes fractional seconds, and this repo's own
+# suite runs watchers at FM_POLL=0.2. With no ceiling configured the watcher
+# derives one from POLL, so a fractional poll must still leave the per-pass drain
+# enough room to POST rather than tearing it down before it reaches the endpoint.
+test_a_fractional_poll_still_drains_pending_records() {
+  local home rc pid receipt= i=0
+  home=$(make_home fractional-poll)
+  status_line "$home" queued 'done: fractional poll result'
+  rc=$(outbox "$home" --status "$home/state/queued.status" --no-drain)
+  expect_code 0 "$rc" "recording the queued result failed"
+  [ "$(pending_count "$home")" = 1 ] || fail "nothing was left pending for the drain to deliver"
+
+  # With the status file gone the watcher observes no terminal signal, so nothing
+  # records and nothing detaches a drain. The per-pass drain is then the only
+  # thing that can deliver this record.
+  rm -f "$home/state/queued.status"
+
+  start_watcher "$home" FM_POLL=0.2 FM_FLOWY_DRAIN_SECONDS=
+  pid=$!
+  while [ "$i" -lt 300 ]; do
+    receipt=$(sole_receipt "$home")
+    [ -z "$receipt" ] || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  [ -n "$receipt" ] || fail "a fractional FM_POLL left the per-pass drain unable to deliver"
+  assert_contains "$(cat "$receipt")" "status: queued: done: fractional poll result" \
+    "the per-pass drain delivered the wrong result"
+  [ "$(pending_count "$home")" = 0 ] || fail "the delivered result stayed pending"
+  pass "a fractional FM_POLL still leaves the per-pass drain a usable ceiling"
+}
+
 test_delivers_from_url_file_and_keychain_with_no_env_var
 test_the_bearer_key_never_reaches_the_process_table
 test_failed_post_retries_to_success_after_a_restart
@@ -734,3 +769,4 @@ test_watcher_retries_a_failed_delivery_on_a_later_pass
 test_watcher_delivers_the_result_it_recorded_without_a_second_generation
 test_a_hung_endpoint_never_delays_the_watcher_exit
 test_a_hung_endpoint_cannot_stall_the_poll_loop
+test_a_fractional_poll_still_drains_pending_records
