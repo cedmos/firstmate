@@ -556,6 +556,11 @@ else
       PENDING_REPLY_CREATED=1
     fi
     fm_pending_reply_embed_corr "$MESSAGE" "$PENDING_REPLY_CORR" MESSAGE
+    if [ "$PENDING_REPLY_CREATED" != 1 ] \
+      && fm_pending_reply_delivery_attempt_unresolved "$STATE" "$PENDING_REPLY_CORR"; then
+      echo "error: pending-reply delivery for $TARGET_TASK_ID is unresolved; refusing to resend correlation $PENDING_REPLY_CORR" >&2
+      exit 1
+    fi
     if ! fm_pending_reply_prepare_delivery "$STATE" "$PENDING_REPLY_CORR"; then
       [ "$PENDING_REPLY_CREATED" != 1 ] \
         || fm_pending_reply_discard_undelivered "$STATE" "$PENDING_REPLY_CORR" || true

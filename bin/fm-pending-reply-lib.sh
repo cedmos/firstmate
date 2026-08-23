@@ -412,6 +412,19 @@ fm_pending_reply_reconcile_delivery() {  # <state-dir> <corr_id>
   return 1
 }
 
+fm_pending_reply_delivery_attempt_unresolved() {  # <state-dir> <corr_id>
+  local state=$1 corr=$2 rec delivered marker entry
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  [ -f "$rec" ] && [ ! -L "$rec" ] || return 1
+  delivered=$(fm_pending_reply_get "$rec" delivered_epoch)
+  [ -z "$delivered" ] || return 1
+  marker=$(fm_pending_reply_delivery_confirmation_path "$state" "$corr")
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  entry=$(cat "$marker" 2>/dev/null || true)
+  case "$entry" in attempted=*) return 0 ;; esac
+  return 1
+}
+
 fm_pending_reply_reset_known_undelivered() {  # <state-dir> <corr_id>
   local state=$1 corr=$2 rec delivered phase marker entry
   rec=$(fm_pending_reply_path "$state" "$corr")

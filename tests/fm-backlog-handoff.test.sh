@@ -274,6 +274,52 @@ SH
   pass "a post-confirmation crash reconciles delivery without resending"
 }
 
+test_unresolved_delivery_attempt_refuses_immediate_resend() {
+  local home="$TMP_ROOT/attempt-crash-main" sub="$TMP_ROOT/attempt-crash-sub"
+  local fakebin="$TMP_ROOT/attempt-crash-fakebin" real_mv rc=0 wake_count out
+  setup_homes "$home" "$sub"
+  mkdir -p "$sub/data" "$fakebin"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] attempt-crash - do not resend an unresolved delivery (repo: alpha)
+
+## Done
+EOF
+  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  real_mv=$(command -v mv)
+  cat > "$fakebin/mv" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [ -f "$arg" ] && grep -q '^confirmed=' "$arg" 2>/dev/null; then
+    kill -KILL "$PPID"
+    exit 1
+  fi
+done
+exec "$FM_REAL_MV" "$@"
+SH
+  chmod +x "$fakebin/mv"
+  : > "$TMP_ROOT/default-tmux.log"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_REAL_MV="$real_mv" FM_HOME="$home" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design attempt-crash \
+    > "$TMP_ROOT/attempt-crash.out" 2>&1
+  rc=$?
+  set +e
+  [ "$rc" -ne 0 ] || fail "unresolved-attempt crash fixture unexpectedly reported success"
+  wake_count=$(grep -cF 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log")
+  [ "$wake_count" -eq 1 ] || fail "unresolved-attempt crash did not deliver exactly one receiver wake"
+
+  rc=0
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design attempt-crash 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "immediate retry resent or accepted an unresolved delivery attempt"
+  assert_contains "$out" 'delivery for design is unresolved; refusing to resend correlation' \
+    "immediate retry did not report the unresolved delivery boundary"
+  [ "$(grep -cF 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log")" -eq "$wake_count" ] \
+    || fail "immediate retry duplicated the unresolved receiver wake"
+  pass "an unresolved delivery attempt refuses an immediate duplicate wake"
+}
+
 test_concurrent_local_handoffs_serialize_move_and_wake() {
   local home="$TMP_ROOT/concurrent-main" sub="$TMP_ROOT/concurrent-sub"
   local basebin blockbin="$TMP_ROOT/concurrent-blockbin" first second i wake_count
@@ -1015,6 +1061,7 @@ test_failed_wake_retries_when_the_item_is_already_present
 test_known_receiver_failure_remains_retryable_after_grace
 test_move_crash_keeps_wake_pending_for_recovery
 test_delivery_confirmation_crash_does_not_resend
+test_unresolved_delivery_attempt_refuses_immediate_resend
 test_concurrent_local_handoffs_serialize_move_and_wake
 test_local_teardown_waits_for_handoff_wake
 test_body_moves_when_followed_by_another_item
