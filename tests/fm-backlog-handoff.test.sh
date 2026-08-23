@@ -173,6 +173,73 @@ SH
   pass "a known receiver failure stays retryable after reconciliation grace"
 }
 
+test_known_failure_restores_retry_after_reconciliation_race() {
+  local home="$TMP_ROOT/reconcile-race-main" sub="$TMP_ROOT/reconcile-race-sub"
+  local basebin blockbin="$TMP_ROOT/reconcile-race-block" handoff i corr phase
+  setup_homes "$home" "$sub"
+  mkdir -p "$sub/data" "$blockbin"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] reconcile-race - retry after concurrent reconciliation (repo: alpha)
+
+## Done
+EOF
+  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  basebin=$(make_fake_tmux "$TMP_ROOT/reconcile-race-fake")
+  cat > "$blockbin/tmux" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = send-keys ]; then
+  touch "$FM_RECONCILE_RACE_ENTERED"
+  while [ ! -f "$FM_RECONCILE_RACE_RELEASE" ]; do sleep 0.02; done
+  exit 1
+fi
+exec "$FM_BASE_TMUX" "$@"
+SH
+  chmod +x "$blockbin/tmux"
+
+  PATH="$blockbin:$basebin:$PATH" FM_BASE_TMUX="$basebin/tmux" FM_HOME="$home" \
+    FM_RECONCILE_RACE_ENTERED="$TMP_ROOT/reconcile-race.entered" \
+    FM_RECONCILE_RACE_RELEASE="$TMP_ROOT/reconcile-race.release" \
+    FM_FAKE_TMUX_WINDOW='firstmate:fm-design' \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/reconcile-race-tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/reconcile-race-fake/pane.txt" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design reconcile-race \
+    > "$TMP_ROOT/reconcile-race.out" 2>&1 &
+  handoff=$!
+  i=0
+  while [ ! -f "$TMP_ROOT/reconcile-race.entered" ]; do
+    kill -0 "$handoff" 2>/dev/null || fail "reconciliation-race handoff exited before backend delivery"
+    i=$((i + 1))
+    [ "$i" -le 250 ] || fail "reconciliation-race handoff never reached backend delivery"
+    sleep 0.02
+  done
+  corr=$(cut -d: -f2- "$home/state/.backlog-handoff-design.wake-pending")
+  FM_PENDING_REPLY_NOW=9999999999 bash -c '
+    . "$1"
+    fm_pending_reply_reconcile_delivery "$2" "$3"
+  ' _ "$ROOT/bin/fm-pending-reply-lib.sh" "$home/state" "$corr" \
+    || fail "concurrent watcher fixture did not reconcile the aged attempt"
+  phase=$(sed -n 's/^phase=//p' "$home/state/pending-replies/$corr")
+  [ "$phase" = delivery_unknown ] || fail "aged in-flight attempt did not become delivery_unknown"
+  touch "$TMP_ROOT/reconcile-race.release"
+  if wait "$handoff"; then
+    fail "known backend failure after reconciliation reported success"
+  fi
+  phase=$(sed -n 's/^phase=//p' "$home/state/pending-replies/$corr")
+  [ "$phase" = awaiting_report ] \
+    || fail "known backend failure did not restore retryable phase after reconciliation"
+  assert_absent "$home/state/pending-replies/.delivery-confirmed-$corr" \
+    "known backend failure retained its aged attempted marker"
+
+  : > "$TMP_ROOT/default-tmux.log"
+  FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design reconcile-race \
+    > "$TMP_ROOT/reconcile-race-retry.out" 2>&1 \
+    || fail "reconciliation-race handoff did not retry: $(cat "$TMP_ROOT/reconcile-race-retry.out")"
+  assert_grep 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log" \
+    "reconciliation-race retry did not wake the receiver"
+  pass "known failure restores retryability after concurrent reconciliation"
+}
+
 test_move_crash_keeps_wake_pending_for_recovery() {
   local home="$TMP_ROOT/move-crash-main" sub="$TMP_ROOT/move-crash-sub"
   local fakebin="$TMP_ROOT/move-crash-fakebin" real_tasks rc=0
@@ -1059,6 +1126,7 @@ EOF
 test_handoff_wakes_live_local_receiver
 test_failed_wake_retries_when_the_item_is_already_present
 test_known_receiver_failure_remains_retryable_after_grace
+test_known_failure_restores_retry_after_reconciliation_race
 test_move_crash_keeps_wake_pending_for_recovery
 test_delivery_confirmation_crash_does_not_resend
 test_unresolved_delivery_attempt_refuses_immediate_resend
