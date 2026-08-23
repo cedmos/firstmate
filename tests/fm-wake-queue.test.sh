@@ -355,6 +355,51 @@ test_acknowledged_stall_publication_survives_pre_marker_crash() {
   pass "stall publication acknowledgement closes the pre-marker crash window"
 }
 
+test_empty_prefix_mate_preserves_other_mate_receipt() {
+  local dir state empty stalled fakebin epoch row_before round
+  dir=$(make_case secondmate-prefix-receipt)
+  state="$dir/state"
+  empty="$dir/ios"
+  stalled="$dir/ios-ui"
+  mkdir -p "$empty/state" "$stalled/state"
+  printf 'ios\n' > "$empty/.fm-secondmate-home"
+  printf 'ios-ui\n' > "$stalled/.fm-secondmate-home"
+  printf 'window=firstmate:fm-ios\nkind=secondmate\nhome=%s\n' "$empty" > "$state/ios.meta"
+  printf 'window=firstmate:fm-ios-ui\nkind=secondmate\nhome=%s\n' "$stalled" > "$state/ios-ui.meta"
+  : > "$empty/state/.wake-queue"
+  epoch=$(( $(date +%s) - 10 ))
+  printf '%s\t9\tcheck\trouted\tcheck: routed row\n' "$epoch" > "$stalled/state/.wake-queue"
+  row_before="$dir/foreign-before"
+  cp "$stalled/state/.wake-queue" "$row_before"
+  append_wake "$state" check "secondmate-wake-loop-ios-ui-$epoch-9" \
+    "check: secondmate wake-loop stalled: mate=ios-ui row=9 age=10s" \
+    || fail "could not seed the ios-ui stall publication"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$dir/drain.out" 2> "$dir/drain.err" \
+    || fail "ios-ui stall publication could not be drained"
+  ack_drain_err "$state" "$dir/drain.err" \
+    || fail "ios-ui stall publication could not be acknowledged"
+
+  fakebin="$dir/fakebin"
+  round=1
+  while [ "$round" -le 2 ]; do
+    PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ROOT_OVERRIDE="$ROOT" \
+      FM_STATE_OVERRIDE="$state" FM_FAKE_TMUX_WINDOW='' \
+      FM_FAKE_TMUX_LOG="$dir/tmux.log" FM_FAKE_TMUX_CAPTURE="$dir/fake-tmux/pane.txt" \
+      FM_SECONDMATE_WAKE_STALL_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=0 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+      "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 2 \
+      > "$dir/watch-$round.out" 2> "$dir/watch-$round.err" || true
+    ! grep -F 'secondmate wake-loop stalled' "$dir/watch-$round.out" >/dev/null \
+      || fail "empty ios queue erased ios-ui idempotency on checkpoint $round"
+    round=$((round + 1))
+  done
+  [ ! -s "$state/.wake-queue" ] \
+    || fail "overlapping mate ids re-published the acknowledged ios-ui stall"
+  cmp -s "$row_before" "$stalled/state/.wake-queue" \
+    || fail "overlapping mate receipt checks changed the foreign row"
+  pass "empty prefix mate cleanup preserves another mate's stall receipt"
+}
+
 test_drain_asserts_watcher_liveness() {
   local dir state err identity
   dir=$(make_case drain-liveness)
@@ -915,6 +960,7 @@ test_historical_annotation_skips_announced_status() {
 test_self_held_lock_reclaims_instead_of_deadlocking
 test_secondmate_foreign_queue_stall_is_one_shot_and_read_only
 test_acknowledged_stall_publication_survives_pre_marker_crash
+test_empty_prefix_mate_preserves_other_mate_receipt
 test_self_announced_append_guards
 test_historical_annotation_skips_announced_status
 test_concurrent_append_and_drain

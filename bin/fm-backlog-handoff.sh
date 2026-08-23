@@ -347,8 +347,7 @@ receiver_wake_mark_pending() { # <secondmate-id>
     esac
   fi
   corr=$(fm_pending_reply_create "$FM_HOME" "$STATE" "$id" "$RECEIVER_WAKE_MESSAGE") || return 1
-  if ! fm_pending_reply_prepare_delivery "$STATE" "$corr" \
-    || ! receiver_wake_state_write "$id" "pending:$corr"; then
+  if ! receiver_wake_state_write "$id" "pending:$corr"; then
     fm_pending_reply_discard_undelivered "$STATE" "$corr" || true
     return 1
   fi
@@ -389,6 +388,10 @@ wake_secondmate_receiver() { # <secondmate-id> <correlation-id>
   fi
   [ "$(grep '^kind=' "$meta" | cut -d= -f2-)" = secondmate ] || {
     printf 'error: secondmate %s has non-secondmate endpoint metadata; backlog is durable but the receiver was not woken\n' "$id" >&2
+    return 1
+  }
+  fm_pending_reply_prepare_delivery "$STATE" "$corr" || {
+    printf 'error: receiver wake delivery for secondmate %s could not be prepared\n' "$id" >&2
     return 1
   }
   out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$FM_ROOT" \

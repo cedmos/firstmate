@@ -1177,12 +1177,26 @@ fm_wake_queued_keys_locked() {
 }
 
 fm_wake_secondmate_stall_receipt_write() { # <task> <row-key>
-  local task=$1 row_key=$2 receipt tmp
+  local task=$1 row_key=$2 root task_dir receipt tmp
   case "$task" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
   case "$row_key" in ''|*[!0-9-]*) return 1 ;; esac
-  receipt="$STATE/.secondmate-wake-stall-receipt-$task-$row_key"
+  root="$STATE/.secondmate-wake-stall-receipts"
+  task_dir="$root/$task"
+  if [ -e "$root" ] || [ -L "$root" ]; then
+    [ -d "$root" ] && [ ! -L "$root" ] || return 1
+  else
+    mkdir "$root" || return 1
+    chmod 0700 "$root" || return 1
+  fi
+  if [ -e "$task_dir" ] || [ -L "$task_dir" ]; then
+    [ -d "$task_dir" ] && [ ! -L "$task_dir" ] || return 1
+  else
+    mkdir "$task_dir" || return 1
+    chmod 0700 "$task_dir" || return 1
+  fi
+  receipt="$task_dir/$row_key"
   [ "$(cat "$receipt" 2>/dev/null || true)" != "$row_key" ] || return 0
-  tmp=$(mktemp "$STATE/.secondmate-wake-stall-receipt.XXXXXX") || return 1
+  tmp=$(mktemp "$task_dir/.receipt.XXXXXX") || return 1
   if ! printf '%s\n' "$row_key" > "$tmp" || ! chmod 0600 "$tmp" \
     || ! _fm_atomic_replace "$tmp" "$receipt"; then
     rm -f -- "$tmp"

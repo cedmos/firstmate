@@ -321,7 +321,7 @@ secondmate_oldest_queue_row() {  # <queue-path>
 # only this home's marker so a later row can be observed.
 secondmate_wake_stall_tick() {
   local now=$(( $(date +%s) )) threshold=$SECONDMATE_WAKE_STALL_SECS
-  local meta task kind remote_host home queue row epoch seq row_key marker receipt notify_key queued age reason
+  local meta task kind remote_host home queue row epoch seq row_key marker receipt receipt_dir notify_key queued age reason
   case "$threshold" in ''|*[!0-9]*|0) threshold=60 ;; esac
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
@@ -339,8 +339,13 @@ secondmate_wake_stall_tick() {
     queue="$home/state/.wake-queue"
     row=$(secondmate_oldest_queue_row "$queue")
     marker="$STATE/.secondmate-wake-stall-$task"
+    receipt_dir="$STATE/.secondmate-wake-stall-receipts/$task"
     if [ -z "$row" ]; then
-      rm -f "$marker" "$STATE"/.secondmate-wake-stall-receipt-"$task"-*
+      rm -f "$marker"
+      if [ -e "$receipt_dir" ] || [ -L "$receipt_dir" ]; then
+        [ -d "$receipt_dir" ] && [ ! -L "$receipt_dir" ] || return 1
+        rm -rf -- "$receipt_dir" || return 1
+      fi
       continue
     fi
     IFS=$(printf '\t') read -r epoch seq _row_kind _row_key _row_payload <<EOF
@@ -351,7 +356,7 @@ EOF
     age=$((now - epoch))
     [ "$age" -ge "$threshold" ] || continue
     row_key="$epoch-$seq"
-    receipt="$STATE/.secondmate-wake-stall-receipt-$task-$row_key"
+    receipt="$receipt_dir/$row_key"
     [ "$(cat "$marker" 2>/dev/null || true)" = "$row_key" ] && continue
     [ "$(cat "$receipt" 2>/dev/null || true)" = "$row_key" ] && continue
     notify_key="secondmate-wake-loop-$task-$row_key"

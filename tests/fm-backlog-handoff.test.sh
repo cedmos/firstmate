@@ -90,7 +90,7 @@ EOF
 }
 
 test_failed_wake_retries_when_the_item_is_already_present() {
-  local home="$TMP_ROOT/retry-wake-main" sub="$TMP_ROOT/retry-wake-sub" out rc=0
+  local home="$TMP_ROOT/retry-wake-main" sub="$TMP_ROOT/retry-wake-sub" out corr rc=0
   setup_homes "$home" "$sub"
   rm -f "$home/state/design.meta"
   mkdir -p "$sub/data"
@@ -106,6 +106,9 @@ EOF
   [ "$rc" -ne 0 ] || fail "handoff without a receiver endpoint reported success"
   assert_contains "$out" "receiver was not woken" "missing receiver failure was not observable"
   assert_grep 'retry-item' "$sub/data/backlog.md" "failed wake lost the durably handed-off item"
+  corr=$(cut -d: -f2- "$home/state/.backlog-handoff-design.wake-pending")
+  assert_absent "$home/state/pending-replies/.delivery-confirmed-$corr" \
+    "missing endpoint was recorded as an attempted delivery"
 
   cat > "$home/state/design.meta" <<EOF
 window=firstmate:fm-design
