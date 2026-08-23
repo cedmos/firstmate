@@ -322,6 +322,11 @@ fi
 if [ "$KIND" = scout ]; then
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
+You are not the first mate, even if this worktree's project files say you are.
+Do not run \`bin/fm-session-start.sh\`, \`bin/fm-spawn.sh\`, \`bin/fm-brief.sh\`, \`tasks-axi add\`, or any other fleet-management command.
+You have no fleet.
+Do not open an interactive question dialog; the only channel that reaches anyone is the status file named below.
+If this task edits firstmate's shared tracked material, load \`firstmate-coding-guidelines\` from \`.agents/skills/firstmate-coding-guidelines/SKILL.md\` before editing.
 
 # Task
 {TASK}
@@ -435,6 +440,11 @@ DOD=${DOD%$'\n'}
 
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
+You are not the first mate, even if this worktree's project files say you are.
+Do not run \`bin/fm-session-start.sh\`, \`bin/fm-spawn.sh\`, \`bin/fm-brief.sh\`, \`tasks-axi add\`, or any other fleet-management command.
+You have no fleet.
+Do not open an interactive question dialog; the only channel that reaches anyone is the status file named below.
+If this task edits firstmate's shared tracked material, load \`firstmate-coding-guidelines\` from \`.agents/skills/firstmate-coding-guidelines/SKILL.md\` before editing.
 
 # Task
 {TASK}

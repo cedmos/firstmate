@@ -198,6 +198,16 @@ Independently, `fm-spawn.sh`, `fm-send.sh`, `fm-control.sh`, and `fm-teardown.sh
 A normal primary checkout or crewmate worktree has neither signal and remains unaffected.
 The helper's header owns the exact signal detection, relocated-home limitation, test-harness bypass, and relationship to no-mistakes' HEAD-continuity guard.
 
+## Crew worktree instruction overlay
+
+A crew or scout whose project is the firstmate repo works in a linked worktree of this same repository.
+Harnesses auto-load `AGENTS.md` and `CLAUDE.md` from that worktree as project instructions that outrank the launch brief, so the worker otherwise adopts the firstmate role, runs session start, and tries to spawn a worker for its own task.
+`bin/fm-spawn.sh` therefore installs crewmate instructions over those auto-loaded files after the pooled worktree refresh, using skip-worktree so the overlay is not uncommitted work, and refuses the spawn if the overlay cannot be hidden from git or still presents firstmate identity.
+The overlay keeps `.agents/skills/firstmate-coding-guidelines/SKILL.md` in the worktree and tells the worker how to restore the committed `AGENTS.md` when the task is to edit it.
+A secondmate home and a non-firstmate project are left unchanged, and the library refuses to overlay a primary checkout.
+`bin/fm-session-start.sh` separately refuses in the same linked firstmate worktree so a worker that still reaches for it cannot build a ghost home.
+`bin/fm-crew-worktree-instructions-lib.sh` owns the overlay, the session-start predicate, and the loud failure modes.
+
 ## Two task shapes
 
 Ship tasks change projects and ship by project mode (`no-mistakes`, `direct-PR`, or `local-only`); scout tasks leave standalone investigation reports at `data/<id>/report.md` and never push.

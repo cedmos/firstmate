@@ -179,10 +179,15 @@
 # the digest never runs without the same hard bound and process-group cleanup.
 #
 # Usage: fm-session-start.sh [--reemit] [--source <source>]
-#   Prints the full ordered digest to stdout and always exits 0: this is a
-#   reporting command, not a gate. A lock refusal is reported as a loud
+#   Prints the full ordered digest to stdout and always exits 0 when this
+#   checkout is a firstmate primary or secondmate home: this is a reporting
+#   command, not a gate. A lock refusal is reported as a loud
 #   banner inline, never a silent failure or a non-zero exit that would make
 #   an agent skip the rest of the digest.
+#   One exception: a linked ordinary task worktree of firstmate itself is not
+#   a home. Session start then refuses with status 2 and no digest so a
+#   crewmate that reached for this command cannot build a ghost fleet
+#   (bin/fm-crew-worktree-instructions-lib.sh).
 #
 #   --reemit  This process ALREADY took the helm at its own startup and has
 #             only lost its context (a /clear or a compaction). Skip the
@@ -248,6 +253,13 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+# shellcheck source=bin/fm-crew-worktree-instructions-lib.sh
+. "$SCRIPT_DIR/fm-crew-worktree-instructions-lib.sh"
+if fm_crew_session_start_is_forbidden "$FM_ROOT"; then
+  printf '%s\n' "error: this checkout is a crewmate worktree of firstmate, not a firstmate home; do not run session start. You are a crewmate. Follow the launch brief and the crew worktree instructions in AGENTS.md." >&2
+  exit 2
+fi
 
 # --- 0. runtime bound ---------------------------------------------------------
 # The ordered stage list is the contract behind the truncation banner: the child
