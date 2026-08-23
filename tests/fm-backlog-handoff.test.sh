@@ -123,6 +123,128 @@ EOF
   pass "a failed receiver wake is loud and retries from an already-present handoff"
 }
 
+test_move_crash_keeps_wake_pending_for_recovery() {
+  local home="$TMP_ROOT/move-crash-main" sub="$TMP_ROOT/move-crash-sub"
+  local fakebin="$TMP_ROOT/move-crash-fakebin" real_tasks rc=0
+  setup_homes "$home" "$sub"
+  mkdir -p "$sub/data" "$fakebin"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] crash-item - survive the post-move crash (repo: alpha)
+
+## Done
+EOF
+  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  real_tasks=$(command -v tasks-axi)
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+"$FM_REAL_TASKS_AXI" "$@"
+rc=$?
+case " $* " in
+  *" --file "*" --to "*)
+    if [ "$rc" -eq 0 ] && [ "${1:-}" = mv ]; then
+      handoff_pid=$(ps -o ppid= -p "$PPID" | tr -d '[:space:]')
+      kill -KILL "$handoff_pid"
+      sleep 1
+    fi
+    ;;
+esac
+exit "$rc"
+SH
+  chmod +x "$fakebin/tasks-axi"
+
+  set +e
+  FM_REAL_TASKS_AXI="$real_tasks" PATH="$fakebin:$PATH" FM_HOME="$home" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design crash-item > "$TMP_ROOT/move-crash.out" 2>&1
+  rc=$?
+  set +e
+  [ "$rc" -ne 0 ] || fail "post-move crash fixture unexpectedly reported success"
+  assert_grep 'crash-item' "$sub/data/backlog.md" "post-move crash did not leave the item durable"
+  assert_present "$home/state/.backlog-handoff-design.wake-pending" \
+    "post-move crash lost receiver wake intent"
+
+  : > "$TMP_ROOT/default-tmux.log"
+  FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design crash-item \
+    > "$TMP_ROOT/move-crash-retry.out" 2>&1 \
+    || fail "post-move crash recovery failed: $(cat "$TMP_ROOT/move-crash-retry.out")"
+  assert_grep 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log" \
+    "post-move crash recovery did not wake the receiver"
+  assert_absent "$home/state/.backlog-handoff-design.wake-pending" \
+    "confirmed crash recovery left receiver wake pending"
+  pass "a post-move crash preserves wake intent for an idempotent retry"
+}
+
+test_concurrent_local_handoffs_serialize_move_and_wake() {
+  local home="$TMP_ROOT/concurrent-main" sub="$TMP_ROOT/concurrent-sub"
+  local basebin blockbin="$TMP_ROOT/concurrent-blockbin" first second i wake_count
+  setup_homes "$home" "$sub"
+  mkdir -p "$sub/data" "$blockbin"
+  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] concurrent-a - first routed item (repo: alpha)
+
+## Done
+EOF
+  basebin=$(make_fake_tmux "$TMP_ROOT/concurrent-fake")
+  cat > "$blockbin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"New routed work is in your backlog."*)
+    if mkdir "$FM_BLOCK_WAKE_ONCE" 2>/dev/null; then
+      touch "$FM_BLOCK_WAKE_ENTERED"
+      while [ ! -f "$FM_BLOCK_WAKE_RELEASE" ]; do sleep 0.02; done
+    fi
+    ;;
+esac
+exec "$FM_BASE_TMUX" "$@"
+SH
+  chmod +x "$blockbin/tmux"
+
+  PATH="$blockbin:$basebin:$PATH" FM_HOME="$home" FM_BASE_TMUX="$basebin/tmux" \
+    FM_BLOCK_WAKE_ONCE="$TMP_ROOT/concurrent.once" \
+    FM_BLOCK_WAKE_ENTERED="$TMP_ROOT/concurrent.entered" \
+    FM_BLOCK_WAKE_RELEASE="$TMP_ROOT/concurrent.release" \
+    FM_FAKE_TMUX_WINDOW='firstmate:fm-design' \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/concurrent-tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/concurrent-fake/pane.txt" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design concurrent-a > "$TMP_ROOT/concurrent-a.out" 2>&1 &
+  first=$!
+  i=0
+  while [ ! -f "$TMP_ROOT/concurrent.entered" ]; do
+    kill -0 "$first" 2>/dev/null || fail "first concurrent handoff exited before its blocked wake"
+    i=$((i + 1))
+    [ "$i" -le 250 ] || fail "first concurrent handoff never reached its receiver wake"
+    sleep 0.02
+  done
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] concurrent-b - second routed item (repo: alpha)
+
+## Done
+EOF
+  PATH="$blockbin:$basebin:$PATH" FM_HOME="$home" FM_BASE_TMUX="$basebin/tmux" \
+    FM_BLOCK_WAKE_ONCE="$TMP_ROOT/concurrent.once" \
+    FM_BLOCK_WAKE_ENTERED="$TMP_ROOT/concurrent.entered" \
+    FM_BLOCK_WAKE_RELEASE="$TMP_ROOT/concurrent.release" \
+    FM_FAKE_TMUX_WINDOW='firstmate:fm-design' \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/concurrent-tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/concurrent-fake/pane.txt" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design concurrent-b > "$TMP_ROOT/concurrent-b.out" 2>&1 &
+  second=$!
+  sleep 0.2
+  assert_grep 'concurrent-b' "$home/data/backlog.md" \
+    "second local handoff moved while the first still owned its wake"
+  touch "$TMP_ROOT/concurrent.release"
+  wait "$first" || fail "first serialized local handoff failed"
+  wait "$second" || fail "second serialized local handoff failed"
+  assert_grep 'concurrent-a' "$sub/data/backlog.md" "first serialized item was lost"
+  assert_grep 'concurrent-b' "$sub/data/backlog.md" "second serialized item was lost"
+  wake_count=$(grep -cF 'New routed work is in your backlog.' "$TMP_ROOT/concurrent-tmux.log")
+  [ "$wake_count" -eq 2 ] || fail "serialized local handoffs produced $wake_count receiver wakes"
+  pass "concurrent local handoffs serialize each durable move with its wake"
+}
+
 # Exact multi-line block extract: header matching key plus following body lines
 # (indented lines and blank separators between paragraphs), stopping at the next
 # item header or unindented section heading (column-0 ##).
@@ -732,6 +854,8 @@ EOF
 
 test_handoff_wakes_live_local_receiver
 test_failed_wake_retries_when_the_item_is_already_present
+test_move_crash_keeps_wake_pending_for_recovery
+test_concurrent_local_handoffs_serialize_move_and_wake
 test_body_moves_when_followed_by_another_item
 test_body_moves_when_followed_by_section_heading
 test_multi_paragraph_body_with_internal_blanks_moves_whole

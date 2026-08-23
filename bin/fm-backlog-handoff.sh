@@ -102,6 +102,7 @@ if [ "${1:-}" = --resume-pending ]; then
 else
   [ "$#" -ge 2 ] || { echo "usage: fm-backlog-handoff.sh <secondmate-id> <item-key>..." >&2; exit 1; }
   ID=$1
+  case "$ID" in ''|*[!A-Za-z0-9._-]*) echo "error: unsafe secondmate id: $ID" >&2; exit 1 ;; esac
   shift
 fi
 
@@ -571,7 +572,10 @@ if [ "$REMOTE" = 1 ]; then
   release_remote_locks
   exit "$rc"
 fi
-release_remote_locks
+ACTIVE_HANDOFF_LOCK="$STATE/.backlog-handoff-$ID.lock"
+fm_lock_acquire_wait "$ACTIVE_HANDOFF_LOCK"
+fm_lock_release "$ACTIVE_REGISTRY_LOCK"
+ACTIVE_REGISTRY_LOCK=
 
 RAW_HOME=$(secondmate_home "$ID") || exit 1
 [ -n "$RAW_HOME" ] || { echo "error: secondmate $ID has no home in $REG" >&2; exit 1; }
@@ -649,6 +653,16 @@ if ! fm_tasks_axi_compatible; then
   exit 1
 fi
 
+WAKE_PENDING_BEFORE=0
+WAKE_PENDING_MARKER="$STATE/.backlog-handoff-$ID.wake-pending"
+if [ -e "$WAKE_PENDING_MARKER" ] || [ -L "$WAKE_PENDING_MARKER" ]; then
+  WAKE_PENDING_BEFORE=1
+fi
+receiver_wake_mark_pending "$ID" || {
+  echo "error: receiver wake state for secondmate $ID could not be recorded; nothing was moved" >&2
+  exit 1
+}
+
 # Seed the destination with firstmate's standard three-section scaffold when it
 # does not exist yet, so the moved item lands under the right section. (Left to
 # create the file itself, tasks-axi mv writes its own `# Backlog` title format,
@@ -669,6 +683,12 @@ if ! MV_OUT=$(tasks-axi mv "${TO_MOVE[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BAC
   if [ "$SUB_CREATED" -eq 1 ]; then
     rm -f "$SUB_BACKLOG"
   fi
+  if [ "$WAKE_PENDING_BEFORE" -eq 0 ]; then
+    rm -f -- "$WAKE_PENDING_MARKER" || {
+      echo "error: tasks-axi mv failed and receiver wake state could not be cleared" >&2
+      exit 1
+    }
+  fi
   if [ -n "$MV_OUT" ]; then
     printf '%s\n' "$MV_OUT" >&2
   fi
@@ -678,10 +698,6 @@ fi
 
 echo "handed off ${#TO_MOVE[@]} item(s) to $ID: ${TO_MOVE[*]}"
 echo "  into $SUB_BACKLOG"
-receiver_wake_mark_pending "$ID" || {
-  echo "error: backlog delivery to secondmate $ID succeeded, but receiver wake state could not be recorded" >&2
-  exit 1
-}
 wake_pending_secondmate_receiver "$ID" || exit 1
 if [ "${#ALREADY[@]}" -gt 0 ]; then
   echo "  already present (skipped): ${ALREADY[*]}"
