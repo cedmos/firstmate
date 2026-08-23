@@ -98,6 +98,30 @@ function startupRebuildSource(ctx: SessionStartContext): "resume" | "fork" | und
 const sessionstartTruncatedMarker =
   "\n\nPI SESSION-START DELIVERY TRUNCATED - the digest exceeded 512 KiB. " +
   "Treat omitted context as unread and inspect the named files directly before acting on it.";
+const branchReplayMetadata = /^FIRSTMATE_SESSIONSTART_BRANCH_REPLAY_THROUGH=([1-9][0-9]*)$/;
+
+type SessionstartOutput = { content: string; branchReplayThrough?: string };
+
+function parseSessionstartOutput(raw: string): SessionstartOutput {
+  let branchReplayThrough: string | undefined;
+  const content = raw
+    .split("\n")
+    .filter((line) => {
+      const matched = line.match(branchReplayMetadata);
+      if (!matched) return true;
+      branchReplayThrough = matched[1];
+      return false;
+    })
+    .join("\n")
+    .trim();
+  return { content, branchReplayThrough };
+}
+
+function acknowledgeBranchReplay(through: string): void {
+  spawnSync(`${root}/bin/fm-branch-outcome.sh`, ["startup-replay-ack", "--through", through], {
+    stdio: "ignore",
+  });
+}
 
 function runSessionstartHook(source: string): Promise<string> {
   return new Promise((resolveResult) => {
@@ -133,21 +157,24 @@ function runSessionstartHook(source: string): Promise<string> {
 async function injectSessionstart(pi: ExtensionAPI, source: string): Promise<void> {
   const raw = await runSessionstartHook(source);
   if (!raw) return;
+  const output = parseSessionstartOutput(raw);
+  if (!output.content) return;
   try {
     // Pi is the only adapter that injects a MESSAGE rather than hook stdout, so
     // whatever it injects must carry operational provenance or the Ahoy skill
     // would have to guess whether it was captain-authored. The wrapper already
     // returns an encoded nudge on a context-preserving open, so only an
     // unencoded digest needs the marker added here.
-    const content = classifyFirstmateCurrentOperationalText(raw)
-      ? raw
-      : encodeFirstmateOperationalInput("session-start", raw);
+    const content = classifyFirstmateCurrentOperationalText(output.content)
+      ? output.content
+      : encodeFirstmateOperationalInput("session-start", output.content);
     pi.sendMessage({
       customType: "firstmate-sessionstart-nudge",
       content,
       display: false,
       details: { kind: "session-start" },
     });
+    if (output.branchReplayThrough) acknowledgeBranchReplay(output.branchReplayThrough);
   } catch {
   }
 }

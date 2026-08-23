@@ -322,6 +322,7 @@ if [ -z "${FM_SESSION_START_STAGE_FILE:-}" ]; then
 fi
 
 PRIMARY_HARNESS=$("$SCRIPT_DIR/fm-harness.sh" 2>/dev/null || printf unknown)
+BRANCH_REPLAY_LAST=
 
 # shellcheck source=bin/fm-backend.sh
 . "$SCRIPT_DIR/fm-backend.sh"
@@ -722,10 +723,7 @@ else
       "$SCRIPT_DIR/fm-branch-outcome.sh" startup-replay 2>&1) || BRANCH_REPLAY_OUT=
     if [ -n "$BRANCH_REPLAY_OUT" ]; then
       BRANCH_REPLAY_LAST=$(printf '%s\n' "$BRANCH_REPLAY_OUT" | sed -n 's/^{"seq":\([0-9][0-9]*\),.*/\1/p' | tail -n 1)
-      if printf '%s\n' "$BRANCH_REPLAY_OUT" && [ -n "$BRANCH_REPLAY_LAST" ]; then
-        FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
-          "$SCRIPT_DIR/fm-branch-outcome.sh" startup-replay-ack --through "$BRANCH_REPLAY_LAST" 2>/dev/null || true
-      fi
+      printf '%s\n' "$BRANCH_REPLAY_OUT"
     fi
   fi
   DRAIN_OUT=$("$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
@@ -958,6 +956,10 @@ if [ "$READ_ONLY" -eq 0 ] && [ "$REEMIT" -eq 0 ]; then
       printf '\nSESSION_START_AGENTS_BASELINE: not recorded - a later supported rebuild will re-emit AGENTS.md.\n'
     fi
   fi
+fi
+
+if [ -n "$BRANCH_REPLAY_LAST" ]; then
+  printf 'FIRSTMATE_SESSIONSTART_BRANCH_REPLAY_THROUGH=%s\n' "$BRANCH_REPLAY_LAST"
 fi
 
 exit 0

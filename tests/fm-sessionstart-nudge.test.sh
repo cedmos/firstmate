@@ -404,6 +404,70 @@ JS
   pass "Pi distinguishes header-proven restored CLI sessions from named create-if-missing startups"
 }
 
+test_pi_branch_replay_acknowledges_only_after_delivery() {
+  local fixture out status=0
+  command -v node >/dev/null 2>&1 || {
+    echo "skip: node not found for Pi branch replay delivery test"
+    return 0
+  }
+  fixture="$TMP_ROOT/pi-branch-replay-delivery"
+  mkdir -p "$fixture/.pi/extensions/lib" "$fixture/bin" "$fixture/state"
+  cp "$ROOT/.pi/extensions/fm-primary-turnend-guard.ts" "$fixture/.pi/extensions/"
+  cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$fixture/.pi/extensions/lib/"
+  cp "$ROOT/bin/fm-operational-input.sh" "$fixture/bin/"
+  cat > "$fixture/bin/fm-sessionstart-run.sh" <<'SH'
+#!/usr/bin/env bash
+printf 'BRANCH OUTCOMES\n{"seq":7,"summary":"delivery boundary"}\n'
+printf 'FIRSTMATE_SESSIONSTART_BRANCH_REPLAY_THROUGH=7\n'
+SH
+  cat > "$fixture/bin/fm-branch-outcome.sh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FM_HOME:?}/state/replay-acks"
+SH
+  cat > "$fixture/bin/fm-turnend-guard.sh" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+  chmod +x "$fixture/bin/"*.sh
+
+  out=$(EXT="$fixture/.pi/extensions/fm-primary-turnend-guard.ts" \
+    FM_HOME="$fixture" FM_ROOT_OVERRIDE="$fixture" \
+    node --input-type=module 2>&1 <<'JS'
+import { existsSync, readFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const handlers = new Map();
+let rejectDelivery = true;
+const messages = [];
+const pi = {
+  on(event, handler) { handlers.set(event, handler); },
+  sendMessage(message) {
+    if (rejectDelivery) throw new Error("main session append failed");
+    messages.push(message);
+  },
+};
+const extension = await import(`${pathToFileURL(process.env.EXT).href}?replay=${Date.now()}`);
+extension.default(pi);
+const ctx = { sessionManager: { getEntries: () => [] } };
+await handlers.get("session_start")({ reason: "startup" }, ctx);
+if (existsSync(`${process.env.FM_HOME}/state/replay-acks`)) {
+  throw new Error("failed main delivery acknowledged the startup replay");
+}
+rejectDelivery = false;
+await handlers.get("session_start")({ reason: "startup" }, ctx);
+if (messages.length !== 1) throw new Error(`expected one delivered digest, got ${messages.length}`);
+if (messages[0].content.includes("FIRSTMATE_SESSIONSTART_BRANCH_REPLAY_THROUGH")) {
+  throw new Error("branch replay metadata leaked into main context");
+}
+if (!messages[0].content.includes("delivery boundary")) throw new Error("delivered digest lost the replay outcome");
+const ack = readFileSync(`${process.env.FM_HOME}/state/replay-acks`, "utf8").trim();
+if (ack !== "startup-replay-ack --through 7") throw new Error(`unexpected replay acknowledgement: ${ack}`);
+JS
+  ) || status=$?
+  expect_code 0 "$status" "Pi branch replay delivery acknowledgement"
+  [ -z "$out" ] || fail "Pi branch replay delivery test printed output: $out"
+  pass "Pi acknowledges startup replay only after durable main delivery"
+}
+
 test_pi_large_sessionstart_digest_is_delivered_loudly() {
   local fixture out status=0
   command -v node >/dev/null 2>&1 || {
@@ -553,4 +617,5 @@ test_run_unknown_source_takes_the_helm
 test_run_gate_and_scope_are_silent
 test_run_reports_a_failed_session_start_as_digest_text
 test_pi_startup_classifies_cli_continuations
+test_pi_branch_replay_acknowledges_only_after_delivery
 test_pi_large_sessionstart_digest_is_delivered_loudly
