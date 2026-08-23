@@ -291,6 +291,55 @@ SH
   pass "a post-move crash preserves wake intent for an idempotent retry"
 }
 
+test_pre_move_crash_does_not_wake_until_move_lands() {
+  local home="$TMP_ROOT/pre-move-crash-main" sub="$TMP_ROOT/pre-move-crash-sub"
+  local fakebin="$TMP_ROOT/pre-move-crash-fakebin" real_tasks rc=0 wake_count
+  setup_homes "$home" "$sub"
+  mkdir -p "$sub/data" "$fakebin"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] pre-move-crash - wake only after durable move (repo: alpha)
+
+## Done
+EOF
+  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  real_tasks=$(command -v tasks-axi)
+  cat > "$fakebin/tasks-axi" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *" --file "*" --to "*)
+    if [ "${1:-}" = mv ]; then
+      handoff_pid=$(ps -o ppid= -p "$PPID" | tr -d '[:space:]')
+      kill -KILL "$handoff_pid"
+      sleep 1
+    fi
+    ;;
+esac
+exec "$FM_REAL_TASKS_AXI" "$@"
+SH
+  chmod +x "$fakebin/tasks-axi"
+  : > "$TMP_ROOT/default-tmux.log"
+
+  set +e
+  FM_REAL_TASKS_AXI="$real_tasks" PATH="$fakebin:$PATH" FM_HOME="$home" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design pre-move-crash > "$TMP_ROOT/pre-move-crash.out" 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "pre-move crash fixture unexpectedly reported success"
+  assert_grep 'pre-move-crash' "$home/data/backlog.md" "pre-move crash changed the source backlog"
+  assert_no_grep 'pre-move-crash' "$sub/data/backlog.md" "pre-move crash changed the destination backlog"
+  assert_present "$home/state/.backlog-handoff-design.wake-pending" \
+    "pre-move crash lost its prepared wake intent"
+
+  FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design pre-move-crash \
+    > "$TMP_ROOT/pre-move-crash-retry.out" 2>&1 \
+    || fail "pre-move crash recovery failed: $(cat "$TMP_ROOT/pre-move-crash-retry.out")"
+  assert_grep 'pre-move-crash' "$sub/data/backlog.md" "pre-move crash recovery did not move the item"
+  wake_count=$(grep -cF 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log")
+  [ "$wake_count" -eq 1 ] || fail "pre-move crash recovery emitted $wake_count receiver wakes"
+  pass "a pre-move crash wakes only after retry makes the item durable"
+}
+
 test_delivery_confirmation_crash_does_not_resend() {
   local home="$TMP_ROOT/confirm-crash-main" sub="$TMP_ROOT/confirm-crash-sub"
   local fakebin="$TMP_ROOT/confirm-crash-fakebin" real_sleep rc=0 wake_count
@@ -1145,6 +1194,7 @@ test_failed_wake_retries_when_the_item_is_already_present
 test_known_receiver_failure_remains_retryable_after_grace
 test_known_failure_restores_retry_after_reconciliation_race
 test_move_crash_keeps_wake_pending_for_recovery
+test_pre_move_crash_does_not_wake_until_move_lands
 test_delivery_confirmation_crash_does_not_resend
 test_unresolved_delivery_attempt_refuses_immediate_resend
 test_concurrent_local_handoffs_serialize_move_and_wake

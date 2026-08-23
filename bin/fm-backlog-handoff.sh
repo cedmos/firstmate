@@ -321,6 +321,7 @@ receiver_wake_state_write() { # <secondmate-id> <state>
   case "$id" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
   case "$value" in
     pending|confirmed) ;;
+    prepared:[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) ;;
     pending:[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) ;;
     confirmed:[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) ;;
     *) return 1 ;;
@@ -332,14 +333,15 @@ receiver_wake_state_write() { # <secondmate-id> <state>
   fi
 }
 
-receiver_wake_mark_pending() { # <secondmate-id>
-  local id=$1 marker="$STATE/.backlog-handoff-$1.wake-pending" value corr rec
+receiver_wake_mark() { # <secondmate-id> <prepared|pending>
+  local id=$1 wake_phase=$2 marker="$STATE/.backlog-handoff-$1.wake-pending" value corr rec
+  case "$wake_phase" in prepared|pending) ;; *) return 1 ;; esac
   if [ -e "$marker" ] || [ -L "$marker" ]; then
     [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
     value=$(cat "$marker" 2>/dev/null || true)
     case "$value" in
-      pending:*)
-        corr=${value#pending:}
+      prepared:*|pending:*)
+        corr=${value#*:}
         rec=$(fm_pending_reply_path "$STATE" "$corr")
         [ -f "$rec" ] && [ ! -L "$rec" ] \
           && [ "$(fm_pending_reply_get "$rec" task_id)" = "$id" ]
@@ -350,10 +352,42 @@ receiver_wake_mark_pending() { # <secondmate-id>
     esac
   fi
   corr=$(fm_pending_reply_create "$FM_HOME" "$STATE" "$id" "$RECEIVER_WAKE_MESSAGE") || return 1
-  if ! receiver_wake_state_write "$id" "pending:$corr"; then
+  if ! receiver_wake_state_write "$id" "$wake_phase:$corr"; then
     fm_pending_reply_discard_undelivered "$STATE" "$corr" || true
     return 1
   fi
+}
+
+receiver_wake_mark_pending() { # <secondmate-id>
+  receiver_wake_mark "$1" pending
+}
+
+receiver_wake_mark_prepared() { # <secondmate-id>
+  receiver_wake_mark "$1" prepared
+}
+
+receiver_wake_discard_prepared() { # <secondmate-id>
+  local id=$1 marker="$STATE/.backlog-handoff-$1.wake-pending" value corr
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  value=$(cat "$marker" 2>/dev/null || true)
+  case "$value" in
+    prepared:*) corr=${value#prepared:} ;;
+    *) return 1 ;;
+  esac
+  fm_pending_reply_discard_undelivered "$STATE" "$corr" || return 1
+  rm -f -- "$marker"
+}
+
+receiver_wake_promote_prepared() { # <secondmate-id>
+  local id=$1 marker="$STATE/.backlog-handoff-$1.wake-pending" value corr
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  value=$(cat "$marker" 2>/dev/null || true)
+  case "$value" in
+    prepared:*) corr=${value#prepared:} ;;
+    pending:*) return 0 ;;
+    *) return 1 ;;
+  esac
+  receiver_wake_state_write "$id" "pending:$corr"
 }
 
 receiver_wake_discard_pending() { # <secondmate-id>
@@ -414,6 +448,10 @@ wake_pending_secondmate_receiver() { # <secondmate-id> [retain-confirmed]
   value=$(cat "$marker" 2>/dev/null || true)
   case "$value" in
     confirmed|confirmed:*) return 0 ;;
+    prepared|prepared:*)
+      printf 'error: receiver wake for secondmate %s was prepared before its backlog became durable\n' "$id" >&2
+      return 1
+      ;;
     pending)
       receiver_wake_mark_pending "$id" || return 1
       value=$(cat "$marker" 2>/dev/null || true)
@@ -744,6 +782,10 @@ fi
 
 if [ "${#TO_MOVE[@]}" -eq 0 ]; then
   echo "nothing to move: ${ALREADY[*]:-no keys} already present in $SUB_BACKLOG"
+  WAKE_PENDING_MARKER="$STATE/.backlog-handoff-$ID.wake-pending"
+  case "$(cat "$WAKE_PENDING_MARKER" 2>/dev/null || true)" in
+    prepared:*) receiver_wake_promote_prepared "$ID" || exit 1 ;;
+  esac
   wake_pending_secondmate_receiver "$ID" || exit 1
   exit 0
 fi
@@ -766,18 +808,19 @@ if ! fm_tasks_axi_compatible; then
   exit 1
 fi
 
-WAKE_PENDING_BEFORE=0
 WAKE_PENDING_MARKER="$STATE/.backlog-handoff-$ID.wake-pending"
-# A surviving marker belongs to an earlier invocation. Resolve its delivery
-# before creating the correlation for this new move; otherwise a confirmed old
-# correlation could make the new routed work appear woken without any submit.
 if [ -e "$WAKE_PENDING_MARKER" ] || [ -L "$WAKE_PENDING_MARKER" ]; then
-  wake_pending_secondmate_receiver "$ID" || {
-    echo "error: previous receiver wake for secondmate $ID is unresolved; nothing new was moved" >&2
-    exit 1
-  }
+  case "$(cat "$WAKE_PENDING_MARKER" 2>/dev/null || true)" in
+    prepared:*) receiver_wake_discard_prepared "$ID" || exit 1 ;;
+    *)
+      wake_pending_secondmate_receiver "$ID" || {
+        echo "error: previous receiver wake for secondmate $ID is unresolved; nothing new was moved" >&2
+        exit 1
+      }
+      ;;
+  esac
 fi
-receiver_wake_mark_pending "$ID" || {
+receiver_wake_mark_prepared "$ID" || {
   echo "error: receiver wake state for secondmate $ID could not be recorded; nothing was moved" >&2
   exit 1
 }
@@ -802,12 +845,10 @@ if ! MV_OUT=$(tasks-axi mv "${TO_MOVE[@]}" --file "$MAIN_BACKLOG" --to "$SUB_BAC
   if [ "$SUB_CREATED" -eq 1 ]; then
     rm -f "$SUB_BACKLOG"
   fi
-  if [ "$WAKE_PENDING_BEFORE" -eq 0 ]; then
-    receiver_wake_discard_pending "$ID" || {
-      echo "error: tasks-axi mv failed and receiver wake state could not be cleared" >&2
-      exit 1
-    }
-  fi
+  receiver_wake_discard_prepared "$ID" || {
+    echo "error: tasks-axi mv failed and receiver wake state could not be cleared" >&2
+    exit 1
+  }
   if [ -n "$MV_OUT" ]; then
     printf '%s\n' "$MV_OUT" >&2
   fi
@@ -817,6 +858,10 @@ fi
 
 echo "handed off ${#TO_MOVE[@]} item(s) to $ID: ${TO_MOVE[*]}"
 echo "  into $SUB_BACKLOG"
+receiver_wake_promote_prepared "$ID" || {
+  echo "error: handed off work to secondmate $ID, but durable receiver wake state could not be recorded" >&2
+  exit 1
+}
 wake_pending_secondmate_receiver "$ID" || exit 1
 if [ "${#ALREADY[@]}" -gt 0 ]; then
   echo "  already present (skipped): ${ALREADY[*]}"

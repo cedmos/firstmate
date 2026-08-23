@@ -214,7 +214,20 @@ phase_recovery() {
 }
 
 phase_teardown() {
-  local teardown_out
+  local teardown_out corr rec
+  corr=$(FM_HOME="$HOME_DIR" bash -c '
+    . "$1"
+    fm_pending_reply_create "$2" "$2/state" design "New routed work is in your backlog."
+  ' _ "$ROOT/bin/fm-pending-reply-lib.sh" "$HOME_DIR") \
+    || fail "could not seed receiver wake retirement state"
+  rec="$HOME_DIR/state/pending-replies/$corr"
+  FM_HOME="$HOME_DIR" bash -c '
+    . "$1"
+    fm_pending_reply_set "$2" phase resolved
+    fm_pending_reply_set "$2" delivered_epoch 1
+  ' _ "$ROOT/bin/fm-pending-reply-lib.sh" "$rec" \
+    || fail "could not settle receiver wake retirement state"
+  printf 'confirmed:%s\n' "$corr" > "$HOME_DIR/state/.backlog-handoff-design.wake-pending"
   : > "$LOG"
   teardown_out=$(PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_LOG="$LOG" FM_FAKE_TMUX_CAPTURE="$PANE" \
     "$ROOT/bin/fm-teardown.sh" design 2>&1) \
@@ -223,6 +236,9 @@ phase_teardown() {
     && fail "secondmate teardown emitted a main-backlog completion reminder"
   assert_absent "$SUB" "teardown did not remove the retired secondmate home"
   assert_absent "$HOME_DIR/state/design.meta" "teardown did not clear the parent meta"
+  assert_absent "$HOME_DIR/state/.backlog-handoff-design.wake-pending" \
+    "teardown left receiver wake state that could poison a replacement route"
+  assert_absent "$rec" "teardown left the retired receiver wake correlation"
   assert_no_grep '- design ' "$HOME_DIR/data/secondmates.md" "teardown did not remove the registry route"
   # The parent's source projects are untouched (no write through a parent home).
   assert_present "$HOME_DIR/projects/alpha" "teardown disturbed a parent project"

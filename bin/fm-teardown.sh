@@ -166,6 +166,8 @@ SUB_HOME_PARENT_MARKER=".fm-secondmate-parent"
 . "$SCRIPT_DIR/fm-secondmate-parent-lib.sh"
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# shellcheck source=bin/fm-pending-reply-lib.sh
+. "$SCRIPT_DIR/fm-pending-reply-lib.sh"
 # shellcheck source=bin/fm-nm-run-lib.sh
 . "$SCRIPT_DIR/fm-nm-run-lib.sh"
 if [ "$#" -lt 1 ] || ! fm_task_id_path_safe "$1"; then
@@ -240,6 +242,77 @@ REMOTE_REGISTRY_LOCK=
 REMOTE_REPLY_LIFECYCLE_LOCK=
 LOCAL_HANDOFF_LOCK=
 LOCAL_REGISTRY_LOCK=
+HANDOFF_WAKE_RETIRE_MARKER=
+HANDOFF_WAKE_RETIRE_VALUE=
+HANDOFF_WAKE_RETIRE_CORR=
+
+handoff_wake_retire_validate() {
+  local marker="$STATE/.backlog-handoff-$ID.wake-pending" value corr rec confirmation
+  HANDOFF_WAKE_RETIRE_MARKER=
+  HANDOFF_WAKE_RETIRE_VALUE=
+  HANDOFF_WAKE_RETIRE_CORR=
+  [ -e "$marker" ] || [ -L "$marker" ] || return 0
+  [ -f "$marker" ] && [ ! -L "$marker" ] || {
+    echo "REFUSED: receiver wake state for secondmate $ID is unsafe" >&2
+    return 1
+  }
+  value=$(cat "$marker" 2>/dev/null || true)
+  case "$value" in
+    pending|confirmed) ;;
+    prepared:*|pending:*|confirmed:*)
+      corr=${value#*:}
+      printf '%s' "$corr" | grep -Eq '^[a-f0-9]{16}$' || {
+        echo "REFUSED: receiver wake state for secondmate $ID is invalid" >&2
+        return 1
+      }
+      rec=$(fm_pending_reply_path "$STATE" "$corr")
+      if [ -e "$rec" ] || [ -L "$rec" ]; then
+        [ -f "$rec" ] && [ ! -L "$rec" ] \
+          && [ "$(fm_pending_reply_get "$rec" task_id)" = "$ID" ] || {
+          echo "REFUSED: receiver wake correlation for secondmate $ID is unsafe or belongs to another task" >&2
+          return 1
+        }
+      fi
+      confirmation=$(fm_pending_reply_delivery_confirmation_path "$STATE" "$corr")
+      if [ -e "$confirmation" ] || [ -L "$confirmation" ]; then
+        [ -f "$confirmation" ] && [ ! -L "$confirmation" ] || {
+          echo "REFUSED: receiver wake delivery state for secondmate $ID is unsafe" >&2
+          return 1
+        }
+      fi
+      HANDOFF_WAKE_RETIRE_CORR=$corr
+      ;;
+    *)
+      echo "REFUSED: receiver wake state for secondmate $ID is invalid" >&2
+      return 1
+      ;;
+  esac
+  HANDOFF_WAKE_RETIRE_MARKER=$marker
+  HANDOFF_WAKE_RETIRE_VALUE=$value
+}
+
+handoff_wake_retire() {
+  local marker=$HANDOFF_WAKE_RETIRE_MARKER corr=$HANDOFF_WAKE_RETIRE_CORR lock rec confirmation rc=0
+  [ -n "$marker" ] || return 0
+  [ -f "$marker" ] && [ ! -L "$marker" ] \
+    && [ "$(cat "$marker" 2>/dev/null || true)" = "$HANDOFF_WAKE_RETIRE_VALUE" ] || return 1
+  if [ -n "$corr" ]; then
+    lock="$STATE/.pending-reply-$corr.lock"
+    fm_lock_acquire_wait "$lock" || return 1
+    rec=$(fm_pending_reply_path "$STATE" "$corr")
+    confirmation=$(fm_pending_reply_delivery_confirmation_path "$STATE" "$corr")
+    if { [ ! -e "$rec" ] && [ ! -L "$rec" ]; } \
+      || { [ -f "$rec" ] && [ ! -L "$rec" ] \
+        && [ "$(fm_pending_reply_get "$rec" task_id)" = "$ID" ]; }; then
+      rm -f -- "$confirmation" "$rec" "$marker" || rc=$?
+    else
+      rc=1
+    fi
+    fm_lock_release "$lock"
+    return "$rc"
+  fi
+  rm -f -- "$marker"
+}
 
 remote_teardown_locks_release() {
   if [ -n "$REMOTE_REPLY_LIFECYCLE_LOCK" ]; then
@@ -352,6 +425,7 @@ remote_secondmate_teardown() {
   [ "$route_host" = "$remote_host" ] && [ "$route_root" = "$remote_root" ] && [ "$route_home" = "$remote_home" ] \
     || { echo "REFUSED: remote secondmate metadata does not match its registry route" >&2; return 1; }
   [ -z "$FORCE" ] || [ "$FORCE" = --force ] || { echo "error: invalid teardown option: $FORCE" >&2; return 2; }
+  handoff_wake_retire_validate || return 1
   remote_recovery_paths_validate initial || return 1
   if [ "$FORCE" != --force ] && [ "$REMOTE_OUTBOX_PRESENT" -eq 1 ]; then
     echo "REFUSED: remote secondmate $ID still has a pending backlog outbox; deliver it or explicitly discard with --force" >&2
@@ -401,6 +475,8 @@ remote_secondmate_teardown() {
   fi
   remote_pending_replies_cleanup \
     || { echo "error: remote pending-reply cleanup failed; preserving the local route for retry" >&2; return 1; }
+  handoff_wake_retire \
+    || { echo "error: remote receiver wake cleanup failed; preserving the local route for retry" >&2; return 1; }
   tmp="$SECONDMATE_REG.tmp.$$"
   grep -vE "^- $ID( |$)" "$SECONDMATE_REG" > "$tmp" || true
   mv -f -- "$tmp" "$SECONDMATE_REG"
@@ -2298,6 +2374,7 @@ if [ "$KIND" = secondmate ]; then
   fm_lock_acquire_wait "$LOCAL_REGISTRY_LOCK" || exit 1
   LOCAL_HANDOFF_LOCK="$STATE/.backlog-handoff-$ID.lock"
   fm_lock_acquire_wait "$LOCAL_HANDOFF_LOCK" || exit 1
+  handoff_wake_retire_validate || exit 1
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
@@ -2560,6 +2637,7 @@ fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit $?
+  handoff_wake_retire || { echo "error: receiver wake cleanup failed; preserving the secondmate route for retry" >&2; exit 1; }
   remove_secondmate_registry_entry "$ID"
 fi
 remove_grok_turnend_auth "$STATE" "$ID" || exit 1
