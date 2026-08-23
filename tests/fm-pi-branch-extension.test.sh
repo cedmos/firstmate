@@ -194,6 +194,7 @@ const pi = {
     sentToMain.push({ message, options: options ?? {} });
   },
   sendUserMessage(content, options) {
+    if (globalThis.__fmRejectMainDelivery) throw new Error("stale extension API");
     mainUserMessages.push({ content, options: options ?? {} });
   },
 };
@@ -456,19 +457,28 @@ test_accepted_wakes_fall_back_during_shutdown() {
   out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
 const prelude = process.env.DRIVER_PRELUDE;
-await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, mainUserMessages }; })()`);
-const { fire, dispatch, settle, mainUserMessages } = globalThis.__t;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, mainUserMessages, home }; })()`);
+const { fire, dispatch, settle, mainUserMessages, home } = globalThis.__t;
 globalThis.__fmBlockPrompt = true;
 if (!dispatch("signal: active during shutdown").accepted) throw new Error("active wake was not accepted");
 if (!dispatch("signal: queued during shutdown").accepted) throw new Error("queued wake was not accepted");
 await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "active branch prompt");
+globalThis.__fmRejectMainDelivery = true;
 fire("session_shutdown");
-await settle(() => mainUserMessages.length === 2, "shutdown fallbacks");
+await new Promise((resolve) => setTimeout(resolve, 30));
+if (mainUserMessages.length !== 0) throw new Error("shutdown used the invalidated extension API");
+globalThis.__fmRejectMainDelivery = false;
+fire("session_start");
+await settle(() => mainUserMessages.length === 2, "replacement-session fallbacks");
 const delivered = mainUserMessages.map((item) => item.content).join("\n");
 if (!delivered.includes("signal: active during shutdown")) throw new Error("active accepted wake was lost");
 if (!delivered.includes("signal: queued during shutdown")) throw new Error("queued accepted wake was lost");
 if (mainUserMessages.some((item) => item.options.deliverAs !== "followUp")) {
   throw new Error("shutdown fallback must deliver as a follow-up");
+}
+const { readdirSync } = await import("node:fs");
+if (readdirSync(`${home}/state/branch-pending-wakes`).some((name) => name.endsWith(".json"))) {
+  throw new Error("replacement-session fallback left accepted wake markers unread");
 }
 process.exit(0);
 EOF

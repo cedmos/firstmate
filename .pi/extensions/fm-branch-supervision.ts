@@ -24,7 +24,15 @@
 // broken branch degrades to today's behavior, never to a lost wake.
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -60,6 +68,7 @@ const mirrorCursorFile = join(state, ".branch-mirror-cursor");
 const promptScript = join(fmRoot, "bin", "fm-branch-prompt.sh");
 const outcomeScript = join(fmRoot, "bin", "fm-branch-outcome.sh");
 const loadedMarker = join(state, ".pi-branch-extension-loaded");
+const pendingWakesDir = join(state, "branch-pending-wakes");
 
 // Same tool set in the same order on every request (part of the cached
 // prefix). "bash" resolves to the customTools override below, which injects
@@ -184,6 +193,8 @@ export default function (pi: ExtensionAPI) {
   let branchBroken = "";
   let mainStreaming = false;
   let shuttingDown = false;
+  let sessionGeneration = 0;
+  let pendingWakeCounter = 0;
   // Serializes branch work: mirror appends and wake turns run strictly in
   // dispatch order, one at a time (the branch runs drain -> handle -> ack
   // serially by design).
@@ -410,18 +421,59 @@ export default function (pi: ExtensionAPI) {
     pi.sendUserMessage(content, { deliverAs: "followUp" });
   }
 
-  function enqueueWake(message: string): void {
+  function persistAcceptedWake(message: string): string {
+    mkdirSync(pendingWakesDir, { recursive: true });
+    const id = `${process.pid}-${Date.now()}-${++pendingWakeCounter}`;
+    const finalPath = join(pendingWakesDir, `${id}.json`);
+    const temporaryPath = join(pendingWakesDir, `.${id}.tmp`);
+    writeFileSync(temporaryPath, `${JSON.stringify({ message })}\n`, { flag: "wx" });
+    renameSync(temporaryPath, finalPath);
+    return finalPath;
+  }
+
+  function clearAcceptedWake(path: string): void {
+    try {
+      unlinkSync(path);
+    } catch {}
+  }
+
+  function replayAcceptedWakes(): void {
+    let names: string[];
+    try {
+      names = readdirSync(pendingWakesDir).filter((name) => name.endsWith(".json")).sort();
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      const path = join(pendingWakesDir, name);
+      try {
+        const parsed = JSON.parse(readFileSync(path, "utf8")) as { message?: unknown };
+        if (typeof parsed.message !== "string") continue;
+        fallbackToMain(parsed.message, "accepted wake recovered after supervision session shutdown");
+        clearAcceptedWake(path);
+      } catch {}
+    }
+  }
+
+  function enqueueWake(message: string, pendingPath: string, acceptedGeneration: number): void {
     branchChain = branchChain
       .then(async () => {
-        if (shuttingDown) throw new Error("supervision session shut down before handling the accepted wake");
+        if (shuttingDown || acceptedGeneration !== sessionGeneration) {
+          throw new Error("supervision session shut down before handling the accepted wake");
+        }
         const session = await ensureBranch();
         await flushMirror(session);
         await session.prompt(
           `FIRSTMATE SUPERVISION WAKE: ${message}\n\nHandle this per your operating procedure and finish with fm_branch_report.`,
         );
+        clearAcceptedWake(pendingPath);
       })
       .catch((error: unknown) => {
-        fallbackToMain(message, error instanceof Error ? error.message : String(error));
+        if (shuttingDown || acceptedGeneration !== sessionGeneration) return;
+        try {
+          fallbackToMain(message, error instanceof Error ? error.message : String(error));
+          clearAcceptedWake(pendingPath);
+        } catch {}
       });
   }
 
@@ -445,8 +497,15 @@ export default function (pi: ExtensionAPI) {
     if (!branchEnabled()) return;
     if (afkActive()) return; // the away daemon owns supervision while afk
     if (branchBroken) return; // fail back to today's wake-to-main path
+    let pendingPath: string;
+    try {
+      pendingPath = persistAcceptedWake(offer.message);
+    } catch {
+      return;
+    }
+    const acceptedGeneration = sessionGeneration;
     offer.accept();
-    enqueueWake(offer.message);
+    enqueueWake(offer.message, pendingPath, acceptedGeneration);
   });
 
   pi.on?.("agent_start", () => {
@@ -482,12 +541,14 @@ export default function (pi: ExtensionAPI) {
     shuttingDown = false;
     branchBroken = "";
     markLoaded();
+    replayAcceptedWakes();
     // A replacement main session (/new, /resume) restarts dialog mirroring
     // from the new session file; collectMainDialog re-anchors the cursor.
   });
 
   pi.on?.("session_shutdown", () => {
     shuttingDown = true;
+    sessionGeneration += 1;
     if (branch) {
       try {
         branch.dispose();

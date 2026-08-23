@@ -338,6 +338,12 @@ if [ -n "$TARGET_META" ]; then
   LEASE_GUARD_TASK=$(fm_send_id_from_meta "$TARGET_META")
   [ -z "$LEASE_GUARD_TASK" ] || fm_lease_guard "$LEASE_GUARD_TASK" "steer (fm-send)"
 fi
+fm_send_lease_cleanup() {
+  local status=$?
+  fm_lease_guard_release
+  return "$status"
+}
+trap fm_send_lease_cleanup EXIT
 
 # Collect --resolve-key flags (answerer-closes; see the header contract). They
 # must precede --key or the message text; everything after the last flag is the

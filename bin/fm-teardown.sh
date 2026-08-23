@@ -209,6 +209,7 @@ teardown_release_locks() {
     fm_lock_release "$CONTROL_LOCK" || true
     CONTROL_LOCK_HELD=0
   fi
+  fm_lease_guard_release
   return "$status"
 }
 trap teardown_release_locks EXIT

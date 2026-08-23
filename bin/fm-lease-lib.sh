@@ -14,8 +14,8 @@
 # CONTRACT.
 #   - Lease file: $STATE/.lease-<task>, one line "<actor>\t<pid>\t<epoch>".
 #     Written atomically (temp + ln for claim, temp + mv for a same-actor
-#     refresh). Lease commands in one home serialize through the advisory
-#     state/.fm-lease.lock before inspecting or changing any lease.
+#     refresh). Lease commands in one home serialize through the portable
+#     state/.fm-lease-command.lock before inspecting or changing any lease.
 #   - Actors: exactly "main" and "branch". The current actor is
 #     $FM_SUPERVISION_ACTOR when set, else "main". The branch's shell gets
 #     FM_SUPERVISION_ACTOR=branch injected deterministically by the Pi branch
@@ -29,12 +29,11 @@
 #     cleared by the session-start sweep only when the pid proves dead;
 #     otherwise the loud release override in the refusal message is the
 #     recovery path.
-#   - Guard semantics (fm_lease_guard): no lease, a same-actor lease, or a
-#     provably stale lease passes; a live lease held by the OTHER actor
-#     refuses with exit FM_LEASE_REFUSE_EXIT. Stale records are removed by a
-#     claim or session-start sweep. A home that never runs the Pi branch never
-#     has lease files and never sets FM_SUPERVISION_ACTOR, so the
-#     guard is a no-op there - non-Pi behavior is unchanged by construction.
+#   - Guard semantics (fm_lease_guard): a live lease held by the OTHER actor
+#     refuses with exit FM_LEASE_REFUSE_EXIT. Otherwise an active Pi actor
+#     claims the task through fm-lease.sh and retains it until its entrypoint
+#     exits. A home that never runs the Pi branch has no live extension marker
+#     and never sets FM_SUPERVISION_ACTOR, so the guard is a no-op there.
 #   - Role partition (fm_lease_forbid_branch): actions MAIN alone owns -
 #     merging a PR, landing local-only work, spawning workers - refuse the
 #     branch actor outright, lease or no lease.
@@ -122,17 +121,45 @@ fm_lease_clear_stale() {
   rm -f -- "$file"
 }
 
+FM_LEASE_GUARD_ACQUIRED=
+FM_LEASE_GUARD_ACTOR=
+
 # fm_lease_guard <task> <action-label>: refuse (exit FM_LEASE_REFUSE_EXIT) when
 # a live lease held by the OTHER actor exists for <task>. Passes silently
 # otherwise. Call after the task id is resolved and before the first mutation.
 fm_lease_guard() {
-  local task=$1 action=$2 actor
+  local task=$1 action=$2 actor marker marker_pid lease_script holder_pid
   fm_lease_valid_id "$task" || return 0
   actor=$(fm_lease_actor) || exit "$FM_LEASE_REFUSE_EXIT"
-  fm_lease_live "$task" || return 0
-  [ "$FM_LEASE_ACTOR" != "$actor" ] || return 0
-  echo "error: $action refused - task '$task' is leased to the $FM_LEASE_ACTOR supervision actor (state/.lease-$task); retry after it releases, or clear a wedged lease with bin/fm-lease.sh release $task --actor $FM_LEASE_ACTOR" >&2
-  exit "$FM_LEASE_REFUSE_EXIT"
+  if fm_lease_live "$task"; then
+    if [ "$FM_LEASE_ACTOR" != "$actor" ]; then
+      echo "error: $action refused - task '$task' is leased to the $FM_LEASE_ACTOR supervision actor (state/.lease-$task); retry after it releases, or clear a wedged lease with bin/fm-lease.sh release $task --actor $FM_LEASE_ACTOR" >&2
+      exit "$FM_LEASE_REFUSE_EXIT"
+    fi
+    return 0
+  fi
+  if [ -z "${FM_SUPERVISION_ACTOR+x}" ]; then
+    marker="$STATE/.pi-branch-extension-loaded"
+    marker_pid=$(cat "$marker" 2>/dev/null || true)
+    case "$marker_pid" in ''|*[!0-9]*) return 0 ;; esac
+    kill -0 "$marker_pid" 2>/dev/null || return 0
+  fi
+  lease_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-lease.sh"
+  holder_pid=${FM_LEASE_HOLDER_PID:-${BASHPID:-$$}}
+  if ! FM_LEASE_HOLDER_PID="$holder_pid" "$lease_script" claim "$task" --actor "$actor"; then
+    exit "$FM_LEASE_REFUSE_EXIT"
+  fi
+  FM_LEASE_GUARD_ACQUIRED=$task
+  FM_LEASE_GUARD_ACTOR=$actor
+}
+
+fm_lease_guard_release() {
+  local lease_script
+  [ -n "$FM_LEASE_GUARD_ACQUIRED" ] || return 0
+  lease_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-lease.sh"
+  "$lease_script" release "$FM_LEASE_GUARD_ACQUIRED" --actor "$FM_LEASE_GUARD_ACTOR" || true
+  FM_LEASE_GUARD_ACQUIRED=
+  FM_LEASE_GUARD_ACTOR=
 }
 
 # fm_lease_forbid_branch <action-label>: refuse (exit FM_LEASE_REFUSE_EXIT)

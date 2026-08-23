@@ -45,6 +45,10 @@ test_branch_prompt_is_byte_stable_and_above_cache_floor() {
     *) fail "branch prompt lost its role preamble" ;;
   esac
   case "$out_a" in
+    *"4. Report:"*"5. Acknowledge only after fm_branch_report succeeds:"*) ;;
+    *) fail "branch prompt does not require a durable report before wake acknowledgement" ;;
+  esac
+  case "$out_a" in
     *"stuck-crewmate-recovery"*) ;;
     *) fail "branch prompt lost the inlined recovery playbook" ;;
   esac
@@ -148,6 +152,36 @@ test_lease_exclusivity_release_stale_and_sweep() {
     esac
   done
 
+  mkdir -p "$home/no-python"
+  cat > "$home/no-python/python3" <<'SH'
+#!/usr/bin/env bash
+exit 99
+SH
+  chmod +x "$home/no-python/python3"
+  PATH="$home/no-python:$PATH" FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ \
+    "$ROOT/bin/fm-lease.sh" claim portable --actor main || fail "portable lease claim depended on python3"
+
+  printf '%s\n' "$$" > "$home/state/.pi-branch-extension-loaded"
+  rm -f "$home/guard-ready" "$home/guard-release"
+  (STATE="$home/state" FM_HOME="$home" bash -c '
+    . "$1"
+    fm_lease_guard guarded "guard probe"
+    : > "$2/guard-ready"
+    while [ ! -e "$2/guard-release" ]; do sleep 0.01; done
+    fm_lease_guard_release
+  ' _ "$ROOT/bin/fm-lease-lib.sh" "$home") &
+  guard_pid=$!
+  for _ in $(seq 1 100); do
+    [ -e "$home/guard-ready" ] && break
+    sleep 0.01
+  done
+  [ -e "$home/guard-ready" ] || fail "active guard did not acquire its lease"
+  out=$(FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim guarded --actor branch 2>&1)
+  [ $? -eq 6 ] || fail "branch claim entered while main's guarded mutation was active: $out"
+  : > "$home/guard-release"
+  wait "$guard_pid" || fail "guard probe failed"
+  FM_HOME="$home" "$ROOT/bin/fm-lease.sh" check guarded >/dev/null && fail "guard lease survived entrypoint cleanup"
+
   # Release by holder name; release of an unheld lease stays a silent no-op.
   FM_HOME="$home" "$ROOT/bin/fm-lease.sh" release task-1 --actor branch || fail "release failed"
   FM_HOME="$home" "$ROOT/bin/fm-lease.sh" check task-1 >/dev/null && fail "released lease still reported"
@@ -192,10 +226,12 @@ test_mutating_scripts_refuse_the_other_actors_lease() {
   status=$?
   [ "$status" -eq 6 ] || fail "leased fm-control exited $status, not 6: $out"
   assert_contains "$out" "leased to the branch supervision actor" "fm-control refusal lost the holder"
+  printf '%s\n' "$$" > "$home/state/.pi-branch-extension-loaded"
   out=$(FM_HOME="$home" "$ROOT/bin/fm-control.sh" task-unheld interrupt 2>&1)
   status=$?
   [ "$status" -ne 6 ] || fail "unleased fm-control still hit the lease refusal"
   assert_contains "$out" "no task 'task-unheld'" "unleased fm-control lost its ordinary error"
+  [ ! -e "$home/state/.lease-task-unheld" ] || fail "fm-control cleanup left its acquired lease behind"
 
   # fm-teardown: same refusal shape before any teardown work.
   out=$(FM_HOME="$home" "$ROOT/bin/fm-teardown.sh" task-held 2>&1)

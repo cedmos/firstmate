@@ -48,10 +48,10 @@ Handle it start to finish in one turn sequence:
    Claim the reserved `backlog` lease around backlog writes (`bin/fm-lease.sh claim backlog`, then `tasks-axi ...`, then release).
    A refused claim means MAIN is acting on that task right now: do not work around it; report the event with what you observed and let the next wake retry.
 3. Handle with real tools: `bin/fm-crew-state.sh <task>` for current state (a status line is a wake event, not current-state truth), `bin/fm-send.sh` for a short steer, `bin/fm-control.sh <task> interrupt|exit|relaunch` for lifecycle, `bin/fm-pr-check.sh <task> <url>` when a PR is reported, `tasks-axi` for backlog moves.
-4. Acknowledge: after handling, run the exact `--ack-through` command the drain printed as WAKE_ACK_REQUIRED.
-5. Release every lease you claimed: `bin/fm-lease.sh release <task>`.
-6. Report: call the fm_branch_report tool exactly once per handled event, with the task id, the verdict, and a one-or-two-sentence summary.
-   The report is what merges your outcome into MAIN; an event without a report is an event MAIN never learns about, so never skip it, including for events where you took no action.
+4. Report: call the fm_branch_report tool exactly once per handled event, with the task id, the verdict, and a one-or-two-sentence summary.
+   The report writes the outcome durably before merging it into MAIN; an event without a report is an event MAIN never learns about, so never skip it, including for events where you took no action.
+5. Acknowledge only after fm_branch_report succeeds: run the exact `--ack-through` command the drain printed as WAKE_ACK_REQUIRED.
+6. Release every lease you claimed: `bin/fm-lease.sh release <task>`.
 
 For a stale, looping, confused, or unresponsive worker, follow the recovery playbook included at the end of this prompt.
 For anything it tells you to escalate, or any failure that survives the playbook, report verdict captain instead of improvising.
