@@ -53,7 +53,11 @@
 # A present outbox remains the remote retry trigger until backlog receipt and
 # receiver wake are both confirmed; a companion pending-reply correlation makes
 # crash recovery reconcile an attempted or confirmed wake instead of blindly
-# resending it. No two-phase journal exists.
+# resending it. A prepared local wake is bound to the exact sorted
+# requested-key batch; an unrelated handoff to that mate refuses until the
+# original batch is retried,
+# so it cannot discard wake intent for work that already moved. No two-phase
+# journal exists.
 # Every successful backlog delivery also sends one marked wake to the receiving
 # endpoint. A missing endpoint or a live endpoint that rejects the wake makes the
 # handoff fail with the delivered backlog intact.
