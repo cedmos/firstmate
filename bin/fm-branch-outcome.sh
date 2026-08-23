@@ -4,8 +4,8 @@
 #
 # CONTRACT (this header is the one owner of the store's format).
 #   - Store: $STATE/branch-outcomes.jsonl, strictly APPEND-ONLY. One JSON
-#     object per line: {"seq":N,"epoch":N,"task":"...","wake":"...",
-#     "verdict":"routine"|"captain","summary":"..."}. Existing lines are never
+#     object per line: {"seq":N,"wake_seq":N,"epoch":N,"task":"...",
+#     "wake":"...","verdict":"routine"|"captain","summary":"..."}. Existing lines are never
 #     rewritten, reordered, or deleted by any subcommand; the read state lives
 #     entirely in the cursor sidecar so marking outcomes read cannot disturb
 #     the log. Retention: the log is small (one line per handled fleet event)
@@ -23,7 +23,7 @@
 #
 # Usage:
 #   fm-branch-outcome.sh append --task <id> --verdict routine|captain \
-#       --summary <text> [--wake <text>]
+#       --summary <text> [--wake <text>] [--wake-seq <n>]
 #     Append one outcome record; prints the assigned seq.
 #   fm-branch-outcome.sh unread
 #     Print every unread record (raw JSONL). Exit 0 with no output when none.
@@ -33,10 +33,10 @@
 #   fm-branch-outcome.sh list [--recent <n>]
 #     Print the last n records (default 20), read or not.
 #   fm-branch-outcome.sh startup-replay
-#     Session-start recovery: print unread records under a labeled header and
-#     mark them read. Prints nothing when nothing is unread, so a home that
-#     never ran the branch stays silent. Run it only when the session holds
-#     the lock (fm-session-start.sh owns the call site).
+#     Session-start recovery: print unread records under a labeled header
+#     without advancing the cursor.
+#   fm-branch-outcome.sh startup-replay-ack --through <seq>
+#     Advance the replay cursor only after the caller delivered replay output.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,7 +48,7 @@ CURSOR="$STATE/.branch-outcomes-cursor"
 LOCK="$STATE/.branch-outcomes.lock"
 
 usage() {
-  echo "usage: fm-branch-outcome.sh append --task <id> --verdict routine|captain --summary <text> [--wake <text>] | unread | mark-read --through <seq> | list [--recent <n>] | startup-replay" >&2
+  echo "usage: fm-branch-outcome.sh append --task <id> --verdict routine|captain --summary <text> [--wake <text>] [--wake-seq <n>] | unread | mark-read --through <seq> | list [--recent <n>] | startup-replay | startup-replay-ack --through <seq>" >&2
   exit 2
 }
 
@@ -114,22 +114,25 @@ case "$CMD" in
     VERDICT=''
     SUMMARY=''
     WAKE=''
+    WAKE_SEQ=0
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --task) TASK=${2:-}; shift 2 || usage ;;
         --verdict) VERDICT=${2:-}; shift 2 || usage ;;
         --summary) SUMMARY=${2:-}; shift 2 || usage ;;
         --wake) WAKE=${2:-}; shift 2 || usage ;;
+        --wake-seq) WAKE_SEQ=${2:-}; shift 2 || usage ;;
         *) usage ;;
       esac
     done
     [ -n "$TASK" ] || usage
     [ -n "$SUMMARY" ] || usage
+    case "$WAKE_SEQ" in ''|*[!0-9]*) usage ;; esac
     case "$VERDICT" in routine|captain) ;; *) usage ;; esac
     fm_lock_acquire_wait "$LOCK"
     SEQ=$(( $(last_seq) + 1 ))
-    printf '{"seq":%s,"epoch":%s,"task":"%s","wake":"%s","verdict":"%s","summary":"%s"}\n' \
-      "$SEQ" "$(date +%s)" "$(json_escape "$TASK")" "$(json_escape "$WAKE")" \
+    printf '{"seq":%s,"wake_seq":%s,"epoch":%s,"task":"%s","wake":"%s","verdict":"%s","summary":"%s"}\n' \
+      "$SEQ" "$WAKE_SEQ" "$(date +%s)" "$(json_escape "$TASK")" "$(json_escape "$WAKE")" \
       "$VERDICT" "$(json_escape "$SUMMARY")" >> "$STORE"
     fm_lock_release "$LOCK"
     printf '%s\n' "$SEQ"
@@ -167,9 +170,16 @@ case "$CMD" in
     if [ -n "$UNREAD" ]; then
       printf 'BRANCH OUTCOMES (handled by the supervision branch, not yet seen by this session):\n'
       printf '%s\n' "$UNREAD"
-      LAST=$(record_seq "$(printf '%s\n' "$UNREAD" | tail -n 1)")
-      [ -z "$LAST" ] || advance_cursor "$LAST"
     fi
+    fm_lock_release "$LOCK"
+    ;;
+  startup-replay-ack)
+    [ "${1:-}" = --through ] || usage
+    THROUGH=${2:-}
+    case "$THROUGH" in ''|*[!0-9]*) usage ;; esac
+    [ "$#" -eq 2 ] || usage
+    fm_lock_acquire_wait "$LOCK"
+    advance_cursor "$THROUGH"
     fm_lock_release "$LOCK"
     ;;
   *) usage ;;

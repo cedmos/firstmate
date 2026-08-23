@@ -79,7 +79,14 @@ export function createBashToolDefinition(cwd, options) {
     parameters: { type: "object" },
     __cwd: cwd,
     __options: options,
-    execute: async () => ({ content: [], details: undefined }),
+    execute: async () => {
+      if (globalThis.__fmBlockBash) {
+        await new Promise((resolve) => {
+          globalThis.__fmResolveBash = resolve;
+        });
+      }
+      return { content: [], details: undefined };
+    },
   };
 }
 
@@ -191,6 +198,7 @@ const pi = {
     renderers.set(customType, renderer);
   },
   sendMessage(message, options) {
+    if (globalThis.__fmRejectMergeDelivery) throw new Error("main merge delivery failed");
     sentToMain.push({ message, options: options ?? {} });
   },
   sendUserMessage(content, options) {
@@ -301,19 +309,19 @@ console.log(`CACHE_KEY=${rewriteA.prompt_cache_key}`);
 // captain-relevant appends and triggers exactly one turn. Store rows are
 // written BEFORE the merge note and marked read after it.
 const report = session.options.customTools.find((tool) => tool.name === "fm_branch_report");
-const r1 = await report.execute("call-1", { task: "task-9", verdict: "routine", summary: "worker healthy, no action needed", wake: "signal: working" }, undefined, undefined, {});
+const r1 = await report.execute("call-1", { task: "task-9", verdict: "routine", summary: "worker healthy, no action needed", wake: "signal: working", wakeSequence: 1 }, undefined, undefined, {});
 if (r1.isError) throw new Error(`routine report failed: ${JSON.stringify(r1)}`);
 if (sentToMain.length !== 1) throw new Error("routine report did not merge exactly one note");
 if (sentToMain[0].message.customType !== "fm-branch-merge") throw new Error("merge note has the wrong custom type");
 if (sentToMain[0].options.triggerTurn) throw new Error("routine idle merge must not trigger a turn");
 if (sentToMain[0].options.deliverAs) throw new Error("routine idle merge must append immediately");
 fire("agent_start", {});
-await report.execute("call-2", { task: "task-9", verdict: "routine", summary: "still healthy" }, undefined, undefined, {});
+await report.execute("call-2", { task: "task-9", verdict: "routine", summary: "still healthy", wakeSequence: 2 }, undefined, undefined, {});
 if (sentToMain[1].options.deliverAs !== "nextTurn" || sentToMain[1].options.triggerTurn) {
   throw new Error(`routine busy merge must defer to nextTurn without a turn: ${JSON.stringify(sentToMain[1].options)}`);
 }
 fire("agent_end", {});
-await report.execute("call-3", { task: "task-9", verdict: "captain", summary: "PR https://example.com/pr/9 checks green, ready for review" }, undefined, undefined, {});
+await report.execute("call-3", { task: "task-9", verdict: "captain", summary: "PR https://example.com/pr/9 checks green, ready for review", wakeSequence: 3 }, undefined, undefined, {});
 if (sentToMain[2].options.triggerTurn !== true || sentToMain[2].options.deliverAs !== "followUp") {
   throw new Error(`captain merge must trigger exactly one follow-up turn: ${JSON.stringify(sentToMain[2].options)}`);
 }
@@ -486,6 +494,44 @@ EOF
   pass "a completed branch wake without a durable report falls back to main"
 }
 
+test_failed_merge_preserves_wake_fallback() {
+  local repo home out status
+  repo="$TMP_ROOT/merge-failure-root"
+  home="$TMP_ROOT/merge-failure-home"
+  mkdir -p "$home/state" "$home/config"
+  install_pi_branch_extension_fixture "$repo"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { dispatch, settle, mainUserMessages, sentToMain, home }; })()`);
+const { dispatch, settle, mainUserMessages, sentToMain, home } = globalThis.__t;
+import { readFileSync } from "node:fs";
+globalThis.__fmBlockPrompt = true;
+if (!dispatch("signal: merge delivery failure").accepted) throw new Error("wake was not accepted");
+await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "merge-failure prompt");
+const session = globalThis.__fmSessions[0];
+const report = session.options.customTools.find((tool) => tool.name === "fm_branch_report");
+globalThis.__fmRejectMergeDelivery = true;
+try {
+  await report.execute("failed-merge", { task: "task-x", verdict: "routine", summary: "handled", wakeSequence: 1 });
+} catch {}
+globalThis.__fmRejectMergeDelivery = false;
+session.resolvePrompt();
+await settle(() => mainUserMessages.length === 1, "failed-merge fallback");
+if (sentToMain.length !== 0) throw new Error("failed merge was recorded as delivered");
+if (!mainUserMessages[0].content.includes("without a durable outcome report")) {
+  throw new Error("failed merge did not preserve fallback to main");
+}
+const rows = readFileSync(`${home}/state/branch-outcomes.jsonl`, "utf8").trim().split("\n");
+if (rows.length !== 1) throw new Error("store-first outcome was not preserved after merge failure");
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "a failed main merge must preserve wake fallback: $out"
+  pass "a failed main merge preserves the durable outcome and wake fallback"
+}
+
 test_accepted_wakes_fall_back_during_shutdown() {
   local repo home out status
   repo="$TMP_ROOT/shutdown-root"
@@ -504,6 +550,10 @@ await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "active branch p
 const { readFileSync } = await import("node:fs");
 const { spawnSync } = await import("node:child_process");
 const generation = readFileSync(`${home}/state/.pi-branch-generation`, "utf8").trim();
+const bashTool = globalThis.__fmSessions[0].options.customTools.find((tool) => tool.name === "bash");
+globalThis.__fmBlockBash = true;
+const bashRun = bashTool.execute("bash-call", { command: "long lifecycle action" });
+await settle(() => typeof globalThis.__fmResolveBash === "function", "active branch bash tool");
 const claim = spawnSync("bash", [`${process.env.FM_ROOT_OVERRIDE}/bin/fm-lease.sh`, "claim", "shutdown-task", "--actor", "branch"], {
   encoding: "utf8",
   env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: `${home}/state`, FM_LEASE_HOLDER_PID: String(process.pid), FM_LEASE_GENERATION: generation },
@@ -515,6 +565,12 @@ await new Promise((resolve) => setTimeout(resolve, 30));
 if (mainUserMessages.length !== 0) throw new Error("shutdown used the invalidated extension API");
 globalThis.__fmRejectMainDelivery = false;
 fire("session_start");
+await new Promise((resolve) => setTimeout(resolve, 30));
+const { existsSync, readdirSync } = await import("node:fs");
+if (!existsSync(`${home}/state/.lease-shutdown-task`)) throw new Error("shutdown released a lease before its tool quiesced");
+if (mainUserMessages.length !== 0) throw new Error("replacement fallback ran before branch tools quiesced");
+globalThis.__fmResolveBash();
+await bashRun;
 await settle(() => mainUserMessages.length === 2, "replacement-session fallbacks");
 const delivered = mainUserMessages.map((item) => item.content).join("\n");
 if (!delivered.includes("signal: active during shutdown")) throw new Error("active accepted wake was lost");
@@ -525,8 +581,7 @@ if (mainUserMessages.some((item) => item.options.deliverAs !== "followUp")) {
 if (readFileSync(`${home}/state/.pi-branch-generation`, "utf8").trim() === generation) {
   throw new Error("shutdown did not invalidate the disposed branch generation");
 }
-const { existsSync, readdirSync } = await import("node:fs");
-if (existsSync(`${home}/state/.lease-shutdown-task`)) throw new Error("shutdown left a live branch lease wedged");
+if (existsSync(`${home}/state/.lease-shutdown-task`)) throw new Error("shutdown left a quiesced branch lease wedged");
 if (readdirSync(`${home}/state/branch-pending-wakes`).some((name) => name.endsWith(".json"))) {
   throw new Error("replacement-session fallback left accepted wake markers unread");
 }
@@ -661,6 +716,7 @@ test_branch_dispatch_two_stage_filter_and_prefix_contract
 test_branch_cache_key_is_per_home_stable
 test_branch_gating_config_afk_and_fallback
 test_completed_wake_without_report_falls_back
+test_failed_merge_preserves_wake_fallback
 test_accepted_wakes_fall_back_during_shutdown
 test_branch_mirror_filters_order_and_cursor
 test_branch_session_persists_across_process_restarts

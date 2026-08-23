@@ -45,7 +45,7 @@ test_branch_prompt_is_byte_stable_and_above_cache_floor() {
     *) fail "branch prompt lost its role preamble" ;;
   esac
   case "$out_a" in
-    *"4. Report:"*"5. Acknowledge only after fm_branch_report succeeds:"*) ;;
+    *"4. Report:"*"5. Acknowledge only after every fm_branch_report succeeds:"*) ;;
     *) fail "branch prompt does not require a durable report before wake acknowledgement" ;;
   esac
   case "$out_a" in
@@ -96,15 +96,51 @@ PY
   replay=$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" startup-replay) || fail "startup-replay failed"
   assert_contains "$replay" "BRANCH OUTCOMES" "replay lost its section header"
   assert_contains "$replay" "https://example.com/pr/2" "replay lost the unread outcome"
+  [ "$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" startup-replay)" = "$replay" ] \
+    || fail "startup-replay advanced its cursor before delivery acknowledgement"
+  FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" startup-replay-ack --through 2 \
+    || fail "startup replay acknowledgement failed"
   [ -z "$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" startup-replay)" ] \
-    || fail "startup-replay re-presented already-read outcomes"
+    || fail "acknowledged startup replay was presented again"
   FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append \
     --task task-3 --verdict routine --summary 'later outcome' >/dev/null || fail "third append failed"
   case "$(cat "$store")" in
     "$snapshot"*) ;;
     *) fail "a later append disturbed earlier store bytes" ;;
   esac
-  pass "outcome store is append-only with cursor-based unread reads and one-shot startup replay"
+  pass "outcome store is append-only with cursor-based unread reads and acknowledged startup replay"
+}
+
+test_branch_ack_requires_every_presented_outcome() {
+  local home drain_out drain_err through generation first_seq second_seq out
+  home="$TMP_ROOT/ack-coverage-home"
+  mkdir -p "$home/state"
+  STATE="$home/state"
+  # shellcheck source=bin/fm-wake-lib.sh
+  . "$ROOT/bin/fm-wake-lib.sh"
+  fm_wake_append signal task-a 'first event' || fail "first wake append failed"
+  fm_wake_append check task-b 'second event' || fail "second wake append failed"
+  drain_out="$home/drain.out"
+  drain_err="$home/drain.err"
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$ROOT/bin/fm-wake-drain.sh" >"$drain_out" 2>"$drain_err" \
+    || fail "branch coverage drain failed"
+  through=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through \([0-9][0-9]*\) --recovery-generation [A-Za-z0-9._-][A-Za-z0-9._-]*$/\1/p' "$drain_err")
+  generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$drain_err")
+  first_seq=$(awk -F '\t' 'NR == 1 { print $2 }' "$drain_out")
+  second_seq=$(awk -F '\t' 'NR == 2 { print $2 }' "$drain_out")
+  FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append --task task-a --verdict routine \
+    --summary handled --wake-seq "$first_seq" >/dev/null || fail "first covered outcome append failed"
+  out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-wake-drain.sh" \
+    --ack-through "$through" --recovery-generation "$generation" 2>&1)
+  [ $? -ne 0 ] || fail "branch acknowledgement consumed an event without an outcome"
+  assert_contains "$out" "wake sequence $second_seq has no durable outcome" "coverage refusal did not identify the omitted wake"
+  [ -s "$home/state/.wake-queue" ] || fail "coverage refusal consumed the durable wake queue"
+  FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append --task task-b --verdict routine \
+    --summary handled --wake-seq "$second_seq" >/dev/null || fail "second covered outcome append failed"
+  FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-wake-drain.sh" \
+    --ack-through "$through" --recovery-generation "$generation" || fail "fully covered acknowledgement failed"
+  [ ! -s "$home/state/.wake-queue" ] || fail "fully covered acknowledgement left wakes queued"
+  pass "branch acknowledgement requires a durable outcome for every presented wake"
 }
 
 # --- lease contract -----------------------------------------------------------
@@ -310,6 +346,7 @@ test_home_without_branch_is_untouched() {
 
 test_branch_prompt_is_byte_stable_and_above_cache_floor
 test_outcome_store_is_append_only_with_cursor_reads
+test_branch_ack_requires_every_presented_outcome
 test_lease_exclusivity_release_stale_and_sweep
 test_mutating_scripts_refuse_the_other_actors_lease
 test_main_owned_actions_refuse_the_branch_actor

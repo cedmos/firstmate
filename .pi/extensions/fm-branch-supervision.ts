@@ -197,7 +197,10 @@ export default function (pi: ExtensionAPI) {
   let shuttingDown = false;
   let sessionGeneration = 0;
   let pendingWakeCounter = 0;
-  let activeWake: { reported: boolean } | null = null;
+  let activeWake: { mergedWakeSequences: Set<number> } | null = null;
+  let activeBranchTools = 0;
+  let branchToolWaiters: Array<() => void> = [];
+  let branchCleanup: Promise<boolean> = Promise.resolve(true);
   // Serializes branch work: mirror appends and wake turns run strictly in
   // dispatch order, one at a time (the branch runs drain -> handle -> ack
   // serially by design).
@@ -212,6 +215,23 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // Diagnostic marker only; never block loading on it.
     }
+  }
+
+  function beginBranchTool(): void {
+    activeBranchTools += 1;
+  }
+
+  function endBranchTool(): void {
+    activeBranchTools -= 1;
+    if (activeBranchTools !== 0) return;
+    const waiters = branchToolWaiters;
+    branchToolWaiters = [];
+    for (const resolveWaiter of waiters) resolveWaiter();
+  }
+
+  function waitForBranchTools(): Promise<void> {
+    if (activeBranchTools === 0) return Promise.resolve();
+    return new Promise((resolveWaiter) => branchToolWaiters.push(resolveWaiter));
   }
 
   function releaseBranchLeases(): boolean {
@@ -282,12 +302,20 @@ export default function (pi: ExtensionAPI) {
           "One or two sentences in captain outcome language; include the full https:// PR URL when a PR is involved",
       }),
       wake: Type.Optional(Type.String({ description: "The wake reason line this outcome answers" })),
+      wakeSequence: Type.Optional(
+        Type.Number({ description: "The drained wake row sequence, or 0 when the drain presented no queue row" }),
+      ),
     }),
     execute: async (_toolCallId, params) => {
       const task = String((params as { task: unknown }).task || "").trim();
       const verdictRaw = String((params as { verdict: unknown }).verdict || "");
       const summary = String((params as { summary: unknown }).summary || "").trim();
       const wake = String((params as { wake?: unknown }).wake ?? "").trim();
+      const wakeSequenceRaw = (params as { wakeSequence?: unknown }).wakeSequence;
+      const wakeSequence =
+        typeof wakeSequenceRaw === "number" && Number.isInteger(wakeSequenceRaw) && wakeSequenceRaw >= 0
+          ? wakeSequenceRaw
+          : null;
       if (!task || !summary || (verdictRaw !== "routine" && verdictRaw !== "captain")) {
         return {
           content: [{ type: "text", text: "invalid report: task, verdict (routine|captain), and summary are required" }],
@@ -295,23 +323,36 @@ export default function (pi: ExtensionAPI) {
           isError: true,
         };
       }
-      const verdict = verdictRaw as Verdict;
-      const appendArgs = ["append", "--task", task, "--verdict", verdict, "--summary", summary];
-      if (wake) appendArgs.push("--wake", wake);
-      const appended = runOutcomeScript(appendArgs);
-      if (!appended.ok) {
+      if (activeWake && wakeSequence === null) {
         return {
-          content: [{ type: "text", text: `outcome store append failed (nothing merged): ${appended.detail}` }],
+          content: [{ type: "text", text: "invalid report: wakeSequence is required for an active supervision wake" }],
           details: undefined,
           isError: true,
         };
       }
-      if (activeWake) activeWake.reported = true;
-      mergeIntoMain(appended.stdout, task, verdict, summary);
-      return {
-        content: [{ type: "text", text: `recorded seq ${appended.stdout} and merged [${verdict}] into main` }],
-        details: undefined,
-      };
+      const verdict = verdictRaw as Verdict;
+      const appendArgs = ["append", "--task", task, "--verdict", verdict, "--summary", summary];
+      if (wake) appendArgs.push("--wake", wake);
+      if (wakeSequence !== null) appendArgs.push("--wake-seq", String(wakeSequence));
+      beginBranchTool();
+      const appended = runOutcomeScript(appendArgs);
+      try {
+        if (!appended.ok) {
+          return {
+            content: [{ type: "text", text: `outcome store append failed (nothing merged): ${appended.detail}` }],
+            details: undefined,
+            isError: true,
+          };
+        }
+        mergeIntoMain(appended.stdout, task, verdict, summary);
+        if (activeWake && wakeSequence !== null) activeWake.mergedWakeSequences.add(wakeSequence);
+        return {
+          content: [{ type: "text", text: `recorded seq ${appended.stdout} and merged [${verdict}] into main` }],
+          details: undefined,
+        };
+      } finally {
+        endBranchTool();
+      }
     },
   };
 
@@ -383,6 +424,15 @@ export default function (pi: ExtensionAPI) {
         },
       }),
     });
+    const executeBash = bashTool.execute.bind(bashTool);
+    bashTool.execute = async (...args) => {
+      beginBranchTool();
+      try {
+        return await executeBash(...args);
+      } finally {
+        endBranchTool();
+      }
+    };
     const created = await createAgentSession({
       cwd: fmRoot,
       sessionManager,
@@ -482,13 +532,15 @@ export default function (pi: ExtensionAPI) {
         }
         const session = await ensureBranch();
         await flushMirror(session);
-        const wakeState = { reported: false };
+        const wakeState = { mergedWakeSequences: new Set<number>() };
         activeWake = wakeState;
         try {
           await session.prompt(
             `FIRSTMATE SUPERVISION WAKE: ${message}\n\nHandle this per your operating procedure and finish with fm_branch_report.`,
           );
-          if (!wakeState.reported) throw new Error("supervision branch completed without a durable outcome report");
+          if (wakeState.mergedWakeSequences.size === 0) {
+            throw new Error("supervision branch completed without a durable outcome report");
+          }
           clearAcceptedWake(pendingPath);
         } finally {
           if (activeWake === wakeState) activeWake = null;
@@ -567,7 +619,11 @@ export default function (pi: ExtensionAPI) {
     shuttingDown = false;
     branchBroken = "";
     markLoaded();
-    if (releaseBranchLeases()) replayAcceptedWakes();
+    const startedGeneration = sessionGeneration;
+    void branchCleanup.then(() => {
+      if (shuttingDown || startedGeneration !== sessionGeneration) return;
+      if (releaseBranchLeases()) replayAcceptedWakes();
+    });
     // A replacement main session (/new, /resume) restarts dialog mirroring
     // from the new session file; collectMainDialog re-anchors the cursor.
   });
@@ -584,7 +640,7 @@ export default function (pi: ExtensionAPI) {
       }
       branch = null;
     }
-    releaseBranchLeases();
+    branchCleanup = waitForBranchTools().then(() => releaseBranchLeases());
   });
 
   pi.registerTool?.({

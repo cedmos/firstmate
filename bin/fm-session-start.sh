@@ -721,7 +721,11 @@ else
   BRANCH_REPLAY_OUT=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
     "$SCRIPT_DIR/fm-branch-outcome.sh" startup-replay 2>&1) || BRANCH_REPLAY_OUT=
   if [ -n "$BRANCH_REPLAY_OUT" ]; then
-    printf '%s\n' "$BRANCH_REPLAY_OUT"
+    BRANCH_REPLAY_LAST=$(printf '%s\n' "$BRANCH_REPLAY_OUT" | sed -n 's/^{"seq":\([0-9][0-9]*\),.*/\1/p' | tail -n 1)
+    if printf '%s\n' "$BRANCH_REPLAY_OUT" && [ -n "$BRANCH_REPLAY_LAST" ]; then
+      FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+        "$SCRIPT_DIR/fm-branch-outcome.sh" startup-replay-ack --through "$BRANCH_REPLAY_LAST" 2>/dev/null || true
+    fi
   fi
   DRAIN_OUT=$("$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
   if [ -n "$DRAIN_OUT" ]; then
