@@ -33,6 +33,16 @@ The `/calm` command replaces the file atomically before changing live presentati
 The extension reloads this preference on every Pi `session_start`, including startup, new, resume, fork, and reload reasons.
 This preference is local to each Firstmate home and is not part of secondmate inherited configuration.
 
+## Pi supervision branch (config/pi-supervision-branch)
+
+On a Pi primary, fleet wakes are handled by a persistent in-process supervision branch that keeps the captain's conversation clean; [docs/pi-supervision-branch.md](pi-supervision-branch.md) owns the architecture.
+The gitignored `config/pi-supervision-branch` file under the effective home controls it: absent, empty, or `on` enables the branch, and `off` disables it so every wake reaches the captain-facing conversation exactly as before the branch existed.
+Any other value also disables the branch, failing toward today's behavior rather than guessing.
+The file is read fresh at every wake offer, so a toggle takes effect without restarting Pi.
+Homes on any other primary harness never read this file and are entirely unaffected.
+Runtime state lives in `state/branch-outcomes.jsonl` with its `.branch-outcomes-cursor`, the persistent conversation under `state/branch-session/` with its `.branch-session` pointer and `.branch-mirror-cursor`, and per-task `state/.lease-<task>` files; `bin/fm-branch-outcome.sh` and `bin/fm-lease-lib.sh` own those formats.
+This preference is local to each Firstmate home and is not part of secondmate inherited configuration; the absent-means-enabled default applies in every home independently.
+
 ## Backlog backend (.tasks.toml / config/backlog-backend)
 
 The tracked `.tasks.toml` pins the default `tasks-axi` markdown backend to `data/backlog.md`, with `done_keep = 10` and an archive at `data/done-archive.md`.

@@ -19,6 +19,10 @@ When this session owns supervision and away mode is not active:
 11. Never use shell `&` for watcher supervision.
    The arm mechanism above is extension-owned, not a model tool call, but a manual recovery probe that backgrounds, pipes, or bundles the arm is denied automatically by the PreToolUse seatbelt (`bin/fm-arm-pretool-check.sh`, wired into the turn-end guard extension at `__FM_PI_TURNEND_EXT__`).
 
+When the supervision branch is enabled (config/pi-supervision-branch absent or "on"; docs/pi-supervision-branch.md), the watcher extension hands each ordinary actionable wake to the persistent in-process supervision branch instead of this conversation, and branch outcomes return as appended "⎇ branch merged [...]" notes, of which only captain-relevant ones open a turn.
+This conversation still receives every wake when the branch is disabled, unavailable, or away mode is active, and every watcher-failure alarm regardless, so the arm and repair contract above is unchanged.
+Treat a merged note as already handled - do not re-drain or re-handle its event - and read the durable outcome store with the fm_branch_outcomes tool when the captain asks what happened.
+
 The turn-end guard extension lives at `__FM_PI_TURNEND_EXT__`.
 The watcher extension lives at `__FM_PI_EXT__`.
 Both are tracked, project-local `.pi/extensions/*.ts` files that Pi auto-discovers once the project is trusted; `bin/fm-session-start.sh` reports when the running Pi session has not loaded both required extensions.

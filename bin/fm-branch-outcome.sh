@@ -110,7 +110,10 @@ shift 2>/dev/null || true
 
 case "$CMD" in
   append)
-    TASK= VERDICT= SUMMARY= WAKE=
+    TASK=''
+    VERDICT=''
+    SUMMARY=''
+    WAKE=''
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --task) TASK=${2:-}; shift 2 || usage ;;

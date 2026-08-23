@@ -43,6 +43,7 @@ import {
   FM_BRANCH_DISPATCH_EVENT,
   type BranchDispatchOffer,
 } from "./lib/fm-branch-dispatch.ts";
+import { encodeFirstmateOperationalInput } from "./lib/fm-operational-input.ts";
 
 const extensionFile = fileURLToPath(import.meta.url);
 const extensionDir = dirname(extensionFile);
@@ -149,13 +150,19 @@ type ReadonlyEntries = {
 };
 
 // Collect main's not-yet-mirrored captain/assistant dialog from its session
-// entries (durable, so a restart replays from the same source), advancing the
-// durable cursor to the collected point.
+// entries (durable, so a restart replays from the same source). The in-memory
+// anchor stops the next turn_end from re-collecting the same entries, while
+// the DURABLE cursor advances only after the batch was actually delivered
+// into the branch (flushMirror), so a crash between collect and delivery
+// re-mirrors rather than drops - over-mirroring is idempotent context.
+let collectAnchor: MirrorCursor | null = null;
+let pendingCursor: MirrorCursor | null = null;
+
 function collectMainDialog(sessionManager: ReadonlyEntries): MirrorItem[] {
   const file = sessionManager.getSessionFile() ?? "";
   const entries = sessionManager.getEntries();
-  const cursor = readMirrorCursor();
-  const start = cursor.file === file ? Math.min(cursor.index, entries.length) : 0;
+  const anchor = collectAnchor ?? readMirrorCursor();
+  const start = anchor.file === file ? Math.min(anchor.index, entries.length) : 0;
   const items: MirrorItem[] = [];
   for (const entry of entries.slice(start)) {
     if (entry.type !== "message") continue;
@@ -167,7 +174,8 @@ function collectMainDialog(sessionManager: ReadonlyEntries): MirrorItem[] {
     if (message.role === "user" && isOperationalUserText(text)) continue;
     items.push({ tag: message.role === "user" ? "captain" : "main", text: capMirrorText(text) });
   }
-  writeMirrorCursor({ file, index: entries.length });
+  collectAnchor = { file, index: entries.length };
+  pendingCursor = collectAnchor;
   return items;
 }
 
@@ -374,20 +382,32 @@ export default function (pi: ExtensionAPI) {
 
   async function flushMirror(session: AgentSession): Promise<void> {
     while (pendingMirror.length > 0) {
-      const item = pendingMirror.shift();
-      if (!item) break;
+      const item = pendingMirror[0];
       await session.sendCustomMessage(
         { customType: "fm-main-mirror", content: `[${item.tag}] ${item.text}`, display: false },
         {},
       );
+      // Remove only after the append succeeded, so a failure retries the same
+      // item in order instead of dropping it.
+      pendingMirror.shift();
+    }
+    if (pendingCursor) {
+      writeMirrorCursor(pendingCursor);
+      pendingCursor = null;
     }
   }
 
   function fallbackToMain(message: string, detail: string): void {
-    pi.sendUserMessage(
-      `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. (Supervision branch unavailable, falling back to main: ${detail})`,
-      { deliverAs: "followUp" },
-    );
+    const body = `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. (Supervision branch unavailable, falling back to main: ${detail})`;
+    let content = body;
+    try {
+      // Marked operational like every watcher injection, so the wake is never
+      // mistaken for captain input (away-mode return semantics, mirror filter).
+      content = encodeFirstmateOperationalInput("watcher", body);
+    } catch {
+      // An encoding failure must not lose the wake; deliver it unmarked.
+    }
+    pi.sendUserMessage(content, { deliverAs: "followUp" });
   }
 
   function enqueueWake(message: string): void {
@@ -436,6 +456,9 @@ export default function (pi: ExtensionAPI) {
   pi.on?.("agent_end", () => {
     mainStreaming = false;
   });
+  pi.on?.("agent_settled", () => {
+    mainStreaming = false;
+  });
 
   // Mirror at main's turn_end: collect the new captain/assistant dialog
   // durably (cursor-advanced) right away, deliver it into the branch through
@@ -450,7 +473,15 @@ export default function (pi: ExtensionAPI) {
     enqueueMirrorFlush();
   });
 
+  // Pi emits session_shutdown for ordinary same-process replacements (/new,
+  // /resume, /fork, reload) as well as terminal quit, exactly as the watcher
+  // extension documents. Shutdown quiesces this generation and releases the
+  // branch session; a replacement session_start re-arms, and the next wake
+  // reopens the persistent branch from its recorded pointer. Terminal quit
+  // simply never fires another session_start.
   pi.on?.("session_start", () => {
+    shuttingDown = false;
+    branchBroken = "";
     markLoaded();
     // A replacement main session (/new, /resume) restarts dialog mirroring
     // from the new session file; collectMainDialog re-anchors the cursor.
