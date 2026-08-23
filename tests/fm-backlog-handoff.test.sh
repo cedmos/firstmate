@@ -126,6 +126,53 @@ EOF
   pass "a failed receiver wake is loud and retries from an already-present handoff"
 }
 
+test_known_receiver_failure_remains_retryable_after_grace() {
+  local home="$TMP_ROOT/known-fail-main" sub="$TMP_ROOT/known-fail-sub"
+  local basebin rejectbin="$TMP_ROOT/known-fail-reject" out corr phase rc=0
+  setup_homes "$home" "$sub"
+  mkdir -p "$sub/data" "$rejectbin"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] known-fail - retry after known receiver rejection (repo: alpha)
+
+## Done
+EOF
+  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  basebin=$(make_fake_tmux "$TMP_ROOT/known-fail-fake")
+  cat > "$rejectbin/tmux" <<'SH'
+#!/usr/bin/env bash
+[ "${1:-}" != send-keys ] || exit 1
+exec "$FM_BASE_TMUX" "$@"
+SH
+  chmod +x "$rejectbin/tmux"
+
+  out=$(PATH="$rejectbin:$basebin:$PATH" FM_BASE_TMUX="$basebin/tmux" \
+    FM_HOME="$home" FM_FAKE_TMUX_WINDOW='firstmate:fm-design' \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/known-fail-tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/known-fail-fake/pane.txt" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design known-fail 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "known receiver rejection reported handoff success"
+  assert_grep 'known-fail' "$sub/data/backlog.md" "known receiver rejection lost the durable item"
+  corr=$(cut -d: -f2- "$home/state/.backlog-handoff-design.wake-pending")
+  assert_absent "$home/state/pending-replies/.delivery-confirmed-$corr" \
+    "known receiver rejection retained an attempted-delivery marker"
+  FM_PENDING_REPLY_NOW=9999999999 bash -c '
+    . "$1"
+    fm_pending_reply_reconcile_delivery "$2" "$3" >/dev/null 2>&1 || true
+  ' _ "$ROOT/bin/fm-pending-reply-lib.sh" "$home/state" "$corr"
+  phase=$(sed -n 's/^phase=//p' "$home/state/pending-replies/$corr")
+  [ "$phase" = awaiting_report ] \
+    || fail "known receiver rejection aged into unretryable phase $phase"
+
+  : > "$TMP_ROOT/default-tmux.log"
+  FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design known-fail \
+    > "$TMP_ROOT/known-fail-retry.out" 2>&1 \
+    || fail "known receiver rejection did not retry: $(cat "$TMP_ROOT/known-fail-retry.out")"
+  assert_grep 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log" \
+    "known receiver rejection retry did not wake the receiver"
+  pass "a known receiver failure stays retryable after reconciliation grace"
+}
+
 test_move_crash_keeps_wake_pending_for_recovery() {
   local home="$TMP_ROOT/move-crash-main" sub="$TMP_ROOT/move-crash-sub"
   local fakebin="$TMP_ROOT/move-crash-fakebin" real_tasks rc=0
@@ -965,6 +1012,7 @@ EOF
 
 test_handoff_wakes_live_local_receiver
 test_failed_wake_retries_when_the_item_is_already_present
+test_known_receiver_failure_remains_retryable_after_grace
 test_move_crash_keeps_wake_pending_for_recovery
 test_delivery_confirmation_crash_does_not_resend
 test_concurrent_local_handoffs_serialize_move_and_wake

@@ -390,10 +390,6 @@ wake_secondmate_receiver() { # <secondmate-id> <correlation-id>
     printf 'error: secondmate %s has non-secondmate endpoint metadata; backlog is durable but the receiver was not woken\n' "$id" >&2
     return 1
   }
-  fm_pending_reply_prepare_delivery "$STATE" "$corr" || {
-    printf 'error: receiver wake delivery for secondmate %s could not be prepared\n' "$id" >&2
-    return 1
-  }
   out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$FM_ROOT" \
     FM_PENDING_REPLY_EXISTING_CORR="$corr" \
     "$SCRIPT_DIR/fm-send.sh" "$id" "$RECEIVER_WAKE_MESSAGE" 2>&1) || rc=$?

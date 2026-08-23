@@ -412,6 +412,21 @@ fm_pending_reply_reconcile_delivery() {  # <state-dir> <corr_id>
   return 1
 }
 
+fm_pending_reply_reset_known_undelivered() {  # <state-dir> <corr_id>
+  local state=$1 corr=$2 rec delivered phase marker entry
+  rec=$(fm_pending_reply_path "$state" "$corr")
+  [ -f "$rec" ] && [ ! -L "$rec" ] || return 1
+  delivered=$(fm_pending_reply_get "$rec" delivered_epoch)
+  [ -z "$delivered" ] || return 1
+  phase=$(fm_pending_reply_get "$rec" phase)
+  [ "$phase" = awaiting_report ] || return 1
+  marker=$(fm_pending_reply_delivery_confirmation_path "$state" "$corr")
+  [ -e "$marker" ] || [ -L "$marker" ] || return 0
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  entry=$(cat "$marker" 2>/dev/null || true)
+  case "$entry" in attempted=*) rm -f -- "$marker" ;; *) return 1 ;; esac
+}
+
 # Drop an undelivered expectation after a failed send so transport failure does
 # not masquerade as a missed report later.
 fm_pending_reply_discard_undelivered() {  # <state-dir> <corr_id>
