@@ -283,7 +283,7 @@ export default function (pi: ExtensionAPI) {
       const result = spawnSync("bash", [leaseScript, "release-actor", "--actor", "branch"], {
         cwd: fmRoot,
         encoding: "utf8",
-        env: scriptEnv,
+        env: { ...scriptEnv, FM_SUPERVISION_ACTOR: "branch" },
       });
       return result.status === 0;
     } catch {

@@ -14,15 +14,16 @@
 #       actor holds a live lease. A stale lease (dead pid, or a torn record)
 #       is cleared and re-claimed.
 #   fm-lease.sh release <task> [--actor main|branch]
-#       Drop the named actor's lease. Releasing a lease the actor does not
+#       Drop the calling actor's lease. Releasing a lease the actor does not
 #       hold is a silent no-op, so a retry after a partial failure is safe.
-#       Passing the OTHER actor's name is the explicit wedged-lease override
-#       the guard's refusal message points at; it prints what it removed.
+#       The requested actor must match $FM_SUPERVISION_ACTOR (else main), so
+#       one actor can never clear the other actor's live coordination fence.
 #   fm-lease.sh check <task>
 #       Print "<actor> <pid> <epoch> <live|stale>" for a held lease, or
 #       nothing (exit 1) when the task is unleased.
 #   fm-lease.sh release-actor --actor main|branch
-#       Drop every lease held by one actor during session-generation cleanup.
+#       Drop every lease held by the calling actor during generation cleanup;
+#       the requested actor must match $FM_SUPERVISION_ACTOR (else main).
 #   fm-lease.sh sweep
 #       Remove every provably stale lease in this home. Run at session start
 #       (a lease held by a dead actor is cleared at session start); safe to
@@ -143,13 +144,14 @@ case "$CMD" in
     fi
     ;;
   release)
+    CALLER=$(fm_lease_actor) || exit "$FM_LEASE_REFUSE_EXIT"
+    if [ "$ACTOR" != "$CALLER" ]; then
+      echo "error: release refused - the $CALLER supervision actor cannot release the $ACTOR actor's lease on '$TASK'" >&2
+      exit "$FM_LEASE_REFUSE_EXIT"
+    fi
     if fm_lease_read "$TASK"; then
       if [ "$FM_LEASE_ACTOR" = "$ACTOR" ] || [ -z "$FM_LEASE_ACTOR" ]; then
-        CALLER=$(fm_lease_actor 2>/dev/null || echo main)
         rm -f -- "$(fm_lease_path "$TASK")"
-        if [ -n "$FM_LEASE_ACTOR" ] && [ "$FM_LEASE_ACTOR" != "$CALLER" ]; then
-          echo "released the $FM_LEASE_ACTOR actor's lease on '$TASK' (explicit override)"
-        fi
       fi
     fi
     ;;
@@ -159,6 +161,11 @@ case "$CMD" in
     printf '%s %s %s %s\n' "${FM_LEASE_ACTOR:-unreadable}" "${FM_LEASE_PID:-0}" "${FM_LEASE_EPOCH:-0}" "$LIVENESS"
     ;;
   release-actor)
+    CALLER=$(fm_lease_actor) || exit "$FM_LEASE_REFUSE_EXIT"
+    if [ "$ACTOR" != "$CALLER" ]; then
+      echo "error: release-actor refused - the $CALLER supervision actor cannot release the $ACTOR actor's leases" >&2
+      exit "$FM_LEASE_REFUSE_EXIT"
+    fi
     for LEASE in "$STATE"/.lease-*; do
       [ -e "$LEASE" ] || continue
       TASK=${LEASE##*/.lease-}

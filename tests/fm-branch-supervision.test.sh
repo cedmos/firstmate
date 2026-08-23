@@ -265,10 +265,27 @@ SH
   wait "$guard_pid" || fail "guard probe failed"
   FM_HOME="$home" "$ROOT/bin/fm-lease.sh" check guarded >/dev/null && fail "guard lease survived entrypoint cleanup"
 
-  # Release by holder name; release of an unheld lease stays a silent no-op.
-  FM_HOME="$home" "$ROOT/bin/fm-lease.sh" release task-1 --actor branch || fail "release failed"
+  # Only the owning actor may release its lease; release of an unheld lease
+  # stays a silent no-op for that actor.
+  FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-lease.sh" release task-1 --actor branch \
+    || fail "release failed"
   FM_HOME="$home" "$ROOT/bin/fm-lease.sh" check task-1 >/dev/null && fail "released lease still reported"
-  FM_HOME="$home" "$ROOT/bin/fm-lease.sh" release task-1 --actor branch || fail "idempotent release failed"
+  FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-lease.sh" release task-1 --actor branch \
+    || fail "idempotent release failed"
+
+  FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim protected-main --actor main \
+    || fail "protected main lease claim failed"
+  out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-lease.sh" \
+    release protected-main --actor main 2>&1)
+  [ $? -eq 6 ] || fail "branch release of a main lease was not refused: $out"
+  assert_contains "$out" "cannot release the main actor's lease" "cross-actor release refusal lost its authority boundary"
+  FM_HOME="$home" "$ROOT/bin/fm-lease.sh" check protected-main >/dev/null \
+    || fail "refused cross-actor release removed the main lease"
+  out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-lease.sh" \
+    release-actor --actor main 2>&1)
+  [ $? -eq 6 ] || fail "branch release-actor of main leases was not refused: $out"
+  FM_HOME="$home" "$ROOT/bin/fm-lease.sh" check protected-main >/dev/null \
+    || fail "refused cross-actor release-actor removed the main lease"
 
   # A lease held by a dead process is stale: claimable by the other actor and
   # removed by the sweep, while a live lease survives the sweep.
@@ -329,7 +346,7 @@ test_mutating_scripts_refuse_the_other_actors_lease() {
 
   # The same lease refuses the BRANCH actor when MAIN holds it - the guard is
   # symmetric, not a branch-only fence.
-  FM_HOME="$home" "$ROOT/bin/fm-lease.sh" release task-held --actor branch
+  FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-lease.sh" release task-held --actor branch
   FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim task-held --actor main \
     || fail "main fixture claim failed"
   out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-control.sh" task-held interrupt 2>&1)

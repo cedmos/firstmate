@@ -117,7 +117,7 @@ if (!existsSync(`${home}/state/.branch-session`)) {
 }
 // The real SessionManager writes the session file lazily (on its first
 // persisted entry), so assert the pointer's placement rather than the file:
-// the recorded path must live under this home's branch-session store.
+// the recorded path must live under this home branch-session store.
 const pointer = readFileSync(`${home}/state/.branch-session`, "utf8").trim();
 if (!pointer.startsWith(`${home}/state/branch-session/`) || !pointer.endsWith(".jsonl")) {
   throw new Error(`recorded branch session pointer is misplaced: ${pointer}`);

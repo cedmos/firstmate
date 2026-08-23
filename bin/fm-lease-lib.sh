@@ -27,8 +27,8 @@
 #     means the process died; the lease is cleared at the next claim, guard,
 #     or sweep. A lease held by a live pid but an abandoned conversation is
 #     cleared by the session-start sweep only when the pid proves dead;
-#     otherwise the loud release override in the refusal message is the
-#     recovery path.
+#     otherwise only the owning actor may release it; cross-actor release is
+#     refused so the coordination fence cannot be bypassed.
 #   - Guard semantics (fm_lease_guard): a live lease held by the OTHER actor
 #     refuses with exit FM_LEASE_REFUSE_EXIT. Otherwise an active Pi actor
 #     claims the task through fm-lease.sh and retains it until its entrypoint
@@ -165,7 +165,7 @@ fm_lease_guard() {
   fi
   if fm_lease_live "$task"; then
     if [ "$FM_LEASE_ACTOR" != "$actor" ]; then
-      echo "error: $action refused - task '$task' is leased to the $FM_LEASE_ACTOR supervision actor (state/.lease-$task); retry after it releases, or clear a wedged lease with bin/fm-lease.sh release $task --actor $FM_LEASE_ACTOR" >&2
+      echo "error: $action refused - task '$task' is leased to the $FM_LEASE_ACTOR supervision actor (state/.lease-$task); retry after the owning actor releases it" >&2
       exit "$FM_LEASE_REFUSE_EXIT"
     fi
     return 0
