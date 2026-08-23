@@ -35,6 +35,10 @@ if [ "$code" = FAIL ]; then
   printf 'curl: (7) failed to connect\n' >&2
   exit 7
 fi
+if [ "$code" = HANG ]; then
+  sleep 60
+  exit 7
+fi
 printf '%s' "$code"
 SH
   chmod +x "$fakebin/security" "$fakebin/curl"
@@ -285,9 +289,8 @@ test_snapshot_names_the_newest_delivered_result() {
   status_line "$home" zeta 'done: zeta shipped'
   rc=$(outbox "$home" --status "$home/state/zeta.status" --no-drain)
   expect_code 0 "$rc" "recording zeta failed"
-  # A record timestamps itself in whole seconds, so the second result has to land
-  # in a later second for "newest" to be well defined at all.
-  sleep 1
+  # Back to back on purpose: both records land in the same wall-clock second, so
+  # nothing but the monotonic ordinal can tell which result is the newer one.
   status_line "$home" alpha 'done: alpha shipped'
   rc=$(outbox "$home" --status "$home/state/alpha.status" --no-drain)
   expect_code 0 "$rc" "recording alpha failed"
@@ -392,42 +395,80 @@ test_same_result_text_from_a_new_event_is_delivered_again() {
   pass "identical result text from a genuinely new event is recorded and delivered again"
 }
 
-# The acceptance path the incident actually needed: the watcher advances its seen
-# markers after one attempt, so the retry can only come from a later pass.
-test_watcher_retries_a_failed_delivery_on_a_later_pass() {
-  local home pid i=0 receipt
-  home=$(make_home watcher)
-  http_code "$home" 503
-  status_line "$home" demo 'done: watcher result'
+# Every watcher case drives the real bin/fm-watch.sh. FM_FLOWY_EXIT_DRAIN_SECONDS
+# shortens the exit-path drain's wall-clock bound so a hung endpoint does not make
+# the suite wait out the production default.
+start_watcher() {  # <home> [extra env assignments...]
+  local home=$1
+  shift
+  env -u FLOWY_WEBHOOK_URL PATH="$home/fakebin:$PATH" \
+    FLOWY_TEST_CODE="$home/http-code" FLOWY_TEST_CALLS="$home/curl.calls" \
+    FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=0 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    FM_FLOWY_EXIT_DRAIN_SECONDS=2 "$@" \
+    "$ROOT/bin/fm-watch.sh" >>"$home/watch.out" 2>>"$home/watch.err" &
+}
 
-  run_watcher() {
-    env -u FLOWY_WEBHOOK_URL PATH="$home/fakebin:$PATH" \
-      FLOWY_TEST_CODE="$home/http-code" FLOWY_TEST_CALLS="$home/curl.calls" \
-      FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=0 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
-      "$ROOT/bin/fm-watch.sh" >>"$home/watch.out" 2>>"$home/watch.err" &
-  }
-
-  run_watcher
-  pid=$!
-  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 200 ]; do
+# Wait for a watcher to end on its own, as it does after a wake.
+await_watcher_exit() {  # <pid> <deciseconds> <message>
+  local pid=$1 limit=$2 i=0
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt "$limit" ]; do
     sleep 0.1
     i=$((i + 1))
   done
   if kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
-    fail "watcher did not surface the terminal result"
+    fail "$3"
   fi
   wait "$pid" 2>/dev/null || true
+}
+
+await_call_count_above() {  # <home> <count> <deciseconds>
+  local home=$1 floor=$2 limit=$3 i=0 seen
+  while [ "$i" -lt "$limit" ]; do
+    seen=$(call_count "$home")
+    [ -n "$seen" ] || seen=0
+    [ "$seen" -le "$floor" ] || return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# The acceptance path the incident actually needed: the watcher advances its seen
+# markers after one attempt, so the retry can only come from a later pass.
+test_watcher_retries_a_failed_delivery_on_a_later_pass() {
+  local home pid i=0 receipt after_first
+  home=$(make_home watcher)
+  http_code "$home" 503
+  status_line "$home" demo 'done: watcher result'
+
+  # First generation: the signal path records, the wake fires, and the bounded
+  # exit drain makes a REAL POST that the endpoint rejects with 503.
+  start_watcher "$home"
+  pid=$!
+  await_watcher_exit "$pid" 200 "watcher did not surface the terminal result"
+  after_first=$(call_count "$home")
+  [ -n "$after_first" ] && [ "$after_first" -gt 0 ] || \
+    fail "the first watcher generation never attempted a delivery, so nothing failed to retry"
   [ "$(pending_count "$home")" = 1 ] || fail "the watcher's failed delivery left nothing to retry"
   [ -z "$(sole_receipt "$home")" ] || fail "the watcher wrote a receipt without a 2xx"
 
-  # Second pass: the status signal is already seen, so only the durable outbox
-  # can still deliver this result.
-  http_code "$home" 200
-  run_watcher
+  # Second generation: the status signal is already seen, so this is the per-pass
+  # drain retrying on its own - and it fails against 503 exactly as the first did.
+  start_watcher "$home"
   pid=$!
-  i=0
+  await_call_count_above "$home" "$after_first" 200 || \
+    fail "a later watcher pass never retried the failed delivery"
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  [ "$(pending_count "$home")" = 1 ] || fail "a failed per-pass drain discarded the result"
+  [ -z "$(sole_receipt "$home")" ] || fail "a failed per-pass drain wrote a receipt without a 2xx"
+
+  # Third generation: the endpoint recovers and the per-pass drain delivers.
+  http_code "$home" 200
+  start_watcher "$home"
+  pid=$!
   while [ "$i" -lt 200 ]; do
     receipt=$(sole_receipt "$home")
     [ -z "$receipt" ] || break
@@ -436,11 +477,58 @@ test_watcher_retries_a_failed_delivery_on_a_later_pass() {
   done
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  [ -n "$receipt" ] || fail "a later watcher pass never retried the failed delivery"
+  [ -n "$receipt" ] || fail "a later watcher pass never retried the failed delivery to success"
   assert_contains "$(cat "$receipt")" "status: demo: done: watcher result" \
     "the retried delivery recorded the wrong result"
   [ "$(pending_count "$home")" = 0 ] || fail "the retried result stayed pending"
   pass "a later watcher pass retries a failed delivery to success"
+}
+
+test_watcher_delivers_before_the_pass_that_recorded_it_exits() {
+  local home pid
+  home=$(make_home exit-drain-prompt)
+  status_line "$home" demo 'done: prompt result'
+
+  start_watcher "$home"
+  pid=$!
+  await_watcher_exit "$pid" 200 "watcher did not surface the terminal result"
+
+  # No second generation runs: if the result is delivered, the exit path of the
+  # very pass that recorded it did it.
+  [ -n "$(sole_receipt "$home")" ] || \
+    fail "the watcher pass that recorded the result exited without delivering it"
+  assert_contains "$(cat "$(sole_receipt "$home")")" "status: demo: done: prompt result" \
+    "the exit drain delivered the wrong result"
+  [ "$(pending_count "$home")" = 0 ] || fail "a delivered result stayed pending"
+  pass "a result recorded on a watcher pass is delivered before that pass exits"
+}
+
+test_a_hung_endpoint_cannot_hold_the_watcher_past_the_exit_bound() {
+  local home pid started elapsed
+  home=$(make_home exit-drain-bound)
+  http_code "$home" HANG
+  status_line "$home" demo 'done: hung result'
+
+  started=$SECONDS
+  start_watcher "$home"
+  pid=$!
+  # The stub hangs for 60s. Without the bound the watcher would still be alive
+  # well past this window, so exiting inside it is the whole assertion.
+  await_watcher_exit "$pid" 200 "a hung endpoint held the watcher past its exit-drain bound"
+  elapsed=$((SECONDS - started))
+  [ "$elapsed" -lt 20 ] || fail "the exit drain took ${elapsed}s, so its wall-clock bound did not bind"
+
+  [ -n "$(calls "$home")" ] || fail "the exit drain never reached the endpoint at all"
+  [ "$(pending_count "$home")" = 1 ] || fail "a timed-out exit drain lost the result"
+  [ -z "$(sole_receipt "$home")" ] || fail "a timed-out exit drain wrote a receipt without a 2xx"
+  assert_absent "$home/state/flowy-last.md" "a timed-out exit drain wrote the display snapshot"
+
+  # Timing out is normal: a later pass against a healthy endpoint still delivers.
+  http_code "$home" 200
+  local rc
+  rc=$(outbox "$home" --drain)
+  expect_code 0 "$rc" "the result left pending by the bound was not delivered later"
+  pass "a hung endpoint cannot hold the watcher past its exit-drain bound"
 }
 
 test_delivers_from_url_file_and_keychain_with_no_env_var
@@ -459,3 +547,5 @@ test_snapshot_pending_line_tracks_undelivered_results
 test_a_dead_endpoint_costs_one_attempt_per_drain
 test_same_result_text_from_a_new_event_is_delivered_again
 test_watcher_retries_a_failed_delivery_on_a_later_pass
+test_watcher_delivers_before_the_pass_that_recorded_it_exits
+test_a_hung_endpoint_cannot_hold_the_watcher_past_the_exit_bound

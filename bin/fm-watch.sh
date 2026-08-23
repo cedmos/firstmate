@@ -891,6 +891,65 @@ if [ "${FM_WATCH_HANDLING_SUCCESSOR:-0}" = 1 ]; then
 elif [ "$FM_RECOVERY_MARKER_ACTION" = recover ]; then
   WATCHER_RECOVERY_PENDING=1
 fi
+# Armed by the signal path once it records a terminal result. A wake ends this
+# process, so that record would otherwise sit undelivered until a NEW watcher
+# generation reached the per-pass drain - on a healthy Flowy the captain would
+# lose a whole poll of promptness, and with nothing re-arming it would wait
+# indefinitely. This runs from the EXIT path, after the wake is already
+# published and after the watch lock is released, so it delays neither.
+#
+# THE BOUND IS THE POINT. FM_FLOWY_EXIT_DRAIN_SECONDS (default 5) is a single
+# ceiling on the WHOLE attempt, not a per-record timeout, plus at most a
+# half-second to tear the drain down, and it is deliberately far below POLL
+# (15s) so this can never outlive a re-arm. Without it a
+# blackholed endpoint would keep the exiting watcher alive and delay re-arming,
+# which is precisely the stall --no-drain removed from the signal path, moved
+# one step later. Hitting the bound is normal and safe: the outbox retires
+# nothing without a 2xx, so the record stays pending and the next generation's
+# per-pass drain - which remains the authoritative delivery owner - takes it.
+FLOWY_EXIT_DRAIN_ARMED=0
+flowy_exit_drain() {
+  local bound pid ticks=0 limit
+  [ "$FLOWY_EXIT_DRAIN_ARMED" -eq 1 ] || return 0
+  FLOWY_EXIT_DRAIN_ARMED=0
+  [ -x "$FLOWY_COMPLETION_OUTBOX" ] || return 0
+  bound=${FM_FLOWY_EXIT_DRAIN_SECONDS:-5}
+  case "$bound" in ''|*[!0-9]*) bound=5 ;; esac
+  limit=$((bound * 10))
+  [ "$limit" -gt 0 ] || return 0
+  # Own process group, so the bound kills any curl still in flight rather than
+  # orphaning it. Capping the outbox's own per-request timeout at the bound
+  # keeps a real curl from outliving this even if the signal is missed.
+  set -m
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_FLOWY_HTTP_TIMEOUT="$bound" \
+    "$FLOWY_COMPLETION_OUTBOX" --drain >/dev/null 2>&1 &
+  pid=$!
+  set +m
+  while [ "$ticks" -lt "$limit" ]; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+    ticks=$((ticks + 1))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    # wake() ignores HUP/INT/TERM before exiting, and an IGNORED disposition is
+    # inherited by children, so a TERM here would be silently discarded by the
+    # very drain this bound exists to stop. TERM first anyway for the exit paths
+    # that did not ignore it, then KILL, which nothing can ignore.
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    ticks=0
+    while [ "$ticks" -lt 5 ]; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+      ticks=$((ticks + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+  fi
+  wait "$pid" 2>/dev/null || true
+  return 0
+}
+
 watcher_cleanup() {
   local cleanup_status=0 owns_lock=0 transition=release-lock
   if [ "$(cat "$WATCH_LOCK/pid" 2>/dev/null || true)" = "${WATCHER_PID:-}" ]; then
@@ -908,6 +967,7 @@ watcher_cleanup() {
     echo "watcher: recovery state could not be persisted; retaining stale lock evidence" >&2
     cleanup_status=1
   fi
+  flowy_exit_drain
   return "$cleanup_status"
 }
 trap watcher_cleanup EXIT
@@ -1101,8 +1161,9 @@ EOF
     # outbox BEFORE the triage below advances the seen markers. --no-drain keeps
     # this to the local write: it opens no socket and reads no Keychain, so an
     # unreachable Flowy cannot delay the wake below it. The per-pass drain above
-    # is the sole owner of getting a record delivered, so a result is never lost
-    # to one bad POST either.
+    # is the authoritative owner of getting a record delivered, so a result is
+    # never lost to one bad POST either. Recording here arms the bounded EXIT
+    # drain, which restores same-pass promptness without ever preceding a wake.
     flowy_result_files=""
     while IFS=$(printf '\t') read -r sf sig f; do
       [ -n "$sf" ] || continue
@@ -1112,8 +1173,11 @@ EOF
         done:*|failed:*|blocked:*|needs-decision:*)
           flowy_result_files="$flowy_result_files $f"
           if [ -x "$FLOWY_COMPLETION_OUTBOX" ]; then
-            FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$FLOWY_COMPLETION_OUTBOX" --status "$f" --no-drain \
-              || triage_log "Flowy completion outbox could not record the result for $(basename "$f")"
+            if FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$FLOWY_COMPLETION_OUTBOX" --status "$f" --no-drain; then
+              FLOWY_EXIT_DRAIN_ARMED=1
+            else
+              triage_log "Flowy completion outbox could not record the result for $(basename "$f")"
+            fi
           fi
           ;;
       esac

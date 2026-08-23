@@ -22,8 +22,22 @@
 # caller on a latency-sensitive path can never be stalled by an unreachable
 # Flowy. Some later --drain is the sole owner of delivering what it recorded.
 #
+# CALLERS. bin/fm-watch.sh uses --no-drain on its signal path, because that path
+# runs immediately before the wake and must never wait on the network. Its
+# per-pass --drain is the sole AUTHORITATIVE delivery owner. Because a wake ends
+# the watcher process, a result recorded on the signal path would otherwise wait
+# for the next watcher generation to deliver it, so the watcher also runs one
+# --drain from its EXIT path after the wake is already durable. That exit drain
+# is a promptness optimization only, and it carries a hard total wall-clock
+# bound of FM_FLOWY_EXIT_DRAIN_SECONDS (default 5), well under the watcher's
+# 15-second poll: without the bound a blackholed endpoint would keep the exiting
+# watcher alive and delay re-arming, which is exactly the stall the record-only
+# signal path removes, moved one step later. Hitting the bound is a normal, safe
+# outcome - the record simply stays pending for the next per-pass drain.
+#
 # DRAIN (--drain, and implicitly after --status). Pending records are drained
-# oldest first and POSTed as JSON to the URL in config/grok-flowy-webhook,
+# oldest first by the monotonic ordinal each record carries, never by filename
+# collation, and POSTed as JSON to the URL in config/grok-flowy-webhook,
 # authenticated with the Keychain Bearer key for service firstmate-flowy-webhook.
 # No environment variable configures the endpoint. A record retires ONLY on
 # HTTP 2xx, at which point its per-record receipt is written to
@@ -63,10 +77,14 @@ CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # a drain killed mid-POST cannot wedge every later delivery behind its lock.
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# The repo's shared millisecond clock, used for the record ordinal below.
+# shellcheck source=bin/fm-timing-lib.sh
+. "$SCRIPT_DIR/fm-timing-lib.sh"
 
 OUTBOX="$STATE/flowy-outbox"
 PENDING_DIR="$OUTBOX/pending"
 DELIVERED_DIR="$OUTBOX/delivered"
+ORDINAL_FILE="$OUTBOX/.ordinal"
 DRAIN_LOCK="$OUTBOX/.drain.lock"
 SNAPSHOT="$STATE/flowy-last.md"
 WEBHOOK_FILE="$CONFIG/grok-flowy-webhook"
@@ -151,16 +169,42 @@ artifact_for() {  # <task> <status-file>
   fi
 }
 
+# A strictly increasing stamp for record creation order, kept separate from the
+# whole-second recorded= field so the payload's meaning does not change.
+# fm_timing_now_ms is the repo's shared millisecond clock, but it degrades to
+# whole seconds on a shell without EPOCHREALTIME (macOS system bash 3.2, which
+# `env bash` still resolves to here), and two records written in one second
+# would then tie and fall back to path collation - exactly the ordering bug the
+# drain order exists to close. Carrying the previous value forward as a floor
+# makes the stamp monotonic however coarse the clock is, and also survives a
+# clock that steps backwards.
+next_ordinal() {
+  local now last tmp
+  now=$(fm_timing_now_ms) || now=0
+  case "$now" in ''|*[!0-9]*) now=0 ;; esac
+  last=$(cat "$ORDINAL_FILE" 2>/dev/null || printf '0')
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ "$now" -gt "$last" ] || now=$((last + 1))
+  if tmp=$(umask 077; mktemp "$OUTBOX/.ordinal.XXXXXX"); then
+    printf '%s\n' "$now" > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$ORDINAL_FILE"
+  fi
+  printf '%s' "$now"
+}
+
 # Oldest recorded result first. A plain glob is collation-ordered, which would
 # let the drain finish on an older record and hand the display snapshot a result
-# that is not the newest one delivered.
+# that is not the newest one delivered. A record written before this field
+# existed sorts first, which is where an older result belongs.
 pending_records() {
-  local record recorded tab
+  local record ordinal tab
   tab=$(printf '\t')
   for record in "$PENDING_DIR"/*; do
     [ -f "$record" ] || continue
-    recorded=$(record_field "$record" recorded)
-    printf '%s%s%s\n' "${recorded:-0}" "$tab" "$record"
+    ordinal=$(record_field "$record" ordinal)
+    case "$ordinal" in ''|*[!0-9]*) ordinal=0 ;; esac
+    printf '%s%s%s\n' "$ordinal" "$tab" "$record"
   done | LC_ALL=C sort -t"$tab" -k1,1n -k2,2 | cut -d"$tab" -f2-
 }
 
@@ -183,7 +227,7 @@ EOF
 }
 
 record_result() {  # <status-file>
-  local file=$1 result task digest record artifact tmp signature
+  local file=$1 result task digest record artifact tmp signature ordinal
   [ -f "$file" ] && [ ! -L "$file" ] || {
     note "status file is unavailable or unsafe: $file"
     return 1
@@ -232,10 +276,12 @@ record_result() {  # <status-file>
     note "cannot create a pending record for $task"
     return 1
   }
+  ordinal=$(next_ordinal)
   {
     printf 'task=%s\n' "$task"
     printf 'digest=%s\n' "$digest"
     printf 'recorded=%s\n' "$(date +%s)"
+    printf 'ordinal=%s\n' "$ordinal"
     printf 'artifact=%s\n' "$artifact"
     printf 'status=%s\n' "$file"
     printf 'result=%s\n' "$result"
