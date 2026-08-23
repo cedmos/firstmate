@@ -1,0 +1,29 @@
+BASE COMMIT (f170ced) - before the fix
+
+$ sed -n '1,3p' '<TMP>/home/data/base-crew-role-z9/brief.md'
+You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
+
+# Task
+
+$ fm_spawn base-crew-role-z9 | tail -1
+spawned base-crew-role-z9 harness=codex kind=scout window=firstmate:fm-base-crew-role-z9 worktree=<TMP>/pool
+
+-- what the harness auto-loads in that crew worktree after spawn --
+
+$ sed -n '1,6p' '<TMP>/pool/AGENTS.md'
+# Firstmate
+
+You are the first mate.
+The user is the captain.
+This file is your entire job description.
+
+
+-- and session start still runs there, so a crewmate can take the helm --
+
+$ cd '<TMP>/pool' && FM_HOME='<TMP>/home' FM_ROOT_OVERRIDE='<TMP>/pool' FM_STATE_OVERRIDE='<TMP>/home/state' FM_DATA_OVERRIDE='<TMP>/home/data' FM_CONFIG_OVERRIDE='<TMP>/home/config' timeout 120 '<TMP>/firstmate/bin/fm-session-start.sh' 2>&1 | head -5; echo '...'
+
+================================================================================
+SESSION START - <TMP>/home
+================================================================================
+
+...

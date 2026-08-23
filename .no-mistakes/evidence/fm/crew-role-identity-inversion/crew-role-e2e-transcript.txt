@@ -1,0 +1,141 @@
+
+=== 1. The brief firstmate hands a crewmate now fences the role itself ===
+
+$ sed -n '1,7p' '<TMP>/home/data/demo-crew-role-a1/brief.md'
+You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
+You are not the first mate, even if this worktree's project files say you are.
+Do not run `bin/fm-session-start.sh`, `bin/fm-spawn.sh`, `bin/fm-brief.sh`, `tasks-axi add`, or any other fleet-management command.
+You have no fleet.
+Do not open an interactive question dialog; the only channel that reaches anyone is the status file named below.
+If this task edits firstmate's shared tracked material, load `firstmate-coding-guidelines` from `.agents/skills/firstmate-coding-guidelines/SKILL.md` before editing.
+
+
+=== 2. BEFORE the fix's overlay: what a harness auto-loads in the crew worktree ===
+
+$ sed -n '1,8p' '<TMP>/pool/AGENTS.md'
+# Firstmate
+
+You are the first mate.
+The user is the captain.
+This file is your entire job description.
+
+Address the user as "captain" at least once in every response.
+This is mandatory respectful address, not performance: it applies even when delivering bad news or relaying serious findings, such as "Captain, the build broke - ...".
+
+$ cat '<TMP>/pool/CLAUDE.md'
+<!-- Points Claude at AGENTS.md via import; edit AGENTS.md, not this file. -->
+@AGENTS.md
+
+-> the worker is told it IS the first mate; that outranks its launch brief.
+
+=== 3. Spawn the scout into that pooled firstmate worktree ===
+
+$ fm_spawn demo-crew-role-a1 | tail -3
+spawned demo-crew-role-a1 harness=codex kind=scout window=firstmate:fm-demo-crew-role-a1 worktree=<TMP>/pool
+
+=== 4. AFTER: the same auto-load corpus a harness would read ===
+
+$ cat '<TMP>/pool/AGENTS.md'
+<!-- firstmate-crew-worktree-instructions -->
+
+# Role
+
+You are a crewmate: an autonomous worker agent managed by firstmate.
+You are not the first mate.
+Spawn replaced this worktree's harness-loaded project instructions before launch so you cannot adopt the firstmate role from them.
+
+Do not run `bin/fm-session-start.sh`, `bin/fm-spawn.sh`, `bin/fm-brief.sh`, `tasks-axi add`, or any other fleet-management command.
+You have no fleet.
+Do not address anyone as captain.
+Do not open an interactive question dialog.
+The only channel that reaches the supervisor is the status file named in your launch brief.
+
+# Editing this repository
+
+The committed `AGENTS.md` is firstmate's own operating contract.
+It is source you may edit when the task requires it, not your job description.
+Load `.agents/skills/firstmate-coding-guidelines/SKILL.md` before editing firstmate's shared tracked material.
+
+Git still has the committed files.
+This working copy is a spawn-time overlay.
+
+If this task requires editing `AGENTS.md` itself, restore the committed file first with `git update-index --no-skip-worktree AGENTS.md` and then `git checkout HEAD -- AGENTS.md`.
+You remain a crewmate after that restore.
+Editing an overlaid file without that restore does not fail silently: a pre-commit guard refuses the commit and names the same restore commands.
+Committing this overlay over the committed file is refused for the same reason.
+
+If `.fm-agents-md-edit` exists, in-progress `AGENTS.md` edits were saved there before this overlay was installed.
+If `.fm-claude-md-edit` exists, the same is true for `CLAUDE.md`.
+The pre-commit guard refuses every commit while either sidecar exists, so restore the committed file, re-apply the saved edits, and delete the sidecar.
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.
+
+$ cat '<TMP>/pool/CLAUDE.md'
+<!-- Points Claude at AGENTS.md via import; edit AGENTS.md, not this file. -->
+@AGENTS.md
+
+=== 5. The committed job description is untouched, and git sees no dirt ===
+
+$ git -C '<TMP>/pool' show HEAD:AGENTS.md | sed -n '1,2p'
+# Firstmate
+
+
+$ git -C '<TMP>/pool' status --porcelain --untracked-files=no; echo '(clean)'
+(clean)
+
+=== 6. A crewmate that still reaches for session start is refused ===
+
+$ cd '<TMP>/pool' && FM_HOME='<TMP>/home' FM_ROOT_OVERRIDE='<TMP>/pool' FM_STATE_OVERRIDE='<TMP>/home/state' FM_DATA_OVERRIDE='<TMP>/home/data' FM_CONFIG_OVERRIDE='<TMP>/home/config' '<TMP>/firstmate/bin/fm-session-start.sh'; echo "exit=$?"
+error: this checkout is a crewmate worktree of firstmate, not a firstmate home; do not run session start. You are a crewmate. Follow the launch brief and the crew worktree instructions in AGENTS.md.
+exit=2
+
+=== 7. The next task reuses the same overlaid slot: self-heal, refresh, re-overlay ===
+
+$ fm_spawn demo-crew-role-b2 | tail -2
+spawned demo-crew-role-b2 harness=codex kind=scout window=firstmate:fm-demo-crew-role-b2 worktree=<TMP>/pool
+
+$ git -C '<TMP>/pool' log --oneline -1 origin/main
+90dcc34 main moved on while the slot was overlaid
+
+$ git -C '<TMP>/pool' log --oneline -1 HEAD
+90dcc34 main moved on while the slot was overlaid
+
+$ sed -n '1,6p' '<TMP>/pool/AGENTS.md'
+<!-- firstmate-crew-worktree-instructions -->
+
+# Role
+
+You are a crewmate: an autonomous worker agent managed by firstmate.
+You are not the first mate.
+
+$ git -C '<TMP>/pool' status --porcelain --untracked-files=no; echo '(clean)'
+(clean)
+
+=== 8. Editing the overlaid AGENTS.md cannot vanish from a commit ===
+
+$ git -C '<TMP>/pool' add -A && git -C '<TMP>/pool' commit -m 'crew edit' 2>&1; echo "exit=$?"
+error: AGENTS.md is the crew overlay, hidden from git with skip-worktree, and it has been edited.
+error: this commit would silently omit every change to AGENTS.md.
+error: restore the committed file, then re-apply the intended source edits:
+error:   git update-index --no-skip-worktree -- AGENTS.md && git checkout HEAD -- AGENTS.md
+exit=1
+
+=== 9. The restore the overlay documents makes the same edit land ===
+
+$ git -C '<TMP>/pool' update-index --no-skip-worktree -- AGENTS.md
+
+$ git -C '<TMP>/pool' checkout HEAD -- AGENTS.md
+
+$ git -C '<TMP>/pool' commit -qam 'crew edit to firstmate AGENTS.md' 2>&1; echo "exit=$?"
+exit=0
+
+$ git -C '<TMP>/pool' show --stat --oneline HEAD | head -3
+0d4ec8d crew edit to firstmate AGENTS.md
+ AGENTS.md | 1 +
+ 1 file changed, 1 insertion(+)
+
