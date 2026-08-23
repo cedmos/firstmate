@@ -321,7 +321,7 @@ secondmate_oldest_queue_row() {  # <queue-path>
 # only this home's marker so a later row can be observed.
 secondmate_wake_stall_tick() {
   local now=$(( $(date +%s) )) threshold=$SECONDMATE_WAKE_STALL_SECS
-  local meta task kind remote_host home queue row epoch seq row_key marker notify_key queued age reason
+  local meta task kind remote_host home queue row epoch seq row_key marker receipt notify_key queued age reason
   case "$threshold" in ''|*[!0-9]*|0) threshold=60 ;; esac
   for meta in "$STATE"/*.meta; do
     [ -e "$meta" ] || continue
@@ -340,7 +340,7 @@ secondmate_wake_stall_tick() {
     row=$(secondmate_oldest_queue_row "$queue")
     marker="$STATE/.secondmate-wake-stall-$task"
     if [ -z "$row" ]; then
-      rm -f "$marker"
+      rm -f "$marker" "$STATE"/.secondmate-wake-stall-receipt-"$task"-*
       continue
     fi
     IFS=$(printf '\t') read -r epoch seq _row_kind _row_key _row_payload <<EOF
@@ -351,13 +351,16 @@ EOF
     age=$((now - epoch))
     [ "$age" -ge "$threshold" ] || continue
     row_key="$epoch-$seq"
+    receipt="$STATE/.secondmate-wake-stall-receipt-$task-$row_key"
     [ "$(cat "$marker" 2>/dev/null || true)" = "$row_key" ] && continue
+    [ "$(cat "$receipt" 2>/dev/null || true)" = "$row_key" ] && continue
     notify_key="secondmate-wake-loop-$task-$row_key"
     reason="check: secondmate wake-loop stalled: mate=$task row=$seq age=${age}s"
     queued=$(fm_wake_queued_keys check)
     if ! printf '%s\n' "$queued" | grep -Fx "$notify_key" >/dev/null 2>&1; then
       fm_wake_append check "$notify_key" "$reason" || return 1
     fi
+    fm_wake_secondmate_stall_receipt_write "$task" "$row_key" || return 1
     printf '%s\n' "$row_key" > "$marker"
     wake "$reason"
   done

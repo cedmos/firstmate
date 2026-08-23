@@ -14,6 +14,12 @@ set -u
 command -v tasks-axi >/dev/null 2>&1 || { echo "skip: tasks-axi not found (required by the delegated handoff path)"; exit 0; }
 
 TMP_ROOT=$(fm_test_tmproot fm-backlog-handoff)
+HANDOFF_FAKEBIN=$(make_fake_tmux "$TMP_ROOT/default-fake")
+export PATH="$HANDOFF_FAKEBIN:$PATH"
+export FM_FAKE_TMUX_WINDOW='firstmate:fm-design'
+export FM_FAKE_TMUX_LOG="$TMP_ROOT/default-tmux.log"
+export FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/default-fake/pane.txt"
+export FM_SEND_SETTLE=0 FM_SEND_SLEEP=0 FM_SEND_RETRIES=1
 
 setup_homes() {
   local home=$1 subhome=$2 id=${3:-design}
@@ -23,6 +29,14 @@ setup_homes() {
   sub_abs=$(cd "$subhome" && pwd -P)
   printf -- '- %s - feature work (home: %s; scope: feature work; projects: alpha; added 2026-07-09)\n' \
     "$id" "$sub_abs" > "$home/data/secondmates.md"
+  cat > "$home/state/$id.meta" <<EOF
+window=firstmate:fm-$id
+kind=secondmate
+harness=claude
+backend=tmux
+home=$sub_abs
+worktree=$sub_abs
+EOF
 }
 
 # A live local receiver must get the same marked endpoint wake that direct routed
@@ -63,6 +77,40 @@ EOF
   grep -F 'New routed work is in your backlog.' "$TMP_ROOT/live-wake-tmux.log" >/dev/null \
     || fail "receiver wake did not carry the routed-work instruction"
   pass "a routed handoff wakes the live local receiver through its verified endpoint"
+}
+
+test_failed_wake_retries_when_the_item_is_already_present() {
+  local home="$TMP_ROOT/retry-wake-main" sub="$TMP_ROOT/retry-wake-sub" out rc=0
+  setup_homes "$home" "$sub"
+  rm -f "$home/state/design.meta"
+  mkdir -p "$sub/data"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] retry-item - wake must be retried (repo: alpha)
+
+## Done
+EOF
+  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+
+  out=$(FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design retry-item 2>&1) || rc=$?
+  [ "$rc" -ne 0 ] || fail "handoff without a receiver endpoint reported success"
+  assert_contains "$out" "receiver was not woken" "missing receiver failure was not observable"
+  assert_grep 'retry-item' "$sub/data/backlog.md" "failed wake lost the durably handed-off item"
+
+  cat > "$home/state/design.meta" <<EOF
+window=firstmate:fm-design
+kind=secondmate
+harness=claude
+backend=tmux
+home=$sub
+worktree=$sub
+EOF
+  : > "$TMP_ROOT/default-tmux.log"
+  FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design retry-item > "$TMP_ROOT/retry-wake.out" 2>&1 \
+    || fail "an already-present handoff did not retry its receiver wake: $(cat "$TMP_ROOT/retry-wake.out")"
+  assert_grep 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log" \
+    "the recovery handoff did not retry delivery through the receiver endpoint"
+  pass "a failed receiver wake is loud and retries from an already-present handoff"
 }
 
 # Exact multi-line block extract: header matching key plus following body lines
@@ -673,6 +721,7 @@ EOF
 }
 
 test_handoff_wakes_live_local_receiver
+test_failed_wake_retries_when_the_item_is_already_present
 test_body_moves_when_followed_by_another_item
 test_body_moves_when_followed_by_section_heading
 test_multi_paragraph_body_with_internal_blanks_moves_whole

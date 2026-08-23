@@ -311,8 +311,8 @@ warn_stale_public_commitments() { # <secondmate-id> <moved-key>...
 wake_secondmate_receiver() { # <secondmate-id>
   local id=$1 meta="$STATE/$1.meta" out rc=0
   if [ ! -f "$meta" ] || [ -L "$meta" ]; then
-    printf 'warning: handed off work to secondmate %s, but no live receiver endpoint is recorded; the destination backlog is durable and needs a later wake\n' "$id" >&2
-    return 0
+    printf 'error: handed off work to secondmate %s, but no live receiver endpoint is recorded; the destination backlog is durable and the receiver was not woken\n' "$id" >&2
+    return 1
   fi
   [ "$(grep '^kind=' "$meta" | cut -d= -f2-)" = secondmate ] || {
     printf 'error: secondmate %s has non-secondmate endpoint metadata; backlog is durable but the receiver was not woken\n' "$id" >&2
@@ -591,6 +591,7 @@ fi
 
 if [ "${#TO_MOVE[@]}" -eq 0 ]; then
   echo "nothing to move: ${ALREADY[*]:-no keys} already present in $SUB_BACKLOG"
+  wake_secondmate_receiver "$ID" || exit 1
   exit 0
 fi
 
