@@ -622,46 +622,67 @@ SH
   pass "local teardown waits for the routed move and receiver wake"
 }
 
-test_local_teardown_preserves_home_when_wake_retirement_fails() {
-  local home="$TMP_ROOT/teardown-wake-fail-main" sub="$TMP_ROOT/teardown-wake-fail-sub"
-  local fakebin rm_bin="$TMP_ROOT/teardown-wake-fail-rm" real_rm corr rc=0
+test_local_teardown_preserves_wake_when_home_removal_fails() {
+  local home="$TMP_ROOT/teardown-home-fail-main" sub="$TMP_ROOT/teardown-home-fail-sub"
+  local fakebin rm_bin="$TMP_ROOT/teardown-home-fail-rm" real_rm corr rc=0 marker rec fail_home
+  local marker_before="$TMP_ROOT/teardown-home-fail-marker.before"
+  local rec_before="$TMP_ROOT/teardown-home-fail-record.before"
   setup_homes "$home" "$sub"
   printf 'project=%s\n' "$ROOT" >> "$home/state/design.meta"
   mkdir -p "$sub/data" "$rm_bin"
-  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  printf '## Queued\n- [ ] still-routed - preserve its wake (repo: alpha)\n\n## Done\n' > "$sub/data/backlog.md"
   corr=$(FM_HOME="$home" bash -c '
     . "$1"
     fm_pending_reply_create "$2" "$2/state" design "New routed work is in your backlog."
   ' _ "$ROOT/bin/fm-pending-reply-lib.sh" "$home") \
-    || fail "could not seed teardown wake retirement failure"
-  printf 'pending:%s\n' "$corr" > "$home/state/.backlog-handoff-design.wake-pending"
+    || fail "could not seed teardown wake state"
+  marker="$home/state/.backlog-handoff-design.wake-pending"
+  rec="$home/state/pending-replies/$corr"
+  printf 'pending:%s\n' "$corr" > "$marker"
+  cp -p -- "$marker" "$marker_before"
+  cp -p -- "$rec" "$rec_before"
   real_rm=$(command -v rm)
+  fail_home=$(cd "$sub" && pwd -P)
   cat > "$rm_bin/rm" <<'SH'
 #!/usr/bin/env bash
 for arg in "$@"; do
-  [ "$arg" != "$FM_FAIL_WAKE_MARKER" ] || exit 1
+  [ "$arg" != "$FM_FAIL_HOME" ] || exit 1
 done
 exec "$FM_REAL_RM" "$@"
 SH
   chmod +x "$rm_bin/rm"
-  fakebin=$(make_fake_tmux "$TMP_ROOT/teardown-wake-fail-fake")
+  fakebin=$(make_fake_tmux "$TMP_ROOT/teardown-home-fail-fake")
 
   set +e
-  PATH="$rm_bin:$fakebin:$PATH" FM_REAL_RM="$real_rm" \
-    FM_FAIL_WAKE_MARKER="$home/state/.backlog-handoff-design.wake-pending" \
+  PATH="$rm_bin:$fakebin:$PATH" FM_REAL_RM="$real_rm" FM_FAIL_HOME="$fail_home" \
     FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     FM_FAKE_TMUX_WINDOW='firstmate:fm-design' \
-    FM_FAKE_TMUX_LOG="$TMP_ROOT/teardown-wake-fail-tmux.log" \
-    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/teardown-wake-fail-fake/pane.txt" \
-    "$ROOT/bin/fm-teardown.sh" design --force > "$TMP_ROOT/teardown-wake-fail.out" 2>&1
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/teardown-home-fail-tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/teardown-home-fail-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" design --force > "$TMP_ROOT/teardown-home-fail.out" 2>&1
   rc=$?
   set -e
-  [ "$rc" -ne 0 ] || fail "teardown ignored receiver wake retirement failure"
-  assert_present "$sub" "teardown removed the home before receiver wake retirement succeeded"
-  assert_present "$home/state/design.meta" "teardown removed route metadata after wake retirement failure"
-  assert_grep '- design ' "$home/data/secondmates.md" \
-    "teardown removed the registry route after wake retirement failure"
-  pass "local teardown preserves its route when receiver wake retirement fails"
+  [ "$rc" -ne 0 ] || fail "teardown ignored the receiver-home removal failure"
+  assert_present "$sub" "failed teardown did not preserve the receiver home"
+  assert_grep 'still-routed' "$sub/data/backlog.md" "failed teardown lost routed backlog work"
+  cmp -s "$marker_before" "$marker" \
+    || fail "failed home removal changed the pending wake marker"
+  cmp -s "$rec_before" "$rec" \
+    || fail "failed home removal changed the pending wake correlation"
+  assert_present "$home/state/design.meta" "failed teardown removed route metadata"
+  assert_grep '- design ' "$home/data/secondmates.md" "failed teardown removed the registry route"
+
+  PATH="$fakebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_FAKE_TMUX_WINDOW='firstmate:fm-design' \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/teardown-home-fail-tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/teardown-home-fail-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" design --force > "$TMP_ROOT/teardown-home-retry.out" 2>&1 \
+    || fail "teardown retry did not retire the preserved wake: $(cat "$TMP_ROOT/teardown-home-retry.out")"
+  assert_absent "$sub" "teardown retry left the receiver home"
+  assert_absent "$marker" "teardown retry left the pending wake marker"
+  assert_absent "$rec" "teardown retry left the pending wake correlation"
+  assert_no_grep '- design ' "$home/data/secondmates.md" "teardown retry left the registry route"
+  pass "failed local home removal preserves its wake and a retry retires both"
 }
 
 # Exact multi-line block extract: header matching key plus following body lines
@@ -1281,7 +1302,7 @@ test_delivery_confirmation_crash_does_not_resend
 test_unresolved_delivery_attempt_refuses_immediate_resend
 test_concurrent_local_handoffs_serialize_move_and_wake
 test_local_teardown_waits_for_handoff_wake
-test_local_teardown_preserves_home_when_wake_retirement_fails
+test_local_teardown_preserves_wake_when_home_removal_fails
 test_body_moves_when_followed_by_another_item
 test_body_moves_when_followed_by_section_heading
 test_multi_paragraph_body_with_internal_blanks_moves_whole

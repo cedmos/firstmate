@@ -2646,8 +2646,11 @@ if [ "$BACKEND" = herdr ]; then
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
-  handoff_wake_retire || { echo "error: receiver wake cleanup failed; preserving the secondmate route for retry" >&2; exit 1; }
+  # Keep the durable wake intact until home retirement succeeds. If home
+  # removal fails, the registered receiver and its routed backlog still have
+  # their recovery signal; a teardown retry can remove both in order.
   remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit $?
+  handoff_wake_retire || { echo "error: receiver wake cleanup failed; preserving the secondmate route for retry" >&2; exit 1; }
   remove_secondmate_registry_entry "$ID"
 fi
 remove_grok_turnend_auth "$STATE" "$ID" || exit 1
