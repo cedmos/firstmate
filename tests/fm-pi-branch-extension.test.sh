@@ -331,6 +331,19 @@ if (sentToMain[2].options.triggerTurn !== true || sentToMain[2].options.deliverA
 if (!sentToMain[2].message.content.includes("[captain] task-9: PR https://example.com/pr/9")) {
   throw new Error(`captain note lost its content: ${sentToMain[2].message.content}`);
 }
+const duplicate = await report.execute("call-duplicate", {
+  task: "task-9",
+  verdict: "captain",
+  summary: "duplicate captain escalation",
+  wakeSequence: 3,
+}, undefined, undefined, {});
+if (!duplicate.isError || !duplicate.content[0].text.includes("duplicate report")) {
+  throw new Error(`duplicate wake report was not rejected: ${JSON.stringify(duplicate)}`);
+}
+if (sentToMain.length !== 3) throw new Error("duplicate wake report merged another main note");
+if (sentToMain.filter((item) => item.options.triggerTurn === true).length !== 1) {
+  throw new Error("duplicate wake report triggered another captain turn");
+}
 
 // The store (the owned durable contract) holds all three outcomes in order.
 const rows = readFileSync(`${home}/state/branch-outcomes.jsonl`, "utf8").trim().split("\n").map((line) => JSON.parse(line));

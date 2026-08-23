@@ -234,7 +234,7 @@ export default function (pi: ExtensionAPI) {
   let ownershipActivated = false;
   let generationToken = randomUUID();
   let pendingWakeCounter = 0;
-  let activeWake: { mergedWakeSequences: Set<number> } | null = null;
+  let activeWake: { reportedWakeSequences: Set<number>; mergedWakeSequences: Set<number> } | null = null;
   let activeBranchTools = 0;
   let branchToolWaiters: Array<() => void> = [];
   // Serializes branch work: mirror appends and wake turns run strictly in
@@ -390,6 +390,17 @@ export default function (pi: ExtensionAPI) {
           isError: true,
         };
       }
+      const wakeState = activeWake;
+      if (wakeState && wakeSequence !== null) {
+        if (wakeState.reportedWakeSequences.has(wakeSequence)) {
+          return {
+            content: [{ type: "text", text: `duplicate report: wakeSequence ${wakeSequence} was already recorded` }],
+            details: undefined,
+            isError: true,
+          };
+        }
+        wakeState.reportedWakeSequences.add(wakeSequence);
+      }
       const verdict = verdictRaw as Verdict;
       const appendArgs = ["append", "--task", task, "--verdict", verdict, "--summary", summary];
       if (wake) appendArgs.push("--wake", wake);
@@ -398,6 +409,7 @@ export default function (pi: ExtensionAPI) {
       const appended = runOutcomeScript(appendArgs);
       try {
         if (!appended.ok) {
+          if (wakeState && wakeSequence !== null) wakeState.reportedWakeSequences.delete(wakeSequence);
           return {
             content: [{ type: "text", text: `outcome store append failed (nothing merged): ${appended.detail}` }],
             details: undefined,
@@ -405,7 +417,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         mergeIntoMain(appended.stdout, task, verdict, summary);
-        if (activeWake && wakeSequence !== null) activeWake.mergedWakeSequences.add(wakeSequence);
+        if (wakeState && wakeSequence !== null) wakeState.mergedWakeSequences.add(wakeSequence);
         return {
           content: [{ type: "text", text: `recorded seq ${appended.stdout} and merged [${verdict}] into main` }],
           details: undefined,
@@ -651,7 +663,10 @@ export default function (pi: ExtensionAPI) {
         }
         const session = await ensureBranch();
         await flushMirror(session);
-        const wakeState = { mergedWakeSequences: new Set<number>() };
+        const wakeState = {
+          reportedWakeSequences: new Set<number>(),
+          mergedWakeSequences: new Set<number>(),
+        };
         clearAckReceipts();
         activeWake = wakeState;
         try {
