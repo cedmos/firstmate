@@ -23,12 +23,23 @@ make_home() {
 printf 'keychain: %s\n' "$1" >> "$FLOWY_TEST_CALLS"
 printf 'fixture-bearer-key\n'
 SH
+  # The endpoint and the Bearer header arrive as a -K - config on stdin, and the
+  # JSON body as a --data-binary @file, so the stub recovers both the way real
+  # curl would. args: is recorded verbatim because it is exactly what a local ps
+  # would see, which is what the no-secret-in-argv case asserts against.
   cat > "$fakebin/curl" <<'SH'
 #!/usr/bin/env bash
 code=$(cat "$FLOWY_TEST_CODE")
-body=$(cat)
+config=$(cat)
+body=
+for arg in "$@"; do
+  case "$arg" in
+    @*) body=$(cat "${arg#@}" 2>/dev/null || true) ;;
+  esac
+done
 {
   printf 'args: %s\n' "$*"
+  printf 'config: %s\n' "$(printf '%s' "$config" | tr '\n' ' ')"
   printf 'body: %s\n' "$body"
 } >> "$FLOWY_TEST_CALLS"
 if [ "$code" = FAIL ]; then
@@ -95,6 +106,35 @@ test_delivers_from_url_file_and_keychain_with_no_env_var() {
   assert_grep 'pending: (none)' "$home/state/flowy-last.md" \
     "display snapshot omitted the required pending: line"
   pass "outbox delivers from the URL file and Keychain with no environment variable"
+}
+
+test_the_bearer_key_never_reaches_the_process_table() {
+  local home rc argv
+  home=$(make_home no-argv-secret)
+  status_line "$home" demo 'done: credentials stay off argv'
+  rc=$(outbox "$home" --status "$home/state/demo.status")
+  expect_code 0 "$rc" "delivery failed"
+
+  # args: is what `ps -ww -axo args` would show for the POST.
+  argv=$(grep '^args: ' "$home/curl.calls" 2>/dev/null || true)
+  [ -n "$argv" ] || fail "the stub recorded no curl invocation to inspect"
+  case "$argv" in
+    *fixture-bearer-key*) fail "the Bearer key reached curl argv, where any local ps can read it" ;;
+  esac
+  case "$argv" in
+    *"$FIXTURE_URL"*) fail "the endpoint url reached curl argv instead of the stdin config" ;;
+  esac
+
+  # Both still actually reach curl, just through stdin.
+  assert_contains "$(calls "$home")" "Authorization: Bearer fixture-bearer-key" \
+    "the Bearer authorization never reached curl at all"
+  assert_contains "$(calls "$home")" "$FIXTURE_URL" "the endpoint url never reached curl at all"
+
+  [ -z "$(grep -rl 'fixture-bearer-key' "$home/state" 2>/dev/null || true)" ] || \
+    fail "the Bearer key was written somewhere under state"
+  [ -z "$(find "$home/state/flowy-outbox" -name '.payload.*' 2>/dev/null)" ] || \
+    fail "the staged payload file outlived the drain"
+  pass "the Bearer key and endpoint reach curl through stdin, never the process table"
 }
 
 test_failed_post_retries_to_success_after_a_restart() {
@@ -395,16 +435,16 @@ test_same_result_text_from_a_new_event_is_delivered_again() {
   pass "identical result text from a genuinely new event is recorded and delivered again"
 }
 
-# Every watcher case drives the real bin/fm-watch.sh. FM_FLOWY_EXIT_DRAIN_SECONDS
-# shortens the exit-path drain's wall-clock bound so a hung endpoint does not make
-# the suite wait out the production default.
+# Every watcher case drives the real bin/fm-watch.sh. The two drain ceilings are
+# shortened so a hung endpoint does not make the suite wait out the production
+# defaults; a later assignment in "$@" overrides either of them.
 start_watcher() {  # <home> [extra env assignments...]
   local home=$1
   shift
   env -u FLOWY_WEBHOOK_URL PATH="$home/fakebin:$PATH" \
     FLOWY_TEST_CODE="$home/http-code" FLOWY_TEST_CALLS="$home/curl.calls" \
     FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=0 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
-    FM_FLOWY_EXIT_DRAIN_SECONDS=2 "$@" \
+    FM_FLOWY_EXIT_DRAIN_SECONDS=2 FM_FLOWY_DRAIN_SECONDS=3 "$@" \
     "$ROOT/bin/fm-watch.sh" >>"$home/watch.out" 2>>"$home/watch.err" &
 }
 
@@ -484,54 +524,118 @@ test_watcher_retries_a_failed_delivery_on_a_later_pass() {
   pass "a later watcher pass retries a failed delivery to success"
 }
 
-test_watcher_delivers_before_the_pass_that_recorded_it_exits() {
-  local home pid
-  home=$(make_home exit-drain-prompt)
+test_watcher_delivers_the_result_it_recorded_without_a_second_generation() {
+  local home pid i=0 receipt
+  home=$(make_home detached-prompt)
   status_line "$home" demo 'done: prompt result'
 
   start_watcher "$home"
   pid=$!
   await_watcher_exit "$pid" 200 "watcher did not surface the terminal result"
 
-  # No second generation runs: if the result is delivered, the exit path of the
-  # very pass that recorded it did it.
-  [ -n "$(sole_receipt "$home")" ] || \
-    fail "the watcher pass that recorded the result exited without delivering it"
-  assert_contains "$(cat "$(sole_receipt "$home")")" "status: demo: done: prompt result" \
-    "the exit drain delivered the wrong result"
+  # No second generation ever runs, so only the drain the recording pass detached
+  # can deliver this. It outlives the watcher by design, hence the short wait.
+  while [ "$i" -lt 100 ]; do
+    receipt=$(sole_receipt "$home")
+    [ -z "$receipt" ] || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  [ -n "$receipt" ] || fail "the detached drain never delivered the recorded result"
+  assert_contains "$(cat "$receipt")" "status: demo: done: prompt result" \
+    "the detached drain delivered the wrong result"
   [ "$(pending_count "$home")" = 0 ] || fail "a delivered result stayed pending"
-  pass "a result recorded on a watcher pass is delivered before that pass exits"
+  pass "a result recorded on a watcher pass is delivered without a second generation"
 }
 
-test_a_hung_endpoint_cannot_hold_the_watcher_past_the_exit_bound() {
-  local home pid started elapsed
-  home=$(make_home exit-drain-bound)
-  http_code "$home" HANG
+test_a_hung_endpoint_never_delays_the_watcher_exit() {
+  local home pid started elapsed baseline rc i
+  home=$(make_home detached-bound)
   status_line "$home" demo 'done: hung result'
+
+  # Baseline: the same wake with a healthy endpoint, which is the promptness the
+  # hung run must match. A synchronous drain would make the hung run far slower.
+  baseline=$(make_home detached-baseline)
+  status_line "$baseline" demo 'done: baseline result'
+  started=$SECONDS
+  start_watcher "$baseline"
+  pid=$!
+  await_watcher_exit "$pid" 300 "the baseline watcher did not surface its result"
+  baseline=$((SECONDS - started))
+
+  http_code "$home" HANG
+  started=$SECONDS
+  start_watcher "$home" FM_FLOWY_EXIT_DRAIN_SECONDS=8
+  pid=$!
+  # The stub hangs 60s and the detached bound is 8s. If the drain were in the
+  # poll body or the EXIT trap, the wake would be held for one of those.
+  await_watcher_exit "$pid" 300 "a hung endpoint held the watcher process"
+  elapsed=$((SECONDS - started))
+  [ "$elapsed" -lt $((baseline + 5)) ] || \
+    fail "a hung endpoint delayed the watcher exit by ${elapsed}s against a ${baseline}s baseline"
+
+  [ "$(pending_count "$home")" = 1 ] || fail "a hung endpoint lost the recorded result"
+  [ -z "$(sole_receipt "$home")" ] || fail "a hung endpoint wrote a receipt without a 2xx"
+  assert_absent "$home/state/flowy-last.md" "a hung endpoint wrote the display snapshot"
+
+  # The bound tears the hung child down, by its TERM handler or by the KILL
+  # backstop behind it. Either way the lock must come back - released cleanly or
+  # taken over from a dead owner - so a later drain can still deliver. A
+  # permanently wedged lock never satisfies this, it just runs out the window.
+  http_code "$home" 200
+  i=0
+  rc=1
+  while [ "$i" -lt 250 ]; do
+    rc=$(outbox "$home" --drain)
+    [ "$rc" != 0 ] || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  expect_code 0 "$rc" "a torn-down detached drain wedged the outbox lock against the next drain"
+  [ "$(pending_count "$home")" = 0 ] || fail "the later drain did not deliver the pending result"
+  pass "a hung endpoint never delays the watcher exit and never wedges the next drain"
+}
+
+test_a_hung_endpoint_cannot_stall_the_poll_loop() {
+  local home rc pid started elapsed i
+  home=$(make_home pass-drain-bound)
+  status_line "$home" queued 'done: queued before the outage'
+  rc=$(outbox "$home" --status "$home/state/queued.status" --no-drain)
+  expect_code 0 "$rc" "recording the queued result failed"
+
+  # The per-pass drain now has a record to send and the endpoint hangs 60s per
+  # POST. Its ceiling is what lets the signal scan below it still run this pass.
+  http_code "$home" HANG
+  status_line "$home" demo 'done: new result during the outage'
 
   started=$SECONDS
   start_watcher "$home"
   pid=$!
-  # The stub hangs for 60s. Without the bound the watcher would still be alive
-  # well past this window, so exiting inside it is the whole assertion.
-  await_watcher_exit "$pid" 200 "a hung endpoint held the watcher past its exit-drain bound"
+  await_watcher_exit "$pid" 400 "a hung per-pass drain stalled the watcher's poll loop"
   elapsed=$((SECONDS - started))
-  [ "$elapsed" -lt 20 ] || fail "the exit drain took ${elapsed}s, so its wall-clock bound did not bind"
+  [ "$elapsed" -lt 30 ] || \
+    fail "the per-pass drain took ${elapsed}s, so its wall-clock ceiling did not bind"
 
-  [ -n "$(calls "$home")" ] || fail "the exit drain never reached the endpoint at all"
-  [ "$(pending_count "$home")" = 1 ] || fail "a timed-out exit drain lost the result"
-  [ -z "$(sole_receipt "$home")" ] || fail "a timed-out exit drain wrote a receipt without a 2xx"
-  assert_absent "$home/state/flowy-last.md" "a timed-out exit drain wrote the display snapshot"
+  [ -n "$(calls "$home")" ] || fail "the per-pass drain never reached the endpoint at all"
+  [ "$(pending_count "$home")" = 2 ] || fail "a ceiling-cut drain retired or dropped a record"
+  [ -z "$(sole_receipt "$home")" ] || fail "a ceiling-cut drain wrote a receipt without a 2xx"
 
-  # Timing out is normal: a later pass against a healthy endpoint still delivers.
   http_code "$home" 200
-  local rc
-  rc=$(outbox "$home" --drain)
-  expect_code 0 "$rc" "the result left pending by the bound was not delivered later"
-  pass "a hung endpoint cannot hold the watcher past its exit-drain bound"
+  i=0
+  rc=1
+  while [ "$i" -lt 250 ]; do
+    rc=$(outbox "$home" --drain)
+    [ "$rc" != 0 ] || break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  expect_code 0 "$rc" "the records left pending by the ceiling were not delivered later"
+  [ "$(sole_receipt "$home" | wc -l | tr -d ' ')" = 2 ] || fail "the later drain lost a record"
+  pass "a hung endpoint cannot stall the poll loop past the per-pass drain's ceiling"
 }
 
 test_delivers_from_url_file_and_keychain_with_no_env_var
+test_the_bearer_key_never_reaches_the_process_table
 test_failed_post_retries_to_success_after_a_restart
 test_two_results_never_overwrite_each_other
 test_second_result_for_one_task_gets_its_own_record
@@ -547,5 +651,6 @@ test_snapshot_pending_line_tracks_undelivered_results
 test_a_dead_endpoint_costs_one_attempt_per_drain
 test_same_result_text_from_a_new_event_is_delivered_again
 test_watcher_retries_a_failed_delivery_on_a_later_pass
-test_watcher_delivers_before_the_pass_that_recorded_it_exits
-test_a_hung_endpoint_cannot_hold_the_watcher_past_the_exit_bound
+test_watcher_delivers_the_result_it_recorded_without_a_second_generation
+test_a_hung_endpoint_never_delays_the_watcher_exit
+test_a_hung_endpoint_cannot_stall_the_poll_loop

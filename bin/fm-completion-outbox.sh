@@ -24,22 +24,36 @@
 #
 # CALLERS. bin/fm-watch.sh uses --no-drain on its signal path, because that path
 # runs immediately before the wake and must never wait on the network. Its
-# per-pass --drain is the sole AUTHORITATIVE delivery owner. Because a wake ends
-# the watcher process, a result recorded on the signal path would otherwise wait
-# for the next watcher generation to deliver it, so the watcher also runs one
-# --drain from its EXIT path after the wake is already durable. That exit drain
-# is a promptness optimization only, and it carries a hard total wall-clock
-# bound of FM_FLOWY_EXIT_DRAIN_SECONDS (default 5), well under the watcher's
-# 15-second poll: without the bound a blackholed endpoint would keep the exiting
-# watcher alive and delay re-arming, which is exactly the stall the record-only
-# signal path removes, moved one step later. Hitting the bound is a normal, safe
-# outcome - the record simply stays pending for the next per-pass drain.
+# per-pass --drain is the sole AUTHORITATIVE delivery owner, and it runs under a
+# single total wall-clock ceiling kept strictly below the watcher's poll
+# interval, so a blackholed or slow endpoint can never push the poll loop past
+# its own interval and delay the next signal scan.
+#
+# Because a wake ends the watcher process, a result recorded on the signal path
+# would otherwise wait for the next watcher generation. The watcher therefore
+# also starts one --drain as a DETACHED child right after recording. Detached is
+# the only shape that works here: a wake becomes observable to firstmate only
+# when the watcher PROCESS EXITS, since every consumer redirects the watcher's
+# stdout to a file and reads it after wait, so any synchronous drain - in the
+# poll body or in the exit path - would sit between the wake and firstmate
+# seeing it, and no bound value removes that delay, it only shrinks it.
+#
+# That detached drain is a promptness optimization only. It carries the same
+# hard total wall-clock bound, FM_FLOWY_EXIT_DRAIN_SECONDS (default 5), with a
+# KILL backstop so it cannot outlive the bound even against an endpoint that
+# hangs and a drain that has TERM deferred inside curl. Hitting the bound is a
+# normal, safe outcome: nothing is retired without a 2xx, the record simply
+# stays pending, and the next per-pass drain takes it. Losing the detached drain
+# entirely costs promptness and never durability.
 #
 # DRAIN (--drain, and implicitly after --status). Pending records are drained
 # oldest first by the monotonic ordinal each record carries, never by filename
 # collation, and POSTed as JSON to the URL in config/grok-flowy-webhook,
 # authenticated with the Keychain Bearer key for service firstmate-flowy-webhook.
-# No environment variable configures the endpoint. A record retires ONLY on
+# No environment variable configures the endpoint. The url and the key reach
+# curl only through a -K - config on stdin, so neither ever appears in argv
+# where a local ps could read it, and the key never touches disk. The JSON body
+# takes the short-lived mode-600 file that stdin would otherwise have carried. A record retires ONLY on
 # HTTP 2xx, at which point its per-record receipt is written to
 # state/flowy-outbox/delivered/<task>.<digest>.md. Any other outcome - a non-2xx
 # code, a transport failure, a missing URL file, an unavailable key - leaves the
@@ -335,6 +349,31 @@ DELIVERED_ARTIFACT=
 # drain stops attempting further records for this pass.
 TRANSPORT_FAILED=0
 
+# Staged payload file for the POST in flight, global so the drain's traps can
+# remove it on any path out.
+PAYLOAD_TMP=
+
+outbox_cleanup() {
+  [ -z "$PAYLOAD_TMP" ] || rm -f "$PAYLOAD_TMP"
+  PAYLOAD_TMP=
+}
+
+# The endpoint url and the Bearer key reach curl ONLY through a -K - config on
+# stdin, never through argv, so neither is ever readable in the process table by
+# any local `ps` for the whole life of a POST. Config values are quoted, so a
+# backslash or a double quote inside either has to be escaped for curl's parser.
+# Both substitutions are shell builtins, so the key never becomes an argument to
+# any process here either.
+curl_config() {  # <url> <key>
+  local url=$1 key=$2
+  url=${url//\\/\\\\}
+  url=${url//\"/\\\"}
+  key=${key//\\/\\\\}
+  key=${key//\"/\\\"}
+  printf 'url = "%s"\n' "$url"
+  printf 'header = "Authorization: Bearer %s"\n' "$key"
+}
+
 deliver_record() {  # <record> <url> <key>
   local record=$1 url=$2 key=$3 base task digest result artifact recorded payload code receipt tmp
   base=$(basename "$record")
@@ -371,12 +410,23 @@ deliver_record() {  # <record> <url> <key>
     return 1
   }
 
-  code=$(printf '%s' "$payload" | curl --silent --show-error --max-time "$HTTP_TIMEOUT" \
+  # stdin belongs to the -K - config, so the payload moves to a short-lived
+  # mode-600 file instead. It carries no secret, only the result already bound
+  # for Flowy, and it is removed the moment curl returns.
+  PAYLOAD_TMP=$(umask 077; mktemp "$OUTBOX/.payload.XXXXXX") || {
+    note "cannot stage the payload for $task"
+    return 1
+  }
+  chmod 600 "$PAYLOAD_TMP"
+  printf '%s' "$payload" > "$PAYLOAD_TMP"
+
+  code=$(curl_config "$url" "$key" | curl --silent --show-error --max-time "$HTTP_TIMEOUT" \
     --output /dev/null --write-out '%{http_code}' \
-    --request POST "$url" \
-    --header "Authorization: Bearer $key" \
+    --request POST \
     --header 'Content-Type: application/json' \
-    --data-binary @-) || code=
+    --data-binary "@$PAYLOAD_TMP" \
+    -K -) || code=
+  outbox_cleanup
   case "$code" in
     2??) ;;
     *)
@@ -468,7 +518,10 @@ EOF
     note "another drain holds the outbox lock; results stay pending"
     return 1
   fi
-  trap 'fm_lock_release "$DRAIN_LOCK"' EXIT
+  # A drain cut short by its caller's wall-clock bound must still drop the staged
+  # payload and hand the lock back rather than leaving both for the takeover path.
+  trap 'outbox_cleanup; fm_lock_release "$DRAIN_LOCK"' EXIT
+  trap 'outbox_cleanup; fm_lock_release "$DRAIN_LOCK"; exit 1' HUP INT TERM
 
   # Re-read under the lock so this pass sees every record written since the
   # cheap pre-lock check, including one a concurrent recorder just landed.
@@ -480,7 +533,7 @@ EOF
   fi
   if [ "$rc" -ne 0 ]; then
     fm_lock_release "$DRAIN_LOCK"
-    trap - EXIT
+    trap - EXIT HUP INT TERM
     return 1
   fi
 
@@ -515,8 +568,9 @@ EOF
   fi
   [ "$remaining" -eq 0 ] || rc=1
 
+  outbox_cleanup
   fm_lock_release "$DRAIN_LOCK"
-  trap - EXIT
+  trap - EXIT HUP INT TERM
   return "$rc"
 }
 

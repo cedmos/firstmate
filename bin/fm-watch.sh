@@ -891,52 +891,31 @@ if [ "${FM_WATCH_HANDLING_SUCCESSOR:-0}" = 1 ]; then
 elif [ "$FM_RECOVERY_MARKER_ACTION" = recover ]; then
   WATCHER_RECOVERY_PENDING=1
 fi
-# Armed by the signal path once it records a terminal result. A wake ends this
-# process, so that record would otherwise sit undelivered until a NEW watcher
-# generation reached the per-pass drain - on a healthy Flowy the captain would
-# lose a whole poll of promptness, and with nothing re-arming it would wait
-# indefinitely. This runs from the EXIT path, after the wake is already
-# published and after the watch lock is released, so it delays neither.
-#
-# THE BOUND IS THE POINT. FM_FLOWY_EXIT_DRAIN_SECONDS (default 5) is a single
-# ceiling on the WHOLE attempt, not a per-record timeout, plus at most a
-# half-second to tear the drain down, and it is deliberately far below POLL
-# (15s) so this can never outlive a re-arm. Without it a
-# blackholed endpoint would keep the exiting watcher alive and delay re-arming,
-# which is precisely the stall --no-drain removed from the signal path, moved
-# one step later. Hitting the bound is normal and safe: the outbox retires
-# nothing without a 2xx, so the record stays pending and the next generation's
-# per-pass drain - which remains the authoritative delivery owner - takes it.
-FLOWY_EXIT_DRAIN_ARMED=0
-flowy_exit_drain() {
-  local bound pid ticks=0 limit
-  [ "$FLOWY_EXIT_DRAIN_ARMED" -eq 1 ] || return 0
-  FLOWY_EXIT_DRAIN_ARMED=0
-  [ -x "$FLOWY_COMPLETION_OUTBOX" ] || return 0
-  bound=${FM_FLOWY_EXIT_DRAIN_SECONDS:-5}
-  case "$bound" in ''|*[!0-9]*) bound=5 ;; esac
-  limit=$((bound * 10))
-  [ "$limit" -gt 0 ] || return 0
-  # Own process group, so the bound kills any curl still in flight rather than
-  # orphaning it. Capping the outbox's own per-request timeout at the bound
-  # keeps a real curl from outliving this even if the signal is missed.
+# Run one outbox --drain under a single TOTAL wall-clock ceiling, never a
+# per-record timeout. The drain gets its own process group, so the ceiling tears
+# down any curl still in flight instead of orphaning it, and the outbox's own
+# per-request timeout is capped at the same value so a real curl cannot outlive
+# it either. TERM first, then KILL as the backstop: a drain blocked inside curl
+# defers its TERM handler until curl returns, and wake() ignores TERM before
+# exiting, which children inherit, so TERM alone can be silently discarded.
+# Hitting the ceiling is normal and safe - the outbox retires nothing without a
+# 2xx, so every unsent record simply stays pending for the next drain.
+flowy_run_bounded_drain() {  # <bound-seconds>
+  local bound=$1 pid rc=0 deadline ticks=0
   set -m
   FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_FLOWY_HTTP_TIMEOUT="$bound" \
     "$FLOWY_COMPLETION_OUTBOX" --drain >/dev/null 2>&1 &
   pid=$!
   set +m
-  while [ "$ticks" -lt "$limit" ]; do
+  # SECONDS is a real elapsed-time deadline. Counting sleep 0.1 ticks instead
+  # would drift well past the ceiling, because every tick also pays a fork.
+  deadline=$((SECONDS + bound))
+  while [ "$SECONDS" -lt "$deadline" ]; do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
-    ticks=$((ticks + 1))
   done
   if kill -0 "$pid" 2>/dev/null; then
-    # wake() ignores HUP/INT/TERM before exiting, and an IGNORED disposition is
-    # inherited by children, so a TERM here would be silently discarded by the
-    # very drain this bound exists to stop. TERM first anyway for the exit paths
-    # that did not ignore it, then KILL, which nothing can ignore.
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-    ticks=0
     while [ "$ticks" -lt 5 ]; do
       kill -0 "$pid" 2>/dev/null || break
       sleep 0.1
@@ -946,7 +925,49 @@ flowy_exit_drain() {
       kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
     fi
   fi
-  wait "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || rc=1
+  return "$rc"
+}
+
+# The ceiling for the authoritative per-pass drain, kept strictly below POLL so
+# a blackholed endpoint - or several records answering 503 slowly - can never
+# push the poll loop past its own interval and delay the next signal scan.
+flowy_drain_bound() {
+  local bound=${FM_FLOWY_DRAIN_SECONDS:-}
+  [ -n "$bound" ] || bound=$((POLL * 2 / 3))
+  case "$bound" in ''|*[!0-9]*) bound=1 ;; esac
+  [ "$bound" -ge 1 ] || bound=1
+  printf '%s' "$bound"
+}
+
+# Armed by the signal path once it records a terminal result. A wake ends this
+# process, so that record would otherwise sit undelivered until a NEW watcher
+# generation reached the per-pass drain - on a healthy Flowy the captain would
+# lose a whole poll of promptness, and with nothing re-arming it would wait
+# indefinitely.
+#
+# DETACHED IS THE ONLY WORKING SHAPE. A wake becomes observable to firstmate
+# only when this PROCESS EXITS: every consumer redirects the watcher's stdout to
+# a file and reads it after wait (bin/fm-watch-arm.sh, bin/fm-supervise-daemon.sh).
+# Any synchronous drain - in the poll body or in the EXIT trap - therefore sits
+# between the wake and firstmate seeing it, and no bound value removes that
+# delay, it only shrinks it. A detached child in its own process group decouples
+# delivery from process exit entirely, so the wake and `fm off` are as prompt as
+# they are with no drain at all, and the watcher's own exit never waits on it.
+# The child keeps the same total wall-clock bound and KILL backstop, and its
+# output goes to /dev/null because this process's stdout IS the wake channel.
+FLOWY_DETACHED_DRAIN_ARMED=0
+flowy_detached_drain() {
+  local bound
+  [ "$FLOWY_DETACHED_DRAIN_ARMED" -eq 1 ] || return 0
+  FLOWY_DETACHED_DRAIN_ARMED=0
+  [ -x "$FLOWY_COMPLETION_OUTBOX" ] || return 0
+  bound=${FM_FLOWY_EXIT_DRAIN_SECONDS:-5}
+  case "$bound" in ''|*[!0-9]*) bound=5 ;; esac
+  [ "$bound" -ge 1 ] || return 0
+  set -m
+  ( flowy_run_bounded_drain "$bound" || true ) >/dev/null 2>&1 </dev/null &
+  set +m
   return 0
 }
 
@@ -967,7 +988,6 @@ watcher_cleanup() {
     echo "watcher: recovery state could not be persisted; retaining stale lock evidence" >&2
     cleanup_status=1
   fi
-  flowy_exit_drain
   return "$cleanup_status"
 }
 trap watcher_cleanup EXIT
@@ -1039,8 +1059,11 @@ while :; do
   # watcher generation, or before a restart) is retried from here until it gets
   # a 2xx, which is why advancing the seen marker after one attempt can no
   # longer strand a captain-visible result. It is a no-op with nothing pending.
+  # It is the AUTHORITATIVE delivery owner, so it runs synchronously here, under
+  # a total ceiling strictly below POLL so it can never delay the signal scan
+  # below it by more than a fraction of one poll.
   if [ -x "$FLOWY_COMPLETION_OUTBOX" ]; then
-    FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$FLOWY_COMPLETION_OUTBOX" --drain \
+    flowy_run_bounded_drain "$(flowy_drain_bound)" \
       || triage_log "Flowy completion outbox has undelivered results"
   fi
 
@@ -1162,8 +1185,9 @@ EOF
     # this to the local write: it opens no socket and reads no Keychain, so an
     # unreachable Flowy cannot delay the wake below it. The per-pass drain above
     # is the authoritative owner of getting a record delivered, so a result is
-    # never lost to one bad POST either. Recording here arms the bounded EXIT
-    # drain, which restores same-pass promptness without ever preceding a wake.
+    # never lost to one bad POST either. Recording here arms the DETACHED bounded
+    # drain started right after this loop, which restores same-pass promptness
+    # while leaving the wake exactly as prompt as it is with no drain at all.
     flowy_result_files=""
     while IFS=$(printf '\t') read -r sf sig f; do
       [ -n "$sf" ] || continue
@@ -1174,7 +1198,7 @@ EOF
           flowy_result_files="$flowy_result_files $f"
           if [ -x "$FLOWY_COMPLETION_OUTBOX" ]; then
             if FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$FLOWY_COMPLETION_OUTBOX" --status "$f" --no-drain; then
-              FLOWY_EXIT_DRAIN_ARMED=1
+              FLOWY_DETACHED_DRAIN_ARMED=1
             else
               triage_log "Flowy completion outbox could not record the result for $(basename "$f")"
             fi
@@ -1184,6 +1208,7 @@ EOF
     done <<EOF
 $pending
 EOF
+    flowy_detached_drain
     # Triage: a signal is ACTIONABLE when any of these holds (cheapest first):
     #   - the away-mode daemon owns triage (afk) and wants every wake;
     #   - any status file carries a captain-relevant verb;
