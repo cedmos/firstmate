@@ -11,17 +11,28 @@
 # job as that worker's instructions.
 # The committed files stay in git; the overlay is skip-worktree so it does
 # not look like uncommitted work.
+# Only AGENTS.md carries the crew body. CLAUDE.md is overlaid with the exact
+# canonical `@AGENTS.md` pointer that bin/fm-ensure-agents-md.sh owns, and the
+# crew body carries that script's canonical `## Maintaining this file` heading,
+# so the brief-mandated `fm-ensure-agents-md.sh .` stays a no-op success in an
+# overlaid worktree instead of reporting a two-real-files conflict.
 # The overlay keeps `.agents/skills/firstmate-coding-guidelines/SKILL.md`
 # reachable and tells the worker how to restore AGENTS.md when the task is
 # to edit it.
 # skip-worktree also hides a worker's own edit to those files, so `git add -A`
 # plus `git commit` would drop it without an error. The install therefore also
-# writes a pre-commit guard that refuses any commit made while a skip-worktree
-# instruction file no longer holds the overlay body. The guard lives in this
-# worktree's own git dir and is selected through per-worktree `core.hooksPath`,
-# so the primary checkout's hooks are never touched.
+# writes a pre-commit guard. It refuses a commit while a skip-worktree
+# instruction file no longer holds its overlay content, while an instruction
+# file would be committed carrying the overlay instead of firstmate's own file,
+# and while a saved in-progress sidecar still holds edits the commit would omit.
+# The guard lives in this worktree's own git dir and is selected through
+# per-worktree `core.hooksPath`, so the primary checkout's hooks are never
+# touched.
 # fm_remove_crew_worktree_instructions undoes all of it: skip-worktree bits,
-# the committed file contents, and the guard. bin/fm-spawn.sh calls it before
+# the committed file contents, the saved sidecars, and the guard. A sidecar
+# that outlived its task would otherwise be handed to the next worker in the
+# same pooled slot as its own in-progress work.
+# bin/fm-spawn.sh calls it before
 # it refreshes a pooled worktree, so a slot returned with the overlay still on
 # it self-heals instead of wedging the next `git reset --hard`.
 # A secondmate home, a primary checkout, and a non-firstmate project are
@@ -72,23 +83,56 @@ This working copy is a spawn-time overlay.
 If this task requires editing `AGENTS.md` itself, restore the committed file first with `git update-index --no-skip-worktree AGENTS.md` and then `git checkout HEAD -- AGENTS.md`.
 You remain a crewmate after that restore.
 Editing an overlaid file without that restore does not fail silently: a pre-commit guard refuses the commit and names the same restore commands.
+Committing this overlay over the committed file is refused for the same reason.
 
 If `.fm-agents-md-edit` exists, in-progress `AGENTS.md` edits were saved there before this overlay was installed.
 If `.fm-claude-md-edit` exists, the same is true for `CLAUDE.md`.
+The pre-commit guard refuses every commit while either sidecar exists, so restore the committed file, re-apply the saved edits, and delete the sidecar.
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.
 EOF
+}
+
+# The canonical CLAUDE.md pointer bin/fm-ensure-agents-md.sh owns. The overlay
+# writes it verbatim so that script still classifies the worktree as canonical.
+fm_crew_claude_pointer_body() {
+  cat <<'EOF'
+<!-- Points Claude at AGENTS.md via import; edit AGENTS.md, not this file. -->
+@AGENTS.md
+EOF
+}
+
+fm_crew_overlay_content() {  # <rel>
+  case $1 in
+    CLAUDE.md) fm_crew_claude_pointer_body ;;
+    *) fm_crew_overlay_body ;;
+  esac
 }
 
 fm_crew_write_overlay_body() {  # <dest>
   fm_crew_overlay_body > "$1"
 }
 
-# The blob hash of the overlay body as `git hash-object --no-filters` would
-# report it for a file holding exactly that body.
-fm_crew_overlay_blob_hash() {  # <worktree>
-  local wt=$1 hash
-  hash=$(fm_crew_overlay_body | git -C "$wt" hash-object --stdin) || return 1
+# The blob hash of <rel>'s overlay content as `git hash-object --no-filters`
+# would report it for a file holding exactly that content.
+fm_crew_overlay_blob_hash() {  # <worktree> <rel>
+  local wt=$1 rel=$2 hash
+  hash=$(fm_crew_overlay_content "$rel" | git -C "$wt" hash-object --stdin) || return 1
   [ -n "$hash" ] || return 1
   printf '%s\n' "$hash"
+}
+
+fm_crew_file_is_installed_overlay() {  # <worktree> <rel>
+  local wt=$1 rel=$2 expected disk
+  [ -f "$wt/$rel" ] || return 1
+  expected=$(fm_crew_overlay_blob_hash "$wt" "$rel") || return 1
+  disk=$(git -C "$wt" hash-object --no-filters -- "$wt/$rel" 2>/dev/null) || return 1
+  [ "$expected" = "$disk" ]
 }
 
 fm_checkout_is_firstmate_shaped() {  # <root>
@@ -149,7 +193,7 @@ fm_crew_file_differs_from_head() {  # <worktree> <rel>
 fm_crew_save_instruction_wip() {  # <worktree> <rel> <dest>
   local wt=$1 rel=$2 dest=$3
   [ -f "$wt/$rel" ] || return 0
-  fm_file_is_crew_overlay "$wt/$rel" && return 0
+  fm_crew_file_is_installed_overlay "$wt" "$rel" && return 0
   fm_crew_file_differs_from_head "$wt" "$rel" || return 0
   cp "$wt/$rel" "$wt/$dest" || {
     echo "error: could not save in-progress $rel to $dest before installing crew instructions" >&2
@@ -184,30 +228,65 @@ fm_crew_commit_guard_dir() {  # <worktree>
   printf '%s\n' "$git_dir/$FM_CREW_HOOKS_DIRNAME"
 }
 
-fm_crew_write_commit_guard() {  # <dest> <overlay-blob-hash>
-  local dest=$1 hash=$2
+fm_crew_write_commit_guard() {  # <dest> <agents-blob-hash> <claude-blob-hash>
+  local dest=$1 agents_hash=$2 claude_hash=$3
   cat > "$dest" <<EOF
 #!/usr/bin/env bash
 # Installed by bin/fm-crew-worktree-instructions-lib.sh for this worktree only.
 # The crew overlay hides AGENTS.md and CLAUDE.md with skip-worktree, so a
-# worker's edit to either file is dropped from every commit without an error.
-# This guard turns that silent omission into a refused commit.
+# worker's edit to either file is dropped from every commit without an error,
+# and clearing that bit lets the overlay itself be committed over firstmate's
+# own file. This guard turns both silent outcomes into a refused commit, and
+# refuses while a saved sidecar still holds edits the commit would omit.
 set -u
-overlay='$hash'
+marker='$FM_CREW_OVERLAY_MARKER'
 guard_status=0
-for rel in $FM_CREW_INSTRUCTION_FILES; do
-  [ -f "\$rel" ] || continue
-  state=\$(git ls-files -v -- "\$rel" 2>/dev/null | awk '{print substr(\$1,1,1)}')
-  [ "\$state" = S ] || continue
-  actual=\$(git hash-object --no-filters -- "\$rel" 2>/dev/null) || actual=
-  [ "\$actual" = "\$overlay" ] && continue
-  {
-    echo "error: \$rel is the crew overlay, hidden from git with skip-worktree, and it has been edited."
-    echo "error: this commit would silently omit every change to \$rel."
-    echo "error: restore the committed file, then re-apply the intended source edits:"
-    echo "error:   git update-index --no-skip-worktree -- \$rel && git checkout HEAD -- \$rel"
-  } >&2
+
+refuse() {
+  printf 'error: %s\n' "\$@" >&2
   guard_status=1
+}
+
+for rel in $FM_CREW_INSTRUCTION_FILES; do
+  case "\$rel" in
+    AGENTS.md) overlay='$agents_hash'; sidecar='$FM_CREW_AGENTS_WIP' ;;
+    *) overlay='$claude_hash'; sidecar='$FM_CREW_CLAUDE_WIP' ;;
+  esac
+  if [ -e "\$sidecar" ]; then
+    refuse "\$sidecar holds in-progress \$rel edits that spawn saved before it reinstalled the crew overlay." \\
+      "this commit would omit them." \\
+      "re-apply them and delete the sidecar:" \\
+      "  git update-index --no-skip-worktree -- \$rel && git checkout HEAD -- \$rel && cp \$sidecar \$rel && rm \$sidecar"
+  fi
+  [ -f "\$rel" ] || continue
+  head_hash=\$(git rev-parse --verify --quiet "HEAD:\$rel" 2>/dev/null || true)
+  disk_hash=\$(git hash-object --no-filters -- "\$rel" 2>/dev/null || true)
+  if [ "\$(git ls-files -v -- "\$rel" 2>/dev/null | awk '{print substr(\$1,1,1)}')" = S ]; then
+    [ "\$disk_hash" = "\$overlay" ] && continue
+    refuse "\$rel is the crew overlay, hidden from git with skip-worktree, and it has been edited." \\
+      "this commit would silently omit every change to \$rel." \\
+      "restore the committed file, then re-apply the intended source edits:" \\
+      "  git update-index --no-skip-worktree -- \$rel && git checkout HEAD -- \$rel"
+    continue
+  fi
+  staged_hash=\$(git ls-files -s -- "\$rel" 2>/dev/null | awk '{print \$2}')
+  overlay_would_land=0
+  if [ -n "\$staged_hash" ] && [ "\$staged_hash" != "\$head_hash" ]; then
+    if [ "\$staged_hash" = "\$overlay" ] ||
+      git cat-file blob "\$staged_hash" 2>/dev/null | grep -Fqx "\$marker"; then
+      overlay_would_land=1
+    fi
+  fi
+  if [ -n "\$disk_hash" ] && [ "\$disk_hash" != "\$head_hash" ]; then
+    if [ "\$disk_hash" = "\$overlay" ] || grep -Fqx "\$marker" "\$rel" 2>/dev/null; then
+      overlay_would_land=1
+    fi
+  fi
+  [ "\$overlay_would_land" -eq 1 ] || continue
+  refuse "\$rel would be committed carrying the crew overlay, replacing firstmate's own committed file." \\
+    "the crew overlay is this worktree's launch scaffolding, never source to commit." \\
+    "restore the committed file, then re-apply the intended source edits:" \\
+    "  git update-index --no-skip-worktree -- \$rel && git checkout HEAD -- \$rel"
 done
 exit "\$guard_status"
 EOF
@@ -217,15 +296,16 @@ EOF
 # config needs extensions.worktreeConfig, which is a shared-config setting whose
 # one documented hazard is core.bare / core.worktree living in the shared file.
 fm_crew_install_commit_guard() {  # <worktree>
-  local wt=$1 dir hash tmp
+  local wt=$1 dir agents_hash claude_hash tmp
   dir=$(fm_crew_commit_guard_dir "$wt") || {
     echo "error: could not resolve the git dir of $wt to install the crew commit guard" >&2
     return 1
   }
-  hash=$(fm_crew_overlay_blob_hash "$wt") || {
-    echo "error: could not hash the crew overlay body for the commit guard in $wt" >&2
+  if ! agents_hash=$(fm_crew_overlay_blob_hash "$wt" AGENTS.md) ||
+    ! claude_hash=$(fm_crew_overlay_blob_hash "$wt" CLAUDE.md); then
+    echo "error: could not hash the crew overlay content for the commit guard in $wt" >&2
     return 1
-  }
+  fi
   if [ "$(git -C "$wt" config --get core.bare 2>/dev/null || true)" = true ] ||
      [ -n "$(git -C "$wt" config --get core.worktree 2>/dev/null || true)" ]; then
     echo "error: refusing to enable per-worktree git config for $wt because core.bare or core.worktree lives in the shared config" >&2
@@ -236,7 +316,8 @@ fm_crew_install_commit_guard() {  # <worktree>
     return 1
   }
   tmp="$dir/pre-commit.new"
-  if ! fm_crew_write_commit_guard "$tmp" "$hash" || ! chmod +x "$tmp" || ! mv "$tmp" "$dir/pre-commit"; then
+  if ! fm_crew_write_commit_guard "$tmp" "$agents_hash" "$claude_hash" ||
+    ! chmod +x "$tmp" || ! mv "$tmp" "$dir/pre-commit"; then
     rm -f "$tmp"
     echo "error: could not write the crew commit guard at $dir/pre-commit" >&2
     return 1
@@ -297,6 +378,10 @@ fm_remove_crew_worktree_instructions() {  # <worktree>
       failed=1
     fi
   done
+  if ! rm -f "$wt/$FM_CREW_AGENTS_WIP" "$wt/$FM_CREW_CLAUDE_WIP"; then
+    echo "error: could not remove the saved instruction sidecars in $wt" >&2
+    failed=1
+  fi
   fm_crew_remove_commit_guard "$wt" || failed=1
   [ "$failed" -eq 0 ]
 }
@@ -307,7 +392,7 @@ fm_crew_install_overlay_file() {  # <worktree> <rel>
     echo "error: could not create a temp file for the crew overlay in $wt" >&2
     return 1
   }
-  fm_crew_write_overlay_body "$tmp" || {
+  fm_crew_overlay_content "$rel" > "$tmp" || {
     rm -f "$tmp"
     echo "error: could not write crew overlay for $rel" >&2
     return 1
@@ -318,8 +403,8 @@ fm_crew_install_overlay_file() {  # <worktree> <rel>
     return 1
   }
   fm_crew_skip_worktree "$wt" "$rel" || return 1
-  fm_file_is_crew_overlay "$wt/$rel" || {
-    echo "error: crew overlay at $rel is missing its marker after install" >&2
+  fm_crew_file_is_installed_overlay "$wt" "$rel" || {
+    echo "error: crew overlay at $rel does not hold its expected content after install" >&2
     return 1
   }
   if fm_file_presents_firstmate_identity "$wt/$rel"; then
