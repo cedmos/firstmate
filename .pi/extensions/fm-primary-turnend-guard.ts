@@ -116,7 +116,7 @@ function runSessionstartHook(source: string): Promise<SessionstartOutput> {
     let replayMetadata = "";
     let retainedBytes = 0;
     let truncated = false;
-    child.stdout.on("data", (chunk: Buffer) => {
+    child.stdout?.on("data", (chunk: Buffer) => {
       if (retainedBytes >= sessionstartDeliveryBytes) {
         truncated = true;
         return;

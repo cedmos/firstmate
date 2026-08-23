@@ -779,9 +779,10 @@ export default function (pi: ExtensionAPI) {
     mainStreaming = false;
   });
 
-  // Mirror at main's turn_end: collect the new captain/assistant dialog
-  // durably (cursor-advanced) right away, deliver it into the branch through
-  // the serialized chain so it lands before any later wake.
+  // Mirror at main's turn_end: collect the new captain/assistant dialog into
+  // the volatile queue, then deliver it through the serialized chain so it
+  // lands before any later wake. The durable cursor advances only in
+  // flushMirror after the complete pending batch reaches the branch.
   pi.on?.("turn_end", (_event, ctx) => {
     if (!activateOwnership() || !branchEnabled()) return;
     try {

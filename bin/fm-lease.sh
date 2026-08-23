@@ -4,8 +4,8 @@
 # The lease contract itself (file format, actors, staleness, guard semantics)
 # is owned by bin/fm-lease-lib.sh; this is the command surface the two
 # supervision actors use around the overlap set (steering, stopping, cleanup,
-# backlog status, stuck-worker recovery). "backlog" is the reserved resource
-# id for the whole-file guard around data/backlog.md writes.
+# backlog status, stuck-worker recovery). bin/fm-lease-lib.sh also owns the
+# exact scope of the reserved "backlog" resource.
 #
 # Usage:
 #   fm-lease.sh claim <task> [--actor main|branch]

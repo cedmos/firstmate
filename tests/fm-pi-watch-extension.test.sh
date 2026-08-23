@@ -1199,8 +1199,8 @@ async function replaceSession(previous, reason) {
   await waitFor(() => {
     if (!existsSync(process.env.FM_CHILD_PID_FILE)) return false;
     const child = readFileSync(process.env.FM_CHILD_PID_FILE, "utf8").trim();
-    return child && child !== previousChild && pidAlive(child);
-  }, `${reason} replacement child`);
+    return child && child !== previousChild && pidAlive(child) && liveArmPids().includes(child);
+  }, `${reason} replacement child and arm record`);
   const live = liveArmPids();
   if (live.length !== 1) {
     throw new Error(`${reason} expected exactly one live arm child, got ${live.join(",") || "(none)"}`);
@@ -1223,8 +1223,8 @@ if (!sameInstanceArm.details?.ok || String(sameInstanceArm.details.message).incl
 await waitFor(() => {
   if (!existsSync(process.env.FM_CHILD_PID_FILE)) return false;
   const child = readFileSync(process.env.FM_CHILD_PID_FILE, "utf8").trim();
-  return child !== sameInstanceChild && pidAlive(child);
-}, "same-instance replacement child");
+  return child !== sameInstanceChild && pidAlive(child) && liveArmPids().includes(child);
+}, "same-instance replacement child and arm record");
 await waitFor(() => !pidAlive(sameInstanceChild), "same-instance previous child exit");
 if (liveArmPids().length !== 1) {
   throw new Error(`same-instance expected one live arm child, got ${liveArmPids().join(",")}`);
@@ -1265,7 +1265,7 @@ if (liveArmPids().length !== 0) {
 EOF
 )
   status=$?
-  expect_code 0 "$status" "Pi session transitions must rearm through an explicit generation owner"
+  [ "$status" -eq 0 ] || fail "Pi session transitions must rearm through an explicit generation owner (exit $status): $out"
   [ -z "$out" ] || fail "Pi session-transition generation owner test printed output: $out"
   pass "Pi session transitions use a generation owner across /new /resume /fork, stale callbacks, and quit"
 }

@@ -10,14 +10,15 @@
 #     entirely in the cursor sidecar so marking outcomes read cannot disturb
 #     the log. Retention: the log is small (one line per handled fleet event)
 #     and truncation, if ever needed, is a captain-approved manual act.
-#   - Cursor: $STATE/.branch-outcomes-cursor holds the highest seq already
+#   - Cursor: $STATE/.branch-outcomes-cursor holds the highest contiguous seq
 #     delivered into main's context (via the branch's append-only merge note,
-#     or via the session-start replay). Records above the cursor are "unread":
-#     the branch wrote them durably but main never saw them - the crash window
-#     between the store write and the merge append.
-#   - Delivery receipts live under $STATE/branch-outcomes-delivered/ until all
-#     preceding outcome sequences are delivered; the cursor advances only over
-#     that contiguous prefix.
+#     or via the session-start replay). An unreceipted record above the cursor
+#     is unread because no durable proof says main saw it; replay is preferred
+#     to loss across the crash window between store append and merge receipt.
+#   - Delivery receipts live under $STATE/branch-outcomes-delivered/ for rows
+#     delivered out of order. Replay excludes those rows, and the cursor
+#     advances only over the contiguous combination of acknowledged replay
+#     rows and delivery receipts.
 #   - Every mutation runs under $STATE/.branch-outcomes.lock so the branch
 #     extension and a concurrent session-start replay cannot interleave.
 #   - The store is written BEFORE the merge note is appended to main

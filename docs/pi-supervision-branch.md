@@ -1,7 +1,7 @@
 # Pi supervision branch
 
 Fleet supervision on the Pi primary harness runs on a second, persistent conversation - the supervision branch - inside the same `pi` process as the captain's chat.
-The branch absorbs every ordinary fleet wake, handles it with real tools, and merges each outcome back by appending a short note to the captain conversation's tail; only captain-relevant outcomes open a turn.
+The branch absorbs every ordinary actionable fleet wake that passes the watcher's unchanged first-stage classifier, handles it with real tools, and merges each outcome back by appending a short note to the captain conversation's tail; only captain-relevant outcomes open a turn.
 The design source is the captain-approved forked-supervision architecture board, a captain-private fleet record (a self-contained HTML explainer with the measured cache and judgment evidence); this document records the shape it landed as, and the delivering PR cites the board artifact itself.
 
 This feature is Pi-only by construction and changes nothing anywhere else:
@@ -18,7 +18,7 @@ This feature is Pi-only by construction and changes nothing anywhere else:
   Every path that cannot reach a working branch falls back to delivering the wake to main - a broken branch degrades to today's behavior, never to a lost wake.
 - Branch system prompt: `bin/fm-branch-prompt.sh`; its header owns the byte-stable-prefix contract (no timestamps, no fleet snapshot, no per-wake content).
 - Outcome store: `bin/fm-branch-outcome.sh`; its header owns the append-only format and the read cursor.
-  Outcomes are written to the store before any note reaches main, and unread outcomes replay once at the next locked session start.
+  Outcomes are written to the store before any note reaches main, and an unread outcome remains eligible for locked session-start replay until a merge receipt or a successfully appended replay durably confirms main delivery.
 - Consistency: `bin/fm-lease-lib.sh` owns the per-task lease contract and the main-only role partition; `bin/fm-lease.sh` is the command surface.
   The guards are wired into `fm-send.sh`, `fm-control.sh`, and `fm-teardown.sh` (overlap, lease-checked) and `fm-pr-merge.sh`, `fm-merge-local.sh`, and `fm-spawn.sh` (main-owned, branch refused; a relaunch through `fm-control` stays branch-legal recovery).
 - Operator toggle: `config/pi-supervision-branch` (docs/configuration.md "Pi supervision branch").

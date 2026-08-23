@@ -37,8 +37,11 @@
 #   - Role partition (fm_lease_forbid_branch): actions MAIN alone owns -
 #     merging a PR, landing local-only work, spawning workers - refuse the
 #     branch actor outright, lease or no lease.
-#   - "backlog" is a reserved claimable resource name: the whole-file guard
-#     around data/backlog.md writes, claimed the same way a task is.
+#   - "backlog" is a reserved claimable resource name. In this release it is
+#     branch-side containment around the branch's own data/backlog.md writes,
+#     not a whole-file mutex: MAIN's tasks-axi path does not claim or inspect
+#     this lease. A branch claim therefore prevents overlapping branch work
+#     but does not imply that MAIN is absent.
 #
 # Sourced by bin/fm-send.sh, bin/fm-control.sh, bin/fm-teardown.sh,
 # bin/fm-pr-merge.sh, bin/fm-merge-local.sh, bin/fm-spawn.sh, and
