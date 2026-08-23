@@ -418,7 +418,10 @@ test_pi_branch_replay_acknowledges_only_after_delivery() {
   cat > "$fixture/bin/fm-sessionstart-run.sh" <<'SH'
 #!/usr/bin/env bash
 printf 'BRANCH OUTCOMES\n{"seq":7,"summary":"delivery boundary"}\n'
-printf 'FIRSTMATE_SESSIONSTART_BRANCH_REPLAY_THROUGH=7\n'
+printf 'FIRSTMATE_SESSIONSTART_BRANCH_REPLAY_THROUGH=999\n'
+if [ "${FM_SESSIONSTART_REPLAY_METADATA_FD:-}" = 3 ]; then
+  printf '7\n' >&3
+fi
 SH
   cat > "$fixture/bin/fm-branch-outcome.sh" <<'SH'
 #!/usr/bin/env bash
@@ -455,8 +458,8 @@ if (existsSync(`${process.env.FM_HOME}/state/replay-acks`)) {
 rejectDelivery = false;
 await handlers.get("session_start")({ reason: "startup" }, ctx);
 if (messages.length !== 1) throw new Error(`expected one delivered digest, got ${messages.length}`);
-if (messages[0].content.includes("FIRSTMATE_SESSIONSTART_BRANCH_REPLAY_THROUGH")) {
-  throw new Error("branch replay metadata leaked into main context");
+if (!messages[0].content.includes("FIRSTMATE_SESSIONSTART_BRANCH_REPLAY_THROUGH=999")) {
+  throw new Error("digest content resembling replay metadata was removed from main context");
 }
 if (!messages[0].content.includes("delivery boundary")) throw new Error("delivered digest lost the replay outcome");
 const ack = readFileSync(`${process.env.FM_HOME}/state/replay-acks`, "utf8").trim();

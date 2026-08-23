@@ -958,8 +958,8 @@ if [ "$READ_ONLY" -eq 0 ] && [ "$REEMIT" -eq 0 ]; then
   fi
 fi
 
-if [ -n "$BRANCH_REPLAY_LAST" ]; then
-  printf 'FIRSTMATE_SESSIONSTART_BRANCH_REPLAY_THROUGH=%s\n' "$BRANCH_REPLAY_LAST"
+if [ -n "$BRANCH_REPLAY_LAST" ] && [ "${FM_SESSIONSTART_REPLAY_METADATA_FD:-}" = 3 ]; then
+  printf '%s\n' "$BRANCH_REPLAY_LAST" >&3
 fi
 
 exit 0
