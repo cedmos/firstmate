@@ -346,7 +346,7 @@ if [ -n "$ACK_THROUGH" ]; then
     ACK_RECEIPT_DIR="$STATE/branch-ack-receipts"
     mkdir -p "$ACK_RECEIPT_DIR" || exit 1
     ACK_RECEIPT_TMP=$(mktemp "$ACK_RECEIPT_DIR/.receipt.XXXXXX") || exit 1
-    printf '%s\n' $PRESENTED_SEQUENCES > "$ACK_RECEIPT_TMP" || exit 1
+    printf '%s\n' "$PRESENTED_SEQUENCES" > "$ACK_RECEIPT_TMP" || exit 1
     mv "$ACK_RECEIPT_TMP" "$ACK_RECEIPT_DIR/${ACK_RECEIPT_TMP##*/.}" || exit 1
   fi
   if [ "$RECOVERY_ACK_MOVED" = true ]; then

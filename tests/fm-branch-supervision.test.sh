@@ -177,9 +177,10 @@ test_branch_ack_requires_every_presented_outcome() {
     || fail "deceptive acknowledgement summary append failed"
   FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append --task task-a --verdict routine \
     --summary handled --wake-seq "$first_seq" >/dev/null || fail "first covered outcome append failed"
-  out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-wake-drain.sh" \
-    --ack-through "$through" --recovery-generation "$generation" 2>&1)
-  [ $? -ne 0 ] || fail "branch acknowledgement consumed an event without an outcome"
+  if out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-wake-drain.sh" \
+    --ack-through "$through" --recovery-generation "$generation" 2>&1); then
+    fail "branch acknowledgement consumed an event without an outcome"
+  fi
   assert_contains "$out" "wake sequence $second_seq has no durable outcome" "coverage refusal did not identify the omitted wake"
   [ -s "$home/state/.wake-queue" ] || fail "coverage refusal consumed the durable wake queue"
   FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append --task task-b --verdict routine \
