@@ -900,13 +900,28 @@ fi
 # exiting, which children inherit, so TERM alone can be silently discarded.
 # Hitting the ceiling is normal and safe - the outbox retires nothing without a
 # 2xx, so every unsent record simply stays pending for the next drain.
+#
+# Signalling the GROUP is only safe once the pgid has been read back and equals
+# the pid. If set -m did not make the child a group leader, -$pid names some
+# unrelated group, and that kill would SUCCEED - so no fallback would fire and
+# the backstop would tear down a stranger while the real drain ran on past its
+# ceiling. run_check_capture guards its own backgrounded child the same way.
+flowy_signal_drain() {  # <pid> <pgid-or-empty> <signal>
+  if [ -n "$2" ]; then
+    kill "-$3" -- "-$2" 2>/dev/null && return 0
+  fi
+  kill "-$3" "$1" 2>/dev/null || true
+}
+
 flowy_run_bounded_drain() {  # <bound-seconds>
-  local bound=$1 pid rc=0 deadline ticks=0
+  local bound=$1 pid pgid rc=0 deadline ticks=0
   set -m
   FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_FLOWY_HTTP_TIMEOUT="$bound" \
     "$FLOWY_COMPLETION_OUTBOX" --drain >/dev/null 2>&1 &
   pid=$!
   set +m
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+  [ "$pgid" = "$pid" ] || pgid=
   # SECONDS is a real elapsed-time deadline. Counting sleep 0.1 ticks instead
   # would drift well past the ceiling, because every tick also pays a fork.
   deadline=$((SECONDS + bound))
@@ -915,14 +930,14 @@ flowy_run_bounded_drain() {  # <bound-seconds>
     sleep 0.1
   done
   if kill -0 "$pid" 2>/dev/null; then
-    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    flowy_signal_drain "$pid" "$pgid" TERM
     while [ "$ticks" -lt 5 ]; do
       kill -0 "$pid" 2>/dev/null || break
       sleep 0.1
       ticks=$((ticks + 1))
     done
     if kill -0 "$pid" 2>/dev/null; then
-      kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      flowy_signal_drain "$pid" "$pgid" KILL
     fi
   fi
   wait "$pid" 2>/dev/null || rc=1

@@ -65,7 +65,10 @@
 #
 # state/flowy-last.md is an aggregate DISPLAY snapshot and is never delivery
 # authority. Only a 2xx creates it or moves its files: and status: lines, which
-# then describe the NEWEST result that actually reached Flowy. Its pending: line
+# then describe the NEWEST result that actually reached Flowy. Newest is decided
+# by the record ordinal against the highest one the snapshot has ever named, not
+# by delivery order, because a per-record rejection can hold an older record back
+# into a later pass; retiring such a record moves only its pending: entry. Its pending: line
 # lists the task ids whose results are still undelivered, or (none), and is
 # refreshed in an existing snapshot whenever the pending set changes, including
 # on a record-only run and on a pass that delivered nothing; every other line is
@@ -99,6 +102,7 @@ OUTBOX="$STATE/flowy-outbox"
 PENDING_DIR="$OUTBOX/pending"
 DELIVERED_DIR="$OUTBOX/delivered"
 ORDINAL_FILE="$OUTBOX/.ordinal"
+SNAPSHOT_ORDINAL_FILE="$OUTBOX/.snapshot-ordinal"
 DRAIN_LOCK="$OUTBOX/.drain.lock"
 SNAPSHOT="$STATE/flowy-last.md"
 WEBHOOK_FILE="$CONFIG/grok-flowy-webhook"
@@ -192,18 +196,30 @@ artifact_for() {  # <task> <status-file>
 # drain order exists to close. Carrying the previous value forward as a floor
 # makes the stamp monotonic however coarse the clock is, and also survives a
 # clock that steps backwards.
+# A missing, empty, or non-numeric stamp file reads as 0, which sorts and
+# compares as "older than anything", exactly where an unknown belongs.
+read_ordinal() {  # <file>
+  local value
+  value=$(cat "$1" 2>/dev/null || printf '0')
+  case "$value" in ''|*[!0-9]*) value=0 ;; esac
+  printf '%s' "$value"
+}
+
+write_ordinal() {  # <file> <value>
+  local tmp
+  tmp=$(umask 077; mktemp "$1.XXXXXX") || return 1
+  printf '%s\n' "$2" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$1"
+}
+
 next_ordinal() {
-  local now last tmp
+  local now last
   now=$(fm_timing_now_ms) || now=0
   case "$now" in ''|*[!0-9]*) now=0 ;; esac
-  last=$(cat "$ORDINAL_FILE" 2>/dev/null || printf '0')
-  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  last=$(read_ordinal "$ORDINAL_FILE")
   [ "$now" -gt "$last" ] || now=$((last + 1))
-  if tmp=$(umask 077; mktemp "$OUTBOX/.ordinal.XXXXXX"); then
-    printf '%s\n' "$now" > "$tmp"
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$ORDINAL_FILE"
-  fi
+  write_ordinal "$ORDINAL_FILE" "$now" || true
   printf '%s' "$now"
 }
 
@@ -339,10 +355,14 @@ webhook_key() {
 
 # Set by deliver_record on success so the aggregate snapshot describes the last
 # result that actually reached Flowy, never one that merely reached disk. The
-# drain walks its records oldest first, so the last one set here is the newest.
+# drain walks its records oldest first, so the last one set here is the newest
+# OF THAT PASS - which is not the same as the newest ever delivered, because a
+# per-record failure can hold an older record back into a later pass. The
+# ordinal carries that comparison across passes.
 DELIVERED_TASK=
 DELIVERED_RESULT=
 DELIVERED_ARTIFACT=
+DELIVERED_ORDINAL=0
 
 # Set by deliver_record when the endpoint gave no HTTP response at all. That is
 # an endpoint-wide condition, not a property of the record being sent, so the
@@ -375,13 +395,15 @@ curl_config() {  # <url> <key>
 }
 
 deliver_record() {  # <record> <url> <key>
-  local record=$1 url=$2 key=$3 base task digest result artifact recorded payload code receipt tmp
+  local record=$1 url=$2 key=$3 base task digest result artifact recorded payload code receipt tmp ordinal
   base=$(basename "$record")
   task=$(record_field "$record" task)
   digest=$(record_field "$record" digest)
   result=$(record_field "$record" result)
   artifact=$(record_field "$record" artifact)
   recorded=$(record_field "$record" recorded)
+  ordinal=$(record_field "$record" ordinal)
+  case "$ordinal" in ''|*[!0-9]*) ordinal=0 ;; esac
   if [ -z "$task" ] || [ -z "$result" ]; then
     note "pending record is unreadable and was left in place: $record"
     return 1
@@ -394,6 +416,7 @@ deliver_record() {  # <record> <url> <key>
     DELIVERED_TASK=$task
     DELIVERED_RESULT=$result
     DELIVERED_ARTIFACT=$artifact
+    DELIVERED_ORDINAL=$ordinal
     return 0
   fi
 
@@ -452,10 +475,21 @@ deliver_record() {  # <record> <url> <key>
   DELIVERED_TASK=$task
   DELIVERED_RESULT=$result
   DELIVERED_ARTIFACT=$artifact
+  DELIVERED_ORDINAL=$ordinal
 }
 
-write_snapshot() {  # <task> <result> <artifact>
-  local task=$1 result=$2 artifact=$3 tmp
+write_snapshot() {  # <task> <result> <artifact> <ordinal>
+  local task=$1 result=$2 artifact=$3 ordinal=${4:-0} newest tmp
+  case "$ordinal" in ''|*[!0-9]*) ordinal=0 ;; esac
+  newest=$(read_ordinal "$SNAPSHOT_ORDINAL_FILE")
+  # A per-record rejection can hold an OLDER record back into a later pass, so
+  # the record retiring now is not necessarily newer than the one the display
+  # already names. Retiring it must not drag the captain's view backwards: only
+  # its pending: line moves, exactly as on a pass that delivered nothing.
+  if [ -f "$SNAPSHOT" ] && [ "$ordinal" -lt "$newest" ]; then
+    refresh_snapshot_pending
+    return
+  fi
   tmp=$(umask 077; mktemp "$STATE/.flowy-last.XXXXXX") || {
     note "cannot refresh the display snapshot"
     return 1
@@ -471,6 +505,7 @@ write_snapshot() {  # <task> <result> <artifact>
   } > "$tmp"
   chmod 600 "$tmp"
   mv -f "$tmp" "$SNAPSHOT"
+  [ "$ordinal" -le "$newest" ] || write_ordinal "$SNAPSHOT_ORDINAL_FILE" "$ordinal" || true
 }
 
 # Move ONLY the pending: line of an existing snapshot, carrying every other line
@@ -562,7 +597,7 @@ EOF
   fi
 
   if [ "$delivered" -gt 0 ]; then
-    write_snapshot "$DELIVERED_TASK" "$DELIVERED_RESULT" "$DELIVERED_ARTIFACT" || rc=1
+    write_snapshot "$DELIVERED_TASK" "$DELIVERED_RESULT" "$DELIVERED_ARTIFACT" "$DELIVERED_ORDINAL" || rc=1
   else
     refresh_snapshot_pending || rc=1
   fi

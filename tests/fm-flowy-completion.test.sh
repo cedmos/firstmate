@@ -37,6 +37,14 @@ for arg in "$@"; do
     @*) body=$(cat "${arg#@}" 2>/dev/null || true) ;;
   esac
 done
+# A per-task override lets ONE drain pass answer differently per record, which
+# is how an older record gets held back while a newer one is accepted.
+for override in "$FLOWY_TEST_CODE"-*; do
+  [ -f "$override" ] || continue
+  case "$body" in
+    *"\"task\":\"${override##*/http-code-}\""*) code=$(cat "$override") ;;
+  esac
+done
 {
   printf 'args: %s\n' "$*"
   printf 'config: %s\n' "$(printf '%s' "$config" | tr '\n' ' ')"
@@ -57,6 +65,10 @@ SH
 }
 
 http_code() { printf '%s' "$2" > "$1/http-code"; }
+
+http_code_for() { printf '%s' "$3" > "$1/http-code-$2"; }
+
+clear_http_code_for() { rm -f "$1/http-code-$2"; }
 
 calls() { cat "$1/curl.calls" 2>/dev/null || true; }
 
@@ -344,6 +356,40 @@ test_snapshot_names_the_newest_delivered_result() {
   assert_grep 'status: alpha: done: alpha shipped' "$home/state/flowy-last.md" \
     "the snapshot named an older delivered result than the newest one"
   pass "one drain of several records leaves the newest delivered result in the snapshot"
+}
+
+test_a_held_back_record_never_drags_the_snapshot_backwards() {
+  local home rc
+  home=$(make_home snapshot-monotonic)
+  status_line "$home" zeta 'done: zeta shipped'
+  rc=$(outbox "$home" --status "$home/state/zeta.status" --no-drain)
+  expect_code 0 "$rc" "recording zeta failed"
+  status_line "$home" alpha 'done: alpha shipped'
+  rc=$(outbox "$home" --status "$home/state/alpha.status" --no-drain)
+  expect_code 0 "$rc" "recording alpha failed"
+
+  # One pass, mixed outcomes. zeta is the OLDER record and is rejected per-record
+  # with a 503, which is record-specific, so the pass keeps going and alpha - the
+  # newer result - is accepted.
+  http_code "$home" 200
+  http_code_for "$home" zeta 503
+  rc=$(outbox "$home" --drain)
+  expect_code 1 "$rc" "a pass that left a record pending reported a clean drain"
+  assert_grep 'status: alpha: done: alpha shipped' "$home/state/flowy-last.md" \
+    "the newer delivered result never reached the snapshot"
+  assert_grep 'pending: zeta' "$home/state/flowy-last.md" \
+    "the held-back record is missing from the pending line"
+
+  # The next pass retires zeta. It is genuinely the older result, so the display
+  # must keep naming alpha and only zeta's pending entry may move.
+  clear_http_code_for "$home" zeta
+  rc=$(outbox "$home" --drain)
+  expect_code 0 "$rc" "the retry did not deliver the held-back record"
+  [ "$(sole_receipt "$home" | wc -l | tr -d ' ')" = 2 ] || fail "both results did not leave receipts"
+  assert_grep 'status: alpha: done: alpha shipped' "$home/state/flowy-last.md" \
+    "delivering the older held-back record dragged the snapshot back to it"
+  assert_grep 'pending: (none)' "$home/state/flowy-last.md" "a drained outbox still reported pending work"
+  pass "delivering a held-back older record never drags the snapshot backwards"
 }
 
 test_snapshot_pending_line_tracks_undelivered_results() {
@@ -680,6 +726,7 @@ test_dry_run_writes_nothing
 test_non_result_status_is_a_no_op
 test_record_only_mode_performs_no_network_io
 test_snapshot_names_the_newest_delivered_result
+test_a_held_back_record_never_drags_the_snapshot_backwards
 test_snapshot_pending_line_tracks_undelivered_results
 test_a_dead_endpoint_costs_one_attempt_per_drain
 test_same_result_text_from_a_new_event_is_delivered_again
