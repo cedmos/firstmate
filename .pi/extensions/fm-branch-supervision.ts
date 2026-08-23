@@ -200,13 +200,15 @@ type ReadonlyEntries = {
 // the DURABLE cursor advances only after the batch was actually delivered
 // into the branch (flushMirror), so a crash between collect and delivery
 // re-mirrors rather than drops - over-mirroring is idempotent context.
-let collectAnchor: MirrorCursor | null = null;
-let pendingCursor: MirrorCursor | null = null;
+type MirrorCollectionState = {
+  collectAnchor: MirrorCursor | null;
+  pendingCursor: MirrorCursor | null;
+};
 
-function collectMainDialog(sessionManager: ReadonlyEntries): MirrorItem[] {
+function collectMainDialog(sessionManager: ReadonlyEntries, state: MirrorCollectionState): MirrorItem[] {
   const file = sessionManager.getSessionFile() ?? "";
   const entries = sessionManager.getEntries();
-  const anchor = collectAnchor ?? readMirrorCursor();
+  const anchor = state.collectAnchor ?? readMirrorCursor();
   const start = anchor.file === file ? Math.min(anchor.index, entries.length) : 0;
   const items: MirrorItem[] = [];
   for (const entry of entries.slice(start)) {
@@ -219,8 +221,8 @@ function collectMainDialog(sessionManager: ReadonlyEntries): MirrorItem[] {
     if (message.role === "user" && isOperationalUserText(text)) continue;
     items.push({ tag: message.role === "user" ? "captain" : "main", text: capMirrorText(text) });
   }
-  collectAnchor = { file, index: entries.length };
-  pendingCursor = collectAnchor;
+  state.collectAnchor = { file, index: entries.length };
+  state.pendingCursor = state.collectAnchor;
   return items;
 }
 
@@ -240,6 +242,7 @@ export default function (pi: ExtensionAPI) {
   // serially by design).
   let branchChain: Promise<void> = Promise.resolve();
   const pendingMirror: MirrorItem[] = [];
+  const mirrorCollection: MirrorCollectionState = { collectAnchor: null, pendingCursor: null };
 
   function markLoaded(): boolean {
     if (lockOwnership() !== "owned") return false;
@@ -528,9 +531,9 @@ export default function (pi: ExtensionAPI) {
       // item in order instead of dropping it.
       pendingMirror.shift();
     }
-    if (pendingCursor) {
-      writeMirrorCursor(pendingCursor);
-      pendingCursor = null;
+    if (mirrorCollection.pendingCursor) {
+      writeMirrorCursor(mirrorCollection.pendingCursor);
+      mirrorCollection.pendingCursor = null;
     }
   }
 
@@ -728,7 +731,7 @@ export default function (pi: ExtensionAPI) {
     if (!activateOwnership() || !branchEnabled()) return;
     try {
       markDeliveredOutcomes(ctx.sessionManager);
-      pendingMirror.push(...collectMainDialog(ctx.sessionManager));
+      pendingMirror.push(...collectMainDialog(ctx.sessionManager, mirrorCollection));
     } catch {
       return;
     }
@@ -752,6 +755,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on?.("session_shutdown", async (_event, ctx) => {
     shuttingDown = true;
+    pendingMirror.length = 0;
+    mirrorCollection.collectAnchor = null;
+    mirrorCollection.pendingCursor = null;
     const stillOwnsLock = lockOwnership() === "owned";
     if (stillOwnsLock) markDeliveredOutcomes(ctx.sessionManager);
     generationToken = randomUUID();

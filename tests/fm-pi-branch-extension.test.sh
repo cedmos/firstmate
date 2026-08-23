@@ -806,6 +806,64 @@ EOF
   pass "a secondary Pi session cannot mutate primary branch state"
 }
 
+test_rebind_recollects_undelivered_mirror() {
+  local repo home out status
+  repo="$TMP_ROOT/mirror-rebind-root"
+  home="$TMP_ROOT/mirror-rebind-home"
+  mkdir -p "$home/state" "$home/config"
+  install_pi_branch_extension_fixture "$repo"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { pi, fire, dispatch, settle, home }; })()`);
+const { pi, fire, dispatch, settle, home } = globalThis.__t;
+import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+const entries = [
+  { type: "message", message: { role: "user", content: "retain this undelivered standing order" } },
+  { type: "message", message: { role: "assistant", content: "standing order retained" } },
+];
+const ctx = {
+  sessionManager: {
+    getSessionFile: () => `${home}/main-reload.jsonl`,
+    getEntries: () => entries,
+  },
+};
+await fire("turn_end", {}, ctx);
+if ((globalThis.__fmSessions ?? []).length !== 0) throw new Error("turn_end unexpectedly created the branch");
+if (existsSync(`${home}/state/.branch-mirror-cursor`)) {
+  throw new Error("undelivered mirror advanced the durable cursor");
+}
+await fire("session_shutdown", {}, ctx);
+const rebound = await import(pathToFileURL(process.env.PLUGIN).href);
+rebound.default(pi);
+await fire("turn_end", {}, ctx);
+globalThis.__fmBlockPrompt = true;
+if (!dispatch("signal: after extension rebind").accepted) throw new Error("rebound branch refused the wake");
+await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "rebound branch prompt");
+const session = globalThis.__fmSessions[0];
+const operations = session.ops.map((operation) => operation.kind);
+if (JSON.stringify(operations) !== JSON.stringify(["custom", "custom", "prompt"])) {
+  throw new Error(`rebound mirror did not land before the wake: ${JSON.stringify(operations)}`);
+}
+const mirrored = session.ops.filter((operation) => operation.kind === "custom").map((operation) => operation.message.content);
+if (JSON.stringify(mirrored) !== JSON.stringify([
+  "[captain] retain this undelivered standing order",
+  "[main] standing order retained",
+])) {
+  throw new Error(`rebound mirror lost undelivered dialog: ${JSON.stringify(mirrored)}`);
+}
+if (!existsSync(`${home}/state/.branch-mirror-cursor`)) {
+  throw new Error("rebound delivery did not advance the durable cursor");
+}
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "extension rebind must recollect undelivered mirror context: $out"
+  pass "extension rebind recollects undelivered dialog from the durable cursor"
+}
+
 test_branch_mirror_filters_order_and_cursor() {
   local repo home out status
   repo="$TMP_ROOT/mirror-root"
@@ -936,5 +994,6 @@ test_accepted_wakes_fall_back_during_shutdown
 test_cleanup_failure_still_replays_accepted_wakes
 test_cold_start_activates_after_lock_acquisition
 test_secondary_session_cannot_mutate_primary_branch_state
+test_rebind_recollects_undelivered_mirror
 test_branch_mirror_filters_order_and_cursor
 test_branch_session_persists_across_process_restarts
