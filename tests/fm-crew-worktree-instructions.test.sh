@@ -549,6 +549,39 @@ test_an_unrepairable_owner_still_yields_a_stable_legal_namespace() {
   pass "an owner git refuses outright still yields a stable legal ref namespace"
 }
 
+# Recovery restores an entry into the working tree and leaves it there, so the
+# save that guards the next recovery saw a working tree holding the very edit it
+# was about to restore and recorded a byte-identical copy, once per invocation.
+# The listing is the only interface the overlay points the worker at, so a row of
+# indistinguishable entries is a wrong answer even though nothing is lost.
+test_repeated_recover_does_not_accumulate_duplicate_entries() {
+  local repo wt out status
+  repo="$TMP_ROOT/dedupe-repo"
+  wt="$TMP_ROOT/dedupe-wt"
+  overlaid_worktree "$repo" "$wt" 'dedupe-task-d5'
+  git -C "$wt" checkout HEAD -- AGENTS.md
+  printf '%s\n' 'THE EDIT THE WORKER KEEPS RECOVERING' >> "$wt/AGENTS.md"
+  fm_install_crew_worktree_instructions "$wt" 'dedupe-task-d5' 2>/dev/null || fail "relaunch failed"
+  expect_code 1 "$(wip_ref_count "$wt" 'dedupe-task-d5')" "the relaunch did not save exactly one entry"
+  out=$("$CREW_INSTRUCTIONS" recover "$wt" 2>&1); status=$?
+  expect_code 0 "$status" "the first recover must succeed: $out"
+  expect_code 1 "$(wip_ref_count "$wt" 'dedupe-task-d5')" \
+    "the first recover added an entry for the edit it restored"
+  out=$("$CREW_INSTRUCTIONS" recover "$wt" 2>&1); status=$?
+  expect_code 0 "$status" "the second recover must succeed: $out"
+  expect_code 1 "$(wip_ref_count "$wt" 'dedupe-task-d5')" \
+    "a second recover recorded a byte-identical copy of the entry it restored"
+  assert_contains "$(cat "$wt/AGENTS.md")" 'THE EDIT THE WORKER KEEPS RECOVERING' \
+    "the repeated recover lost the edit it was restoring"
+  assert_status_contains "$wt" " M AGENTS.md" "the repeated recover left the edit staged"
+  # A genuinely different edit must still be recorded rather than deduped away.
+  printf '%s\n' 'A SECOND, DIFFERENT EDIT' >> "$wt/AGENTS.md"
+  fm_install_crew_worktree_instructions "$wt" 'dedupe-task-d5' 2>/dev/null || fail "second relaunch failed"
+  expect_code 2 "$(wip_ref_count "$wt" 'dedupe-task-d5')" \
+    "a genuinely different edit was deduped away instead of saved"
+  pass "repeated recovery does not accumulate byte-identical entries, and a new edit still saves"
+}
+
 test_recover_refuses_loudly_when_this_task_saved_nothing() {
   local repo wt out status
   repo="$TMP_ROOT/norecover-repo"
@@ -650,6 +683,42 @@ test_crew_instructions_cli_clears_a_branch_move() {
 # The overlay must not read as unlanded work to bin/fm-teardown.sh, and a real
 # uncommitted edit must still read as exactly that. The superseded mechanism
 # hid both cases equally, blinding the unlanded-work test.
+# The filter decides what a cleanliness check is allowed to ignore, and the
+# CLAUDE.md overlay body is the canonical `@AGENTS.md` pointer that
+# bin/fm-ensure-agents-md.sh writes into arbitrary projects. Matching on content
+# alone therefore dropped a real uncommitted CLAUDE.md change in any project a
+# worker had normalized to that pointer.
+test_cleanliness_filter_keeps_foreign_and_unoverlaid_instruction_edits() {
+  local repo wt status_out
+  repo="$TMP_ROOT/filter-foreign-repo"
+  wt="$TMP_ROOT/filter-foreign-wt"
+  mkdir -p "$repo"
+  git init -q -b main "$repo"
+  printf '%s\n' 'You are a helpful project assistant.' > "$repo/AGENTS.md"
+  printf '%s\n' 'Real committed project instructions.' > "$repo/CLAUDE.md"
+  git -C "$repo" add AGENTS.md CLAUDE.md
+  git -C "$repo" commit -qm 'ordinary project'
+  make_linked_worktree "$repo" "$wt"
+  fm_crew_claude_pointer_body > "$wt/CLAUDE.md"
+  status_out=$(git -C "$wt" status --porcelain)
+  [ "$status_out" = " M CLAUDE.md" ] || fail "fixture did not produce exactly ' M CLAUDE.md': $status_out"
+  assert_contains "$(printf '%s\n' "$status_out" | fm_crew_filter_overlay_status "$wt")" 'CLAUDE.md' \
+    "a real CLAUDE.md edit in a non-firstmate project was filtered away as scaffolding"
+  # Firstmate-shaped, but with no overlay installed on AGENTS.md, is still the
+  # worker's own change rather than launch scaffolding.
+  repo="$TMP_ROOT/filter-noverlay-repo"
+  wt="$TMP_ROOT/filter-noverlay-wt"
+  make_firstmate_repo "$repo"
+  printf '%s\n' 'Real committed project instructions.' > "$repo/CLAUDE.md"
+  git -C "$repo" add CLAUDE.md
+  git -C "$repo" commit -qm 'real CLAUDE.md'
+  make_linked_worktree "$repo" "$wt"
+  fm_crew_claude_pointer_body > "$wt/CLAUDE.md"
+  assert_contains "$(git -C "$wt" status --porcelain | fm_crew_filter_overlay_status "$wt")" 'CLAUDE.md' \
+    "a CLAUDE.md edit with no overlay installed was filtered away as scaffolding"
+  pass "the cleanliness filter keeps instruction edits outside an actually overlaid firstmate worktree"
+}
+
 test_cleanliness_filter_separates_scaffolding_from_real_work() {
   local repo wt
   repo="$TMP_ROOT/filter-repo"
@@ -1092,6 +1161,7 @@ test_two_relaunches_keep_both_saved_edits
 test_saved_edits_stay_with_the_task_that_saved_them
 test_recover_restores_this_task_s_own_saved_edit
 test_recover_refuses_loudly_when_this_task_saved_nothing
+test_repeated_recover_does_not_accumulate_duplicate_entries
 test_a_staged_and_a_working_tree_version_both_survive_a_relaunch
 test_a_task_id_git_refuses_as_a_ref_component_still_launches
 test_an_unrepairable_owner_still_yields_a_stable_legal_namespace
@@ -1103,6 +1173,7 @@ test_branch_move_is_escapable_by_the_worker
 test_crew_instructions_status_tracks_a_real_overlay
 test_crew_instructions_cli_clears_a_branch_move
 test_cleanliness_filter_separates_scaffolding_from_real_work
+test_cleanliness_filter_keeps_foreign_and_unoverlaid_instruction_edits
 test_fleet_command_fence_carves_out_the_test_suite
 test_ordinary_project_is_untouched
 test_secondmate_home_is_untouched

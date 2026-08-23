@@ -92,9 +92,13 @@ FM_CREW_CLAUDE_WIP='.fm-claude-md-edit'
 FM_CREW_HOOKS_DIRNAME='fm-crew-hooks'
 FM_CREW_INSTRUCTION_FILES='AGENTS.md CLAUDE.md'
 # Saved in-progress instruction edits live at
-# refs/fm-crew/<task-id>/instruction-wip/<n>. The second component is the owning
-# task, so an entry is addressed by owner and sequence rather than by position
-# in a stack every worktree of this repository shares.
+# refs/fm-crew/<task-id>-<digest>/instruction-wip/<n>, where <digest> is
+# fm_crew_owner_digest of the exact task id. The second component names the
+# owning task, so an entry is addressed by owner and sequence rather than by
+# position in a stack every worktree of this repository shares.
+# fm_crew_wip_ref_base is the only thing that composes it; nothing else should
+# spell the component out, because the folding and digest can drift from a
+# hand-written form.
 FM_CREW_WIP_REF_NAMESPACE='refs/fm-crew'
 FM_CREW_WIP_REF_LEAF='instruction-wip'
 # Names the task those refs belong to. It lives in this worktree's own git dir,
@@ -135,9 +139,10 @@ If `git rebase`, `git merge`, `git checkout`, or `git cherry-pick` refuses becau
 Every remedy git names works here: `git stash`, or `git checkout HEAD -- AGENTS.md CLAUDE.md`.
 `bin/fm-crew-instructions.sh remove` does both files and the guard in one step.
 
-In-progress edits to these files found when this overlay was installed were saved as commits under this task's own `refs/fm-crew/<task-id>/instruction-wip/` refs, never on the shared `git stash` stack.
+In-progress edits to these files found when this overlay was installed were saved as commits on refs this task alone owns, never on the shared `git stash` stack.
 A version you had staged and a version you had only on disk are saved as separate entries, so neither is lost to the other.
-Run `bin/fm-crew-instructions.sh saved` to list the entries this worktree's task owns, and `bin/fm-crew-instructions.sh recover` to restore the newest one.
+Run `bin/fm-crew-instructions.sh saved` to list them: it resolves the ref names itself and prints the exact command that restores each one, so do not try to guess the ref path.
+Run `bin/fm-crew-instructions.sh recover` to restore the newest one.
 
 ## Maintaining this file
 
@@ -506,6 +511,23 @@ fm_crew_instruction_is_unmerged() {  # <worktree> <rel>
   [ -n "$(git -C "$wt" ls-files -u -- "$rel" 2>/dev/null)" ]
 }
 
+# True when <owner> already has an entry holding exactly <blob> for <rel>.
+# Recovery restores an entry into the working tree and then leaves it there, so
+# the next save would otherwise record a byte-identical copy of what it is about
+# to restore, and repeat on every invocation until the listing the worker is
+# pointed at is a row of indistinguishable entries.
+fm_crew_wip_entry_holds_blob() {  # <worktree> <owner> <rel> <blob>
+  local wt=$1 owner=$2 rel=$3 blob=$4 ref
+  [ -n "$blob" ] || return 1
+  while IFS= read -r ref; do
+    [ -n "$ref" ] || continue
+    [ "$(git -C "$wt" rev-parse --verify --quiet "$ref:$rel" 2>/dev/null)" = "$blob" ] && return 0
+  done <<EOF
+$(fm_crew_list_wip_refs "$wt" "$owner")
+EOF
+  return 1
+}
+
 # Save a worker's in-progress instruction edits before the overlay replaces
 # them, restoring the committed files in the same step.
 # A private sidecar was overwritten by the next relaunch and lost with no error,
@@ -519,7 +541,7 @@ fm_crew_instruction_is_unmerged() {  # <worktree> <rel>
 # named in its subject, so the two stay tellable apart on the way back out.
 fm_crew_save_instruction_wip() {  # <worktree> <owner>
   local wt=$1 owner=$2 rel head_blob disk_blob staged_blob overlay_blob
-  local disk_paths='' staged_paths='' ref
+  local disk_paths='' staged_paths='' restore_paths='' reset_paths='' ref
   local -a disk_pairs=() staged_pairs=()
   for rel in $FM_CREW_INSTRUCTION_FILES; do
     [ -f "$wt/$rel" ] || continue
@@ -538,8 +560,11 @@ fm_crew_save_instruction_wip() {  # <worktree> <owner>
         echo "error: could not record the in-progress $rel in $wt; refusing to overwrite uncommitted work" >&2
         return 1
       }
-      disk_paths="${disk_paths:+$disk_paths }$rel"
-      disk_pairs+=("$rel=$disk_blob")
+      restore_paths="${restore_paths:+$restore_paths }$rel"
+      if ! fm_crew_wip_entry_holds_blob "$wt" "$owner" "$rel" "$disk_blob"; then
+        disk_paths="${disk_paths:+$disk_paths }$rel"
+        disk_pairs+=("$rel=$disk_blob")
+      fi
     fi
     # The overlay is launch scaffolding, not the worker's work, and `git add -A`
     # stages it like any other modification, so a staged overlay must not be
@@ -547,8 +572,11 @@ fm_crew_save_instruction_wip() {  # <worktree> <owner>
     staged_blob=$(fm_crew_staged_blob "$wt" "$rel")
     if [ -n "$staged_blob" ] && [ "$staged_blob" != "$head_blob" ] &&
       [ "$staged_blob" != "$disk_blob" ] && [ "$staged_blob" != "$overlay_blob" ]; then
-      staged_paths="${staged_paths:+$staged_paths }$rel"
-      staged_pairs+=("$rel=$staged_blob")
+      reset_paths="${reset_paths:+$reset_paths }$rel"
+      if ! fm_crew_wip_entry_holds_blob "$wt" "$owner" "$rel" "$staged_blob"; then
+        staged_paths="${staged_paths:+$staged_paths }$rel"
+        staged_pairs+=("$rel=$staged_blob")
+      fi
     fi
   done
   if [ "${#staged_pairs[@]}" -gt 0 ]; then
@@ -567,14 +595,14 @@ fm_crew_save_instruction_wip() {  # <worktree> <owner>
     }
     fm_crew_report_saved_entry "$wt" "$ref" "in-progress $disk_paths" || return 1
   fi
-  for rel in $disk_paths; do
+  for rel in $restore_paths; do
     git -C "$wt" checkout HEAD -- "$rel" || {
       echo "error: could not restore the committed $rel in $wt after saving its edits" >&2
       return 1
     }
   done
-  for rel in $staged_paths; do
-    case " $disk_paths " in
+  for rel in $reset_paths; do
+    case " $restore_paths " in
       *" $rel "*) continue ;;
     esac
     git -C "$wt" reset -q HEAD -- "$rel" || {
@@ -605,10 +633,24 @@ fm_crew_report_saved_entry() {  # <worktree> <ref> <what>
 # longer holds the overlay byte for byte, or one staged for commit, is reported
 # as the uncommitted work it is.
 fm_crew_filter_overlay_status() {  # <worktree>
-  local wt=$1 line rel
+  local wt=$1 line rel overlaid=0
+  # Content alone cannot decide this. The CLAUDE.md overlay is the canonical
+  # `@AGENTS.md` pointer that bin/fm-ensure-agents-md.sh writes into ARBITRARY
+  # projects, so "holds the overlay content" is a test any repository can pass,
+  # and a worker who normalizes some other project's CLAUDE.md to that pointer
+  # would have had the change dropped here and torn down.
+  # AGENTS.md carrying the crew body byte for byte is what makes this worktree
+  # an overlaid one, so nothing is dropped unless that is true of a
+  # firstmate-shaped checkout. Keeping a line only costs a loud refusal;
+  # dropping one destroys work, so every uncertain case keeps the line.
+  if fm_checkout_is_firstmate_shaped "$wt" &&
+    fm_crew_file_is_installed_overlay "$wt" AGENTS.md; then
+    overlaid=1
+  fi
   while IFS= read -r line; do
     rel=${line#" M "}
-    if [ "$rel" != "$line" ] && fm_crew_is_instruction_file "$rel" &&
+    if [ "$overlaid" -eq 1 ] && [ "$rel" != "$line" ] &&
+      fm_crew_is_instruction_file "$rel" &&
       fm_crew_file_is_installed_overlay "$wt" "$rel"; then
       continue
     fi

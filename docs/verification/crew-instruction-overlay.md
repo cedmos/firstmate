@@ -93,14 +93,15 @@ Removal therefore issues the two clears as separate invocations, which reports `
 This check ran on 2026-08-23 with git 2.50.1 (Apple Git-155) in a disposable scratch repository.
 It exists because git's own stash was proposed as the place to keep in-progress instruction edits the overlay would otherwise overwrite.
 It is the wrong place: a stash entry carries no owner identity, `git stash pop` takes whatever sits at `stash@{0}`, and `refs/stash` is one stack shared by every worktree of the repository including the primary checkout.
-The same script demonstrates the carrier that replaced it, a commit under `refs/fm-crew/<task-id>/instruction-wip/<n>`.
+The same script demonstrates the carrier that replaced it by calling the shipped library, so the ref names below are the ones the code actually composes rather than a hand-written guess at them.
 
 The exact script run from this repository root was:
 
 ```bash
 set -eu
 git --version
-PROBE="$PWD/.crew-carrier-probe"
+. "$PWD/bin/fm-crew-worktree-instructions-lib.sh"
+PROBE="$PWD/tmp/.crew-carrier-probe"
 rm -rf "$PROBE"; mkdir -p "$PROBE"; cd "$PROBE"
 git init -q -b main primary
 cd primary
@@ -117,36 +118,32 @@ cd ../slot
 printf 'list read from the pooled slot:\n'; git stash list | sed 's/^/  /'
 git stash pop -q
 printf 'the slot popped stash@{0} onto its branch: %s\n' "$(head -1 AGENTS.md)"
-printf 'entries left after that pop: %s\n' "$(git stash list | grep -c . || true)"
 git checkout -q HEAD -- AGENTS.md; git stash clear
 
-printf '\n### a per-task ref is addressed by owner and sequence, never by position\n'
+printf '\n### the shipped per-task namespace, composed by the library itself\n'
 save() {  # <owner> <content>
-  owner=$1; content=$2
-  blob=$(printf '%s\n' "$content" | git hash-object -w --stdin)
-  idx="$PWD/.probe-index"; rm -f "$idx"
-  GIT_INDEX_FILE=$idx git read-tree HEAD
-  GIT_INDEX_FILE=$idx git update-index --add --cacheinfo "100644,$blob,AGENTS.md"
-  tree=$(GIT_INDEX_FILE=$idx git write-tree); rm -f "$idx"
-  n=1; while git rev-parse --verify --quiet "refs/fm-crew/$owner/instruction-wip/$n" >/dev/null; do n=$((n+1)); done
-  git update-ref "refs/fm-crew/$owner/instruction-wip/$n" \
-    "$(git commit-tree "$tree" -p HEAD -m "saved for $owner")"
-  printf 'saved refs/fm-crew/%s/instruction-wip/%s\n' "$owner" "$n"
+  local owner=$1 blob
+  blob=$(printf '%s\n' "$2" | git hash-object -w --stdin)
+  fm_crew_store_wip_entry "$PWD" "$owner" "saved for $owner" "AGENTS.md=$blob" | sed 's/^/  saved /'
 }
 save task-alpha 'ALPHA EDIT 1'
 save task-alpha 'ALPHA EDIT 2'
-printf 'both alpha entries survive and stay distinct: %s | %s\n' \
-  "$(git show refs/fm-crew/task-alpha/instruction-wip/1:AGENTS.md)" \
-  "$(git show refs/fm-crew/task-alpha/instruction-wip/2:AGENTS.md)"
-printf 'the slot is reused by task-beta; entries task-beta owns: [%s]\n' \
-  "$(git for-each-ref --format='%(refname)' 'refs/fm-crew/task-beta/instruction-wip/*' | tr -d '\n')"
+printf 'base for task-alpha:      %s\n' "$(fm_crew_wip_ref_base "$PWD" task-alpha)"
+printf 'base for task-beta:       %s\n' "$(fm_crew_wip_ref_base "$PWD" task-beta)"
+printf 'both alpha entries stay distinct: %s | %s\n' \
+  "$(git show "$(fm_crew_wip_ref_base "$PWD" task-alpha)/1:AGENTS.md")" \
+  "$(git show "$(fm_crew_wip_ref_base "$PWD" task-alpha)/2:AGENTS.md")"
+printf 'entries task-beta owns:   [%s]\n' "$(fm_crew_list_wip_refs "$PWD" task-beta | tr -d '\n')"
+printf 'two ids that fold alike stay apart: %s\n' \
+  "$([ "$(fm_crew_wip_ref_base "$PWD" 'probe..v2.lock')" != "$(fm_crew_wip_ref_base "$PWD" 'probe.v2')" ] && echo yes || echo no)"
 
 printf '\n### the refs live in the common git dir and outlive the worktree\n'
 printf 'read from the primary:\n'; git -C ../primary for-each-ref --format='  %(refname)' refs/fm-crew/
 cd ../primary
 git worktree remove --force ../slot
 printf 'after the pooled worktree is removed:\n'; git for-each-ref --format='  %(refname)' refs/fm-crew/
-printf 'ALPHA EDIT 1 still readable: %s\n' "$(git show refs/fm-crew/task-alpha/instruction-wip/1:AGENTS.md)"
+printf 'ALPHA EDIT 1 still readable: %s\n' \
+  "$(git show "$(git for-each-ref --format='%(refname)' refs/fm-crew/ | head -1):AGENTS.md")"
 cd ../..; rm -rf "$PROBE"
 ```
 
@@ -160,26 +157,30 @@ list read from the pooled slot:
   stash@{0}: On main: unrelated primary work
   stash@{1}: On task: fm-crew
 the slot popped stash@{0} onto its branch: PRIMARY CHECKOUT EDIT
-entries left after that pop: 1
 
-### a per-task ref is addressed by owner and sequence, never by position
-saved refs/fm-crew/task-alpha/instruction-wip/1
-saved refs/fm-crew/task-alpha/instruction-wip/2
-both alpha entries survive and stay distinct: ALPHA EDIT 1 | ALPHA EDIT 2
-the slot is reused by task-beta; entries task-beta owns: []
+### the shipped per-task namespace, composed by the library itself
+  saved refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/1
+  saved refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/2
+base for task-alpha:      refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip
+base for task-beta:       refs/fm-crew/task-beta-b3794eb2fa60/instruction-wip
+both alpha entries stay distinct: ALPHA EDIT 1 | ALPHA EDIT 2
+entries task-beta owns:   []
+two ids that fold alike stay apart: yes
 
 ### the refs live in the common git dir and outlive the worktree
 read from the primary:
-  refs/fm-crew/task-alpha/instruction-wip/1
-  refs/fm-crew/task-alpha/instruction-wip/2
+  refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/1
+  refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/2
 after the pooled worktree is removed:
-  refs/fm-crew/task-alpha/instruction-wip/1
-  refs/fm-crew/task-alpha/instruction-wip/2
+  refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/1
+  refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/2
 ALPHA EDIT 1 still readable: ALPHA EDIT 1
 ```
 
 The pooled slot's `git stash pop` applied the primary checkout's unrelated work onto the task branch and left the crew's own entry behind, which is the cross-contamination a shared position-addressed stack cannot avoid.
 The per-task refs hold the properties the stash cannot: two saves for one task stay distinct instead of overwriting each other, a later occupant of the same slot owns no entries at all so it has nothing to take, and both entries remain readable from the primary after the worktree is gone.
+The component is `<task-id>-<digest>` because the readable part has to be folded to satisfy git's ref grammar and folding is lossy; the digest of the exact task id is what keeps two ids that fold alike apart, as the `probe..v2.lock` versus `probe.v2` line shows.
+A worker should not spell that component out by hand: `bin/fm-crew-instructions.sh saved` resolves it through the same function this script calls.
 
 `refs/stash` being shared rather than per-worktree state is visible in the first block, where the entry pushed from the primary is listed and then consumed from the linked worktree.
 

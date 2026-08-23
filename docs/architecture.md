@@ -211,6 +211,7 @@ Either bit makes git report a clean worktree over a file that differs from the i
 The same concealment also hides a worker's genuine uncommitted instruction edit from the unlanded-work test in `bin/fm-teardown.sh`.
 Telling git the truth costs one visible modification and buys back every standard remedy, so git's own advice terminates, and `bin/fm-crew-instructions.sh` gives the worker a one-command removal as well.
 Consumers that must not read the overlay as unlanded work filter it through the library, which drops the modification only while the file holds the overlay byte for byte, so a real edit stays visible as the uncommitted work it is.
+Content is not sufficient on its own, because the `CLAUDE.md` overlay is the canonical `@AGENTS.md` pointer `bin/fm-ensure-agents-md.sh` writes into arbitrary projects: the filter therefore drops nothing unless the checkout is firstmate-shaped and `AGENTS.md` is itself carrying the overlay, so a worker who normalizes some other project's `CLAUDE.md` to that pointer still refuses teardown.
 
 In-progress instruction edits found at launch or relaunch are saved as commits under `refs/fm-crew/<task-id>-<digest>/instruction-wip/<n>`, one ref per save, rather than in a private sidecar or on git's shared stash stack.
 The readable part of that component has to be folded to satisfy git's ref grammar, and folding is lossy, so a digest of the exact task id keeps the mapping injective and two task ids can never share one namespace.

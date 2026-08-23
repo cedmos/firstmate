@@ -717,6 +717,19 @@ test_squash_merged_branch_deleted_allows() {
   pass "squash-merged + deleted-branch worktree (PR merged) is torn down (the fix)"
 }
 
+# Make <case_dir>/wt look like a firstmate checkout, which is what the overlay
+# filter gates on. Without this the fixture is an ordinary project, and the
+# filter must not drop anything there at all.
+make_case_firstmate_shaped() {  # <case-dir>
+  local case_dir=$1
+  mkdir -p "$case_dir/wt/bin"
+  printf '%s\n' '#!/bin/sh' 'echo session-start' > "$case_dir/wt/bin/fm-session-start.sh"
+  printf '%s\n' '#!/bin/sh' 'echo spawn' > "$case_dir/wt/bin/fm-spawn.sh"
+  chmod +x "$case_dir/wt/bin/fm-session-start.sh" "$case_dir/wt/bin/fm-spawn.sh"
+  git -C "$case_dir/wt" add -- bin
+  git -C "$case_dir/wt" -c user.email=t@t -c user.name=t commit -q -m 'firstmate-shaped fixture'
+}
+
 # A firstmate-repo crew worktree carries the crew instruction overlay as a
 # visible modification of AGENTS.md. It is launch scaffolding, so it must not
 # refuse teardown as unlanded work, while any real uncommitted edit to the same
@@ -726,6 +739,7 @@ test_installed_crew_overlay_is_not_unlanded_work() {
   case_dir=$(make_case crew-overlay-clean)
   write_meta "$case_dir" no-mistakes ship
   wt_commit_file "$case_dir" AGENTS.md 'You are the first mate.' "add AGENTS.md"
+  make_case_firstmate_shaped "$case_dir"
   append_pr_meta_for_current_head "$case_dir"
   pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
   add_gh_pr_merged_for_head "$case_dir" "$pr_head"
@@ -741,11 +755,66 @@ test_installed_crew_overlay_is_not_unlanded_work() {
   pass "an installed crew overlay does not read as unlanded work at teardown"
 }
 
+# The CLAUDE.md overlay body is byte-identical to the canonical `@AGENTS.md`
+# pointer bin/fm-ensure-agents-md.sh writes into ARBITRARY projects, so matching
+# on content alone let the filter drop a real uncommitted CLAUDE.md change in any
+# project a worker had normalized to that pointer, and teardown discarded it.
+test_a_canonical_claude_pointer_in_another_project_still_refuses() {
+  local case_dir rc pr_head
+  case_dir=$(make_case crew-overlay-foreign)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" CLAUDE.md 'Real committed project instructions.' "add CLAUDE.md"
+  append_pr_meta_for_current_head "$case_dir"
+  pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  add_gh_pr_merged_for_head "$case_dir" "$pr_head"
+  # The worker normalizes it to the fleet's canonical pointer and does not commit.
+  fm_crew_claude_pointer_body > "$case_dir/wt/CLAUDE.md"
+  [ "$(git -C "$case_dir/wt" status --porcelain)" = " M CLAUDE.md" ] \
+    || fail "crew-overlay-foreign: fixture did not produce exactly ' M CLAUDE.md'"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "crew-overlay-foreign: an uncommitted CLAUDE.md in a non-firstmate project must refuse teardown"
+  grep -q REFUSED "$case_dir/stderr" || fail "crew-overlay-foreign: no REFUSED line in stderr"
+  grep -q "uncommitted changes" "$case_dir/stderr" \
+    || fail "crew-overlay-foreign: refusal did not cite uncommitted changes"
+  pass "a canonical CLAUDE.md pointer in a non-firstmate project still refuses teardown"
+}
+
+# Even in a firstmate-shaped worktree, the CLAUDE.md pointer is only scaffolding
+# when AGENTS.md is actually carrying the overlay. With no overlay installed it
+# is the worker's own uncommitted change.
+test_a_claude_pointer_without_the_overlay_still_refuses() {
+  local case_dir rc pr_head
+  case_dir=$(make_case crew-overlay-no-agents)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" AGENTS.md 'You are the first mate.' "add AGENTS.md"
+  wt_commit_file "$case_dir" CLAUDE.md 'Real committed project instructions.' "add CLAUDE.md"
+  make_case_firstmate_shaped "$case_dir"
+  append_pr_meta_for_current_head "$case_dir"
+  pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  add_gh_pr_merged_for_head "$case_dir" "$pr_head"
+  fm_crew_claude_pointer_body > "$case_dir/wt/CLAUDE.md"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "crew-overlay-no-agents: a CLAUDE.md edit with no overlay installed must refuse teardown"
+  grep -q REFUSED "$case_dir/stderr" || fail "crew-overlay-no-agents: no REFUSED line in stderr"
+  pass "a CLAUDE.md pointer without an installed overlay still refuses teardown"
+}
+
 test_real_edit_over_the_crew_overlay_still_refuses() {
   local case_dir rc pr_head
   case_dir=$(make_case crew-overlay-dirty)
   write_meta "$case_dir" no-mistakes ship
   wt_commit_file "$case_dir" AGENTS.md 'You are the first mate.' "add AGENTS.md"
+  make_case_firstmate_shaped "$case_dir"
   append_pr_meta_for_current_head "$case_dir"
   pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
   add_gh_pr_merged_for_head "$case_dir" "$pr_head"
@@ -2662,6 +2731,8 @@ test_herdr_projection_teardown_retains_journal_when_close_unconfirmed
 test_herdr_projection_teardown_surfaces_restore_failure_without_blocking_cleanup
 test_squash_merged_branch_deleted_allows
 test_installed_crew_overlay_is_not_unlanded_work
+test_a_canonical_claude_pointer_in_another_project_still_refuses
+test_a_claude_pointer_without_the_overlay_still_refuses
 test_real_edit_over_the_crew_overlay_still_refuses
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows
