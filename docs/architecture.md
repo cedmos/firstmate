@@ -202,15 +202,27 @@ The helper's header owns the exact signal detection, relocated-home limitation, 
 
 A crew or scout whose project is the firstmate repo works in a linked worktree of this same repository.
 Harnesses auto-load `AGENTS.md` and `CLAUDE.md` from that worktree as project instructions that outrank the launch brief, so the worker otherwise adopts the firstmate role, runs session start, and tries to spawn a worker for its own task.
-`bin/fm-spawn.sh` therefore installs crewmate instructions over those auto-loaded files after the pooled worktree refresh, using skip-worktree so the overlay is not uncommitted work, and refuses the spawn if the overlay cannot be hidden from git or still presents firstmate identity.
+`bin/fm-spawn.sh` therefore installs crewmate instructions over those auto-loaded files after the pooled worktree refresh, and refuses the spawn if the overlay cannot be installed or still presents firstmate identity.
 Only `AGENTS.md` carries the crew body; `CLAUDE.md` is overlaid with the canonical `@AGENTS.md` pointer that `bin/fm-ensure-agents-md.sh` owns, and the crew body carries that script's canonical `## Maintaining this file` heading, so the project-memory step every ship brief mandates stays a no-op success instead of reporting a two-real-files conflict.
 The overlay keeps `.agents/skills/firstmate-coding-guidelines/SKILL.md` in the worktree and tells the worker how to restore the committed `AGENTS.md` when the task is to edit it.
-Because skip-worktree also hides a worker's own edit to those files from `git add` and `git commit`, the install adds a pre-commit guard; it refuses a commit while a skipped instruction file no longer holds its overlay content, while an instruction file would be committed carrying the overlay in place of firstmate's own file, and while a saved `.fm-agents-md-edit` or `.fm-claude-md-edit` sidecar still holds work the commit would omit.
+
+The overlay is an ordinary visible working-tree modification, and is deliberately not hidden behind `skip-worktree` or `assume-unchanged`.
+Either bit makes git report a clean worktree over a file that differs from the index, and that costs more than it buys: every branch-moving operation refuses, while `git stash` saves nothing and a commit records nothing, so the remedies git names are dead ends and the worker has no escape.
+The same concealment also hides a worker's genuine uncommitted instruction edit from the unlanded-work test in `bin/fm-teardown.sh`.
+Telling git the truth costs one visible modification and buys back every standard remedy, so git's own advice terminates, and `bin/fm-crew-instructions.sh` gives the worker a one-command removal as well.
+Consumers that must not read the overlay as unlanded work filter it through the library, which drops the modification only while the file holds the overlay byte for byte, so a real edit stays visible as the uncommitted work it is.
+
+In-progress instruction edits found at launch or relaunch move into git's own stash rather than a private sidecar.
+The stash is a stack, so a second relaunch adds an entry instead of destroying the first; `refs/stash` is shared ref space that outlives the disposable worktree; and recovery is the `git stash list` and `git stash pop` a worker already knows.
+
+The install also adds a pre-commit guard, because `git add -A` stages the overlay like any other modification.
+The guard keeps commits ordinary rather than blocking them: an instruction file staged with exactly the overlay content is unstaged so the worker's own staged work still lands, and only a staged file that carries the overlay marker without being the overlay byte for byte is refused, because neither dropping nor keeping that mixture is safe to decide automatically.
 The guard lives in the worktree's own git dir and is selected by per-worktree `core.hooksPath`, so the primary's hooks never change.
-Removal is the same library's job and runs before every pooled-worktree refresh in `bin/fm-spawn.sh`, so a slot returned with the overlay still installed self-heals instead of wedging the next `git reset --hard` on an invisible skip-worktree entry; it also drops the saved sidecars, which are excluded from `git status` and survive a reset, so one task's in-progress edits are never handed to the next worker in that slot.
+Removal is the same library's job and runs before every pooled-worktree refresh in `bin/fm-spawn.sh`, so a slot returned with the overlay still installed self-heals; it also heals a worktree left behind by the superseded mechanism, folding any sidecar it left into the git stash rather than deleting what may be the only copy of an edit that mechanism hid.
 A secondmate home and a non-firstmate project are left unchanged, and the library refuses to overlay a primary checkout.
 `bin/fm-session-start.sh` separately refuses in the same linked firstmate worktree so a worker that still reaches for it cannot build a ghost home.
 `bin/fm-crew-worktree-instructions-lib.sh` owns the overlay, the session-start predicate, and the loud failure modes.
+[`docs/verification/crew-instruction-overlay.md`](verification/crew-instruction-overlay.md) records the git behavior the non-concealment choice rests on, including why `assume-unchanged` is not a wedge-free substitute.
 
 ## Two task shapes
 

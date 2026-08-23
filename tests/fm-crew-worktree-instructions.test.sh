@@ -8,12 +8,18 @@
 # that a warning string exists: after overlay, the files a harness would load
 # no longer contain the firstmate identity line, while git HEAD still does.
 # The overlay's live-fire consequences are exercised through real git and the
-# real consumers: a commit that would silently drop an edit to a skip-worktree
-# instruction file is refused, so is one that would commit the overlay itself
-# or leave a saved sidecar behind, a pooled worktree returned with the overlay
-# still installed can be refreshed onto a moved default branch instead of
-# wedging, and the brief-mandated bin/fm-ensure-agents-md.sh stays a no-op
-# success in an overlaid worktree.
+# real consumers, and the two properties the mechanism exists to hold are
+# asserted directly: a branch move onto a commit carrying a different AGENTS.md
+# stays escapable by the worker with the remedy git itself names, and a second
+# relaunch preserves the first relaunch's saved edits instead of destroying
+# them. Alongside those, a commit that would record the overlay over firstmate's
+# own file is refused, an edit made on top of the overlay is never dropped
+# silently, the cleanliness filter separates launch scaffolding from real
+# uncommitted work, a pooled worktree can be reset onto a moved default branch
+# with the overlay still installed, a worktree left behind by the superseded
+# skip-worktree mechanism is healed without losing its sidelined edit, and the
+# brief-mandated bin/fm-ensure-agents-md.sh stays a no-op success in an overlaid
+# worktree.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -24,6 +30,7 @@ set -u
 SPAWN="$ROOT/bin/fm-spawn.sh"
 SESSION_START="$ROOT/bin/fm-session-start.sh"
 ENSURE_AGENTS_MD="$ROOT/bin/fm-ensure-agents-md.sh"
+CREW_INSTRUCTIONS="$ROOT/bin/fm-crew-instructions.sh"
 TMP_ROOT=$(fm_test_tmproot fm-crew-worktree-instructions)
 fm_git_identity fmtest fmtest@example.invalid
 
@@ -46,17 +53,29 @@ assert_corpus_is_crew() {  # <worktree> <msg>
   assert_contains "$corpus" "$OVERLAY_MARKER" "$msg: auto-loaded files missing overlay marker"
 }
 
-assert_skip_worktree() {  # <worktree> <rel> <msg>
+# The overlay must never be hidden behind skip-worktree or assume-unchanged:
+# those bits make git report a clean worktree over a divergent file, which
+# wedges every branch move while `git stash` saves nothing.
+assert_visible_to_git() {  # <worktree> <rel> <msg>
   local wt=$1 rel=$2 msg=$3 state
   state=$(git -C "$wt" ls-files -v -- "$rel" | awk '{print substr($1,1,1)}')
-  [ "$state" = S ] || fail "$msg ($rel ls-files -v='$state')"
+  case $state in
+    S | [a-z]) fail "$msg ($rel ls-files -v='$state')" ;;
+  esac
+  return 0
 }
 
-assert_not_skip_worktree() {  # <worktree> <rel> <msg>
-  local wt=$1 rel=$2 msg=$3 state
-  state=$(git -C "$wt" ls-files -v -- "$rel" | awk '{print substr($1,1,1)}')
-  [ "$state" = S ] && fail "$msg ($rel is still skip-worktree)"
-  return 0
+assert_status_contains() {  # <worktree> <expected-line> <msg>
+  local wt=$1 expected=$2 msg=$3 status
+  status=$(git -C "$wt" status --porcelain)
+  case $status in
+    *"$expected"*) return 0 ;;
+  esac
+  fail "$msg (git status --porcelain was '$status')"
+}
+
+stash_count() {  # <worktree>
+  git -C "$1" stash list | grep -c . || true
 }
 
 commit_all() {  # <worktree> <message>
@@ -126,13 +145,15 @@ test_overlay_inverts_autoload_corpus() {
   assert_contains "$(git -C "$wt" show HEAD:AGENTS.md)" "$IDENTITY_LINE" \
     "committed AGENTS.md lost firstmate identity"
   assert_present "$wt/$GUIDELINES_REL" "coding guidelines skill disappeared from the worktree"
-  assert_skip_worktree "$wt" AGENTS.md "AGENTS.md overlay was not hidden from git"
-  assert_skip_worktree "$wt" CLAUDE.md "CLAUDE.md overlay was not hidden from git"
+  assert_visible_to_git "$wt" AGENTS.md "AGENTS.md overlay was hidden from git"
+  assert_visible_to_git "$wt" CLAUDE.md "CLAUDE.md overlay was hidden from git"
   if fm_file_is_crew_overlay "$wt/CLAUDE.md"; then
     fail "CLAUDE.md was overlaid with the crew body instead of the canonical @AGENTS.md pointer"
   fi
-  [ -z "$(git -C "$wt" status --porcelain)" ] \
-    || fail "overlay left the worktree dirty: $(git -C "$wt" status --porcelain)"
+  assert_status_contains "$wt" " M AGENTS.md" \
+    "the overlay must be an ordinary visible modification, not a hidden one"
+  [ -z "$(git -C "$wt" status --porcelain | fm_crew_filter_overlay_status "$wt")" ] \
+    || fail "overlay left work a cleanliness check reads as unlanded: $(git -C "$wt" status --porcelain)"
   pass "overlay removes firstmate identity from the auto-load corpus and keeps the committed job"
 }
 
@@ -148,22 +169,111 @@ test_overlay_is_idempotent() {
   pass "overlay install is idempotent"
 }
 
-test_dirty_agents_md_is_saved_then_overlaid() {
+test_dirty_agents_md_is_stashed_then_overlaid() {
   local repo wt
   repo="$TMP_ROOT/wip-repo"
   wt="$TMP_ROOT/wip-wt"
   make_firstmate_repo "$repo"
   make_linked_worktree "$repo" "$wt"
   fm_install_crew_worktree_instructions "$wt" || fail "initial overlay failed"
-  git -C "$wt" update-index --no-skip-worktree -- AGENTS.md
   git -C "$wt" checkout HEAD -- AGENTS.md
   printf '%s\n' 'worker edit to the real job description' >> "$wt/AGENTS.md"
-  fm_install_crew_worktree_instructions "$wt" || fail "overlay after dirty AGENTS.md failed"
-  assert_present "$wt/.fm-agents-md-edit" "dirty AGENTS.md was not saved before overlay"
-  assert_grep "worker edit to the real job description" "$wt/.fm-agents-md-edit" \
-    "saved WIP omitted the worker's AGENTS.md edit"
-  assert_corpus_is_crew "$wt" "after saving dirty AGENTS.md"
-  pass "in-progress AGENTS.md edits are saved, then the overlay is reinstalled"
+  fm_install_crew_worktree_instructions "$wt" 2>/dev/null || fail "overlay after dirty AGENTS.md failed"
+  expect_code 1 "$(stash_count "$wt")" "the in-progress AGENTS.md edit was not pushed to the git stash"
+  assert_contains "$(git -C "$wt" stash show -p 'stash@{0}')" 'worker edit to the real job description' \
+    "the stashed entry omitted the worker's AGENTS.md edit"
+  assert_corpus_is_crew "$wt" "after stashing dirty AGENTS.md"
+  pass "in-progress AGENTS.md edits go to the git stash, then the overlay is reinstalled"
+}
+
+# The redesign's core claim: relaunching twice must not destroy the first
+# relaunch's saved edits. A private sidecar was cp-overwritten with no error;
+# the git stash is a stack, so both survive and both are recoverable.
+test_two_relaunches_keep_both_saved_edits() {
+  local repo wt
+  repo="$TMP_ROOT/relaunch-repo"
+  wt="$TMP_ROOT/relaunch-wt"
+  overlaid_worktree "$repo" "$wt"
+  git -C "$wt" checkout HEAD -- AGENTS.md
+  printf '%s\n' 'EDIT E1 from the first incarnation' >> "$wt/AGENTS.md"
+  fm_install_crew_worktree_instructions "$wt" 2>/dev/null || fail "first relaunch overlay failed"
+  git -C "$wt" checkout HEAD -- AGENTS.md
+  printf '%s\n' 'EDIT E2 from the second incarnation' >> "$wt/AGENTS.md"
+  fm_install_crew_worktree_instructions "$wt" 2>/dev/null || fail "second relaunch overlay failed"
+  expect_code 2 "$(stash_count "$wt")" "two relaunches did not leave two recoverable stash entries"
+  assert_contains "$(git -C "$wt" stash show -p 'stash@{1}')" 'EDIT E1 from the first incarnation' \
+    "the second relaunch destroyed the first relaunch's saved edit"
+  assert_contains "$(git -C "$wt" stash show -p 'stash@{0}')" 'EDIT E2 from the second incarnation' \
+    "the second relaunch did not save its own edit"
+  assert_corpus_is_crew "$wt" "after two relaunches"
+  pass "a second relaunch preserves the first relaunch's saved instruction edits"
+}
+
+# The other core claim: a branch move onto a commit carrying a different
+# AGENTS.md must leave the worker an escape that actually works. Under the
+# superseded hiding mechanism `git stash` saved nothing and the loop never
+# terminated.
+test_branch_move_is_escapable_by_the_worker() {
+  local repo wt out status
+  repo="$TMP_ROOT/wedge-repo"
+  wt="$TMP_ROOT/wedge-wt"
+  overlaid_worktree "$repo" "$wt"
+  printf '%s\n' "$IDENTITY_LINE" 'The user is the captain.' 'Main moved on.' > "$repo/AGENTS.md"
+  git -C "$repo" add AGENTS.md
+  git -C "$repo" commit -qm 'move AGENTS.md on main'
+  git -C "$repo" push -q origin main
+  git -C "$wt" fetch -q origin
+  out=$(git -C "$wt" merge origin/main -m merge 2>&1); status=$?
+  [ "$status" -ne 0 ] || fail "fixture did not reproduce a refused branch move: $out"
+  assert_contains "$out" "AGENTS.md" "the refusal did not name the overlaid file"
+  # The remedy git itself names must now do something.
+  git -C "$wt" stash push --quiet -- AGENTS.md || fail "git stash could not save the overlay"
+  expect_code 1 "$(stash_count "$wt")" "git stash saved nothing, so git's own advice is still a dead end"
+  out=$(git -C "$wt" merge origin/main -m merge 2>&1); status=$?
+  expect_code 0 "$status" "the branch move still fails after taking git's own advice: $out"
+  assert_contains "$(cat "$wt/AGENTS.md")" 'Main moved on.' "the worktree did not move onto the new base"
+  pass "a refused branch move is escapable with the remedy git itself names"
+}
+
+test_crew_instructions_cli_clears_a_branch_move() {
+  local repo wt out status
+  repo="$TMP_ROOT/cli-repo"
+  wt="$TMP_ROOT/cli-wt"
+  overlaid_worktree "$repo" "$wt"
+  out=$("$CREW_INSTRUCTIONS" status "$wt" 2>&1); status=$?
+  expect_code 0 "$status" "status must report an installed overlay: $out"
+  assert_contains "$out" "installed" "status did not report the overlay as installed"
+  printf '%s\n' "$IDENTITY_LINE" 'The user is the captain.' 'Main moved on.' > "$repo/AGENTS.md"
+  git -C "$repo" add AGENTS.md
+  git -C "$repo" commit -qm 'move AGENTS.md on main'
+  git -C "$repo" push -q origin main
+  git -C "$wt" fetch -q origin
+  git -C "$wt" merge origin/main -m merge >/dev/null 2>&1 \
+    && fail "fixture did not reproduce a refused branch move"
+  out=$("$CREW_INSTRUCTIONS" remove "$wt" 2>&1); status=$?
+  expect_code 0 "$status" "the worker-runnable removal failed: $out"
+  assert_contains "$out" "still a crewmate" "removal did not restate the crewmate role"
+  [ -z "$(git -C "$wt" status --porcelain)" ] \
+    || fail "removal left the worktree dirty: $(git -C "$wt" status --porcelain)"
+  out=$(git -C "$wt" merge origin/main -m merge 2>&1); status=$?
+  expect_code 0 "$status" "the branch move still fails after the worker-runnable removal: $out"
+  pass "bin/fm-crew-instructions.sh gives the worker a one-command escape"
+}
+
+# The overlay must not read as unlanded work to bin/fm-teardown.sh, and a real
+# uncommitted edit must still read as exactly that. The superseded mechanism
+# hid both cases equally, blinding the unlanded-work test.
+test_cleanliness_filter_separates_scaffolding_from_real_work() {
+  local repo wt
+  repo="$TMP_ROOT/filter-repo"
+  wt="$TMP_ROOT/filter-wt"
+  overlaid_worktree "$repo" "$wt"
+  [ -z "$(git -C "$wt" status --porcelain | fm_crew_filter_overlay_status "$wt")" ] \
+    || fail "the untouched overlay reads as unlanded work"
+  printf '%s\n' 'a real uncommitted worker edit' >> "$wt/AGENTS.md"
+  assert_contains "$(git -C "$wt" status --porcelain | fm_crew_filter_overlay_status "$wt")" 'AGENTS.md' \
+    "a real uncommitted AGENTS.md edit was filtered away as scaffolding"
+  pass "the cleanliness filter hides only the byte-exact overlay, never a real edit"
 }
 
 test_ordinary_project_is_untouched() {
@@ -294,25 +404,29 @@ test_identity_line_matches_shipped_agents_md() {
   pass "the shipped AGENTS.md still satisfies the identity predicate the overlay gates on"
 }
 
-test_commit_guard_refuses_a_mutated_overlay_file() {
-  local repo wt head_before out status
+# Under the superseded hiding mechanism an edit made on top of the overlay was
+# dropped from every commit without an error, which is why a guard had to refuse
+# it. A visible overlay needs no such rescue: the edit is ordinary content, and
+# what git records is exactly what the worker sees on disk.
+test_an_edit_on_top_of_the_overlay_is_never_dropped_silently() {
+  local repo wt out status recorded
   repo="$TMP_ROOT/guard-fail-repo"
   wt="$TMP_ROOT/guard-fail-wt"
   overlaid_worktree "$repo" "$wt"
-  head_before=$(git -C "$wt" rev-parse HEAD)
   printf '%s\n' 'a crewmate edit that must not vanish' >> "$wt/AGENTS.md"
   printf '%s\n' '#!/bin/sh' 'echo spawn v2' > "$wt/bin/fm-spawn.sh"
-  out=$(commit_all "$wt" 'crew commit that would drop the AGENTS.md edit'); status=$?
-  [ "$status" -ne 0 ] \
-    || fail "commit succeeded even though it omitted the AGENTS.md edit: $out"
-  assert_contains "$out" "AGENTS.md" "guard refusal did not name the file"
-  assert_contains "$out" "would silently omit" \
-    "guard refusal did not say the commit would omit the edit"
-  assert_contains "$out" "git update-index --no-skip-worktree -- AGENTS.md && git checkout HEAD -- AGENTS.md" \
-    "guard refusal did not name the restore commands"
-  [ "$(git -C "$wt" rev-parse HEAD)" = "$head_before" ] \
-    || fail "refused commit still moved HEAD"
-  pass "a commit that would drop an edit to the overlaid AGENTS.md fails loudly"
+  assert_status_contains "$wt" " M AGENTS.md" "the edit on top of the overlay is invisible to git"
+  out=$(commit_all "$wt" 'crew commit touching the overlaid AGENTS.md'); status=$?
+  recorded=$(git -C "$wt" show HEAD:AGENTS.md 2>/dev/null || true)
+  if [ "$status" -eq 0 ]; then
+    assert_contains "$recorded" 'a crewmate edit that must not vanish' \
+      "the commit succeeded but silently dropped the AGENTS.md edit"
+  else
+    assert_contains "$out" "AGENTS.md" "the refusal did not name the file it refused over"
+    assert_contains "$out" "carrying the crew overlay" \
+      "the refusal did not explain that the overlay would be committed"
+  fi
+  pass "an edit on top of the overlay is either recorded or loudly refused, never dropped"
 }
 
 test_commit_guard_allows_an_untouched_overlay() {
@@ -337,8 +451,6 @@ test_restored_agents_md_commits_the_edit() {
   repo="$TMP_ROOT/guard-restore-repo"
   wt="$TMP_ROOT/guard-restore-wt"
   overlaid_worktree "$repo" "$wt"
-  git -C "$wt" update-index --no-skip-worktree -- AGENTS.md \
-    || fail "documented restore could not clear skip-worktree"
   git -C "$wt" checkout HEAD -- AGENTS.md || fail "documented restore could not check out AGENTS.md"
   printf '%s\n' 'A crewmate edited the real job description.' >> "$wt/AGENTS.md"
   out=$(commit_all "$wt" 'edit the committed AGENTS.md'); status=$?
@@ -366,70 +478,52 @@ test_ensure_agents_md_stays_a_no_op_after_overlay() {
   pass "fm-ensure-agents-md.sh is a no-op success in an overlaid firstmate worktree"
 }
 
-test_commit_guard_refuses_committing_the_overlay() {
-  local repo wt head_before out status
+# `git add -A` stages the overlay because it is a visible modification. Keeping
+# it out of the commit is what lets an ordinary crew commit stay ordinary, so
+# the overlay must never reach the committed file and the worker's own staged
+# work must still land.
+test_commit_keeps_the_overlay_out_of_the_commit() {
+  local repo wt out status
   repo="$TMP_ROOT/guard-overlay-repo"
   wt="$TMP_ROOT/guard-overlay-wt"
   overlaid_worktree "$repo" "$wt"
-  head_before=$(git -C "$wt" rev-parse HEAD)
-  git -C "$wt" update-index --no-skip-worktree -- AGENTS.md \
-    || fail "could not clear skip-worktree for the half-restore case"
-  out=$(commit_all "$wt" 'commit the crew overlay over the committed job'); status=$?
-  [ "$status" -ne 0 ] \
-    || fail "commit succeeded and replaced the committed AGENTS.md with the crew overlay: $out"
-  assert_contains "$out" "carrying the crew overlay" \
-    "guard refusal did not say the overlay would be committed"
-  [ "$(git -C "$wt" rev-parse HEAD)" = "$head_before" ] || fail "refused commit still moved HEAD"
+  printf '%s\n' 'real crew work' > "$wt/NOTES.md"
+  out=$(commit_all "$wt" 'ordinary crew commit while the overlay is installed'); status=$?
+  expect_code 0 "$status" "an ordinary crew commit must not be blocked by the overlay: $out"
   assert_contains "$(git -C "$wt" show HEAD:AGENTS.md)" "$IDENTITY_LINE" \
-    "the committed AGENTS.md was replaced by the crew overlay"
-  pass "a commit that would record the crew overlay over the committed file fails loudly"
+    "the commit replaced the committed AGENTS.md with the crew overlay"
+  assert_contains "$(git -C "$wt" show --name-only --format= HEAD)" 'NOTES.md' \
+    "the commit dropped the worker's own staged work"
+  assert_not_contains "$(git -C "$wt" show --name-only --format= HEAD)" 'AGENTS.md' \
+    "the commit recorded the crew overlay"
+  assert_corpus_is_crew "$wt" "after an ordinary crew commit"
+  pass "an ordinary crew commit lands the worker's work and leaves the overlay uncommitted"
 }
 
-test_commit_guard_refuses_while_a_saved_sidecar_survives() {
-  local repo wt head_before out status
-  repo="$TMP_ROOT/guard-sidecar-repo"
-  wt="$TMP_ROOT/guard-sidecar-wt"
-  overlaid_worktree "$repo" "$wt"
-  git -C "$wt" update-index --no-skip-worktree -- AGENTS.md \
-    || fail "documented restore could not clear skip-worktree"
-  git -C "$wt" checkout HEAD -- AGENTS.md || fail "documented restore could not check out AGENTS.md"
-  printf '%s\n' 'restored-file work the relaunch must not sideline' >> "$wt/AGENTS.md"
-  fm_install_crew_worktree_instructions "$wt" 2>/dev/null \
-    || fail "relaunch overlay reinstall failed"
-  assert_present "$wt/.fm-agents-md-edit" "relaunch did not save the restored AGENTS.md work"
-  head_before=$(git -C "$wt" rev-parse HEAD)
-  printf '%s\n' 'ordinary crew work' > "$wt/NOTES.md"
-  out=$(commit_all "$wt" 'crew commit while the sidecar still holds work'); status=$?
-  [ "$status" -ne 0 ] \
-    || fail "commit succeeded while the saved AGENTS.md work was still sidelined: $out"
-  assert_contains "$out" ".fm-agents-md-edit" "guard refusal did not name the sidecar"
-  assert_contains "$out" "this commit would omit them" \
-    "guard refusal did not say the sidelined work would be omitted"
-  assert_contains "$out" "cp .fm-agents-md-edit AGENTS.md" \
-    "guard refusal did not name how to restore from the sidecar"
-  [ "$(git -C "$wt" rev-parse HEAD)" = "$head_before" ] || fail "refused commit still moved HEAD"
-  pass "a commit made while a relaunch sidelined instruction-file work fails loudly"
-}
-
-test_removal_drops_saved_sidecars() {
+# A worktree left behind by the superseded mechanism still carries its hiding
+# bit and possibly a sidecar holding the only copy of an edit it hid. Healing it
+# must not silently discard that edit, and must not hand it to the next occupant.
+test_a_worktree_left_by_the_superseded_mechanism_is_healed() {
   local repo wt
-  repo="$TMP_ROOT/sidecar-reuse-repo"
-  wt="$TMP_ROOT/sidecar-reuse-wt"
+  repo="$TMP_ROOT/legacy-repo"
+  wt="$TMP_ROOT/legacy-wt"
   overlaid_worktree "$repo" "$wt"
-  git -C "$wt" update-index --no-skip-worktree -- AGENTS.md
-  git -C "$wt" checkout HEAD -- AGENTS.md
-  printf '%s\n' 'work belonging to the previous task' >> "$wt/AGENTS.md"
-  fm_install_crew_worktree_instructions "$wt" 2>/dev/null || fail "overlay reinstall failed"
-  assert_present "$wt/.fm-agents-md-edit" "fixture did not produce a saved sidecar"
-  fm_remove_crew_worktree_instructions "$wt" || fail "overlay removal failed"
-  assert_absent "$wt/.fm-agents-md-edit" "overlay removal kept the previous task's saved AGENTS.md edits"
-  assert_absent "$wt/.fm-claude-md-edit" "overlay removal kept a saved CLAUDE.md sidecar"
-  fm_install_crew_worktree_instructions "$wt" || fail "overlay reinstall after removal failed"
-  assert_absent "$wt/.fm-agents-md-edit" "a previous task's sidecar reappeared for the next worker"
-  pass "saved instruction sidecars do not survive overlay removal into the next task"
+  git -C "$wt" update-index --skip-worktree -- AGENTS.md \
+    || fail "could not stage the superseded hidden state"
+  printf '%s\n' 'work the superseded mechanism sidelined' > "$wt/.fm-agents-md-edit"
+  fm_remove_crew_worktree_instructions "$wt" 2>/dev/null || fail "healing removal failed"
+  assert_visible_to_git "$wt" AGENTS.md "healing left AGENTS.md hidden from git"
+  assert_absent "$wt/.fm-agents-md-edit" "healing kept the previous task's sidecar for the next worker"
+  assert_contains "$(git -C "$wt" stash list)" 'fm-crew' \
+    "healing discarded the sidecar instead of recovering it into the git stash"
+  assert_contains "$(git -C "$wt" stash show -p 'stash@{0}')" 'work the superseded mechanism sidelined' \
+    "the recovered stash entry does not hold the sidelined edit"
+  assert_contains "$(cat "$wt/AGENTS.md")" "$IDENTITY_LINE" \
+    "healing did not restore the committed AGENTS.md"
+  pass "a worktree left by the superseded mechanism is healed without losing its sidelined edit"
 }
 
-test_removal_unwedges_a_pooled_reset() {
+test_removal_lets_a_pooled_worktree_reset_onto_a_new_base() {
   local repo wt out status
   repo="$TMP_ROOT/reuse-repo"
   wt="$TMP_ROOT/reuse-wt"
@@ -439,12 +533,9 @@ test_removal_unwedges_a_pooled_reset() {
   git -C "$repo" commit -qm 'move AGENTS.md on main'
   git -C "$repo" push -q origin main
   git -C "$wt" fetch -q origin
-  if git -C "$wt" reset --hard origin/main >/dev/null 2>&1; then
-    fail "fixture did not reproduce the wedged reset of a pooled worktree"
-  fi
   fm_remove_crew_worktree_instructions "$wt" || fail "overlay removal failed"
-  assert_not_skip_worktree "$wt" AGENTS.md "removal left AGENTS.md skip-worktree"
-  assert_not_skip_worktree "$wt" CLAUDE.md "removal left CLAUDE.md skip-worktree"
+  assert_visible_to_git "$wt" AGENTS.md "removal left AGENTS.md hidden from git"
+  assert_visible_to_git "$wt" CLAUDE.md "removal left CLAUDE.md hidden from git"
   assert_contains "$(cat "$wt/AGENTS.md")" "$IDENTITY_LINE" \
     "removal did not restore the committed AGENTS.md"
   out=$(git -C "$wt" reset --hard origin/main 2>&1); status=$?
@@ -454,6 +545,24 @@ test_removal_unwedges_a_pooled_reset() {
   [ -z "$(git -C "$wt" status --porcelain)" ] \
     || fail "removal left the worktree dirty: $(git -C "$wt" status --porcelain)"
   pass "removal clears the overlay so a pooled worktree can be reset onto a new base"
+}
+
+# A pooled slot must be resettable even while the overlay is still installed,
+# because a task can end without anyone removing it.
+test_an_installed_overlay_does_not_wedge_a_pooled_reset() {
+  local repo wt out status
+  repo="$TMP_ROOT/reset-repo"
+  wt="$TMP_ROOT/reset-wt"
+  overlaid_worktree "$repo" "$wt"
+  printf '%s\n' "$IDENTITY_LINE" 'The user is the captain.' 'Main moved on.' > "$repo/AGENTS.md"
+  git -C "$repo" add AGENTS.md
+  git -C "$repo" commit -qm 'move AGENTS.md on main'
+  git -C "$repo" push -q origin main
+  git -C "$wt" fetch -q origin
+  out=$(git -C "$wt" reset --hard origin/main 2>&1); status=$?
+  expect_code 0 "$status" "an installed overlay must not wedge a pooled reset: $out"
+  assert_contains "$(cat "$wt/AGENTS.md")" 'Main moved on.' "the reset worktree is not on the new base"
+  pass "an installed overlay does not wedge a pooled reset onto a new base"
 }
 
 make_spawn_case() {  # <case-dir>
@@ -494,8 +603,8 @@ test_spawn_overlays_firstmate_shaped_pool() {
   assert_corpus_is_crew "$SPAWN_POOL" "spawned firstmate-repo worktree"
   assert_contains "$(git -C "$SPAWN_POOL" show HEAD:AGENTS.md)" "$IDENTITY_LINE" \
     "spawn overlay replaced the committed firstmate job"
-  [ -z "$(git -C "$SPAWN_POOL" status --porcelain)" ] \
-    || fail "spawn overlay left the pool dirty: $(git -C "$SPAWN_POOL" status --porcelain)"
+  [ -z "$(git -C "$SPAWN_POOL" status --porcelain | fm_crew_filter_overlay_status "$SPAWN_POOL")" ] \
+    || fail "spawn left work a cleanliness check reads as unlanded: $(git -C "$SPAWN_POOL" status --porcelain)"
   pass "spawn overlays a firstmate-repo crew worktree before launch"
 }
 
@@ -514,14 +623,30 @@ test_spawn_reuses_a_pool_the_previous_crew_overlaid() {
   assert_corpus_is_crew "$SPAWN_POOL" "second spawn"
   assert_contains "$(git -C "$SPAWN_POOL" show HEAD:AGENTS.md)" 'Main moved on.' \
     "the reused pool was not refreshed onto the new default branch"
-  [ -z "$(git -C "$SPAWN_POOL" status --porcelain)" ] \
-    || fail "reused pool is dirty: $(git -C "$SPAWN_POOL" status --porcelain)"
+  [ -z "$(git -C "$SPAWN_POOL" status --porcelain | fm_crew_filter_overlay_status "$SPAWN_POOL")" ] \
+    || fail "the reused pool holds work a cleanliness check reads as unlanded: $(git -C "$SPAWN_POOL" status --porcelain)"
   pass "a pooled worktree the previous crew overlaid still refreshes and spawns"
+}
+
+# The anti-inversion fence must not read as an order to skip this repo's own
+# tests, which are exactly what invoke the fleet scripts it names.
+test_fleet_command_fence_carves_out_the_test_suite() {
+  local body
+  body=$(fm_crew_overlay_body)
+  assert_contains "$body" 'fleet-management command' "the overlay dropped the fleet-command fence"
+  assert_contains "$body" "except through this repository's own test suite" \
+    "the overlay's fleet-command fence has no test-suite carve-out"
+  pass "the overlay's fleet-command fence carves out this repository's own test suite"
 }
 
 test_overlay_inverts_autoload_corpus
 test_overlay_is_idempotent
-test_dirty_agents_md_is_saved_then_overlaid
+test_dirty_agents_md_is_stashed_then_overlaid
+test_two_relaunches_keep_both_saved_edits
+test_branch_move_is_escapable_by_the_worker
+test_crew_instructions_cli_clears_a_branch_move
+test_cleanliness_filter_separates_scaffolding_from_real_work
+test_fleet_command_fence_carves_out_the_test_suite
 test_ordinary_project_is_untouched
 test_secondmate_home_is_untouched
 test_primary_checkout_is_refused
@@ -530,13 +655,13 @@ test_missing_guidelines_is_refused
 test_session_start_forbidden_predicate
 test_session_start_refuses_linked_worktree
 test_identity_line_matches_shipped_agents_md
-test_commit_guard_refuses_a_mutated_overlay_file
+test_an_edit_on_top_of_the_overlay_is_never_dropped_silently
 test_commit_guard_allows_an_untouched_overlay
 test_restored_agents_md_commits_the_edit
 test_ensure_agents_md_stays_a_no_op_after_overlay
-test_commit_guard_refuses_committing_the_overlay
-test_commit_guard_refuses_while_a_saved_sidecar_survives
-test_removal_drops_saved_sidecars
-test_removal_unwedges_a_pooled_reset
+test_commit_keeps_the_overlay_out_of_the_commit
+test_a_worktree_left_by_the_superseded_mechanism_is_healed
+test_removal_lets_a_pooled_worktree_reset_onto_a_new_base
+test_an_installed_overlay_does_not_wedge_a_pooled_reset
 test_spawn_overlays_firstmate_shaped_pool
 test_spawn_reuses_a_pool_the_previous_crew_overlaid

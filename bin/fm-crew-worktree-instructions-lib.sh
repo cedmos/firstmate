@@ -9,8 +9,6 @@
 # This library replaces the auto-loaded files in a linked ordinary task
 # worktree with a crew overlay so the harness cannot load the firstmate
 # job as that worker's instructions.
-# The committed files stay in git; the overlay is skip-worktree so it does
-# not look like uncommitted work.
 # Only AGENTS.md carries the crew body. CLAUDE.md is overlaid with the exact
 # canonical `@AGENTS.md` pointer that bin/fm-ensure-agents-md.sh owns, and the
 # crew body carries that script's canonical `## Maintaining this file` heading,
@@ -19,19 +17,38 @@
 # The overlay keeps `.agents/skills/firstmate-coding-guidelines/SKILL.md`
 # reachable and tells the worker how to restore AGENTS.md when the task is
 # to edit it.
-# skip-worktree also hides a worker's own edit to those files, so `git add -A`
-# plus `git commit` would drop it without an error. The install therefore also
-# writes a pre-commit guard. It refuses a commit while a skip-worktree
-# instruction file no longer holds its overlay content, while an instruction
-# file would be committed carrying the overlay instead of firstmate's own file,
-# and while a saved in-progress sidecar still holds edits the commit would omit.
-# The guard lives in this worktree's own git dir and is selected through
-# per-worktree `core.hooksPath`, so the primary checkout's hooks are never
-# touched.
-# fm_remove_crew_worktree_instructions undoes all of it: skip-worktree bits,
-# the committed file contents, the saved sidecars, and the guard. A sidecar
-# that outlived its task would otherwise be handed to the next worker in the
-# same pooled slot as its own in-progress work.
+#
+# The overlay is an ordinary visible working-tree modification, and is
+# deliberately NOT hidden with `git update-index --skip-worktree` or
+# `--assume-unchanged`. Both bits make git report the worktree as clean while
+# the file on disk differs from the index, and that lie costs more than it
+# buys: every branch-moving operation refuses ("your local changes to the
+# following files would be overwritten"), while `git stash` saves nothing and a
+# commit records nothing, so the remedies git names are dead ends and the
+# worker has no escape. The same lie hides a worker's genuine uncommitted
+# instruction edit from bin/fm-teardown.sh's unlanded-work test.
+# Telling git the truth costs one visible ` M AGENTS.md` line and buys back
+# every standard remedy: `git stash`, `git checkout HEAD --`, and
+# `git reset --hard` all work, so git's own advice terminates.
+# Consumers that must not read the overlay as unlanded work filter it with
+# fm_crew_filter_overlay_status, which drops the modification only while the
+# file holds the overlay byte for byte, so a real edit stays visible as the
+# uncommitted work it is.
+#
+# In-progress instruction edits found at (re)launch move into git's own stash
+# rather than a private sidecar. The stash is a stack, so a second relaunch
+# adds an entry instead of destroying the first; refs/stash is shared ref space
+# that outlives this disposable worktree; and `git stash list` plus
+# `git stash pop` are recovery commands a worker already knows.
+#
+# The install also writes a pre-commit guard refusing a commit that would land
+# the overlay over firstmate's own committed file. The guard lives in this
+# worktree's own git dir and is selected through per-worktree `core.hooksPath`,
+# so the primary checkout's hooks are never touched.
+# fm_remove_crew_worktree_instructions undoes all of it, and bin/fm-crew-instructions.sh
+# makes it reachable by the worker, so a worker who wants a clean tree for a
+# branch move has a one-command escape. It also heals a worktree still carrying
+# the superseded skip-worktree bits or sidecars.
 # bin/fm-spawn.sh calls it before
 # it refreshes a pooled worktree, so a slot returned with the overlay still on
 # it self-heals instead of wedging the next `git reset --hard`.
@@ -41,7 +58,8 @@
 # firstmate identity afterwards.
 # Session start refuses in the same linked firstmate worktree so a worker
 # that still reaches for it cannot build a ghost home.
-# Sourced by bin/fm-spawn.sh and bin/fm-session-start.sh.
+# Sourced by bin/fm-spawn.sh, bin/fm-session-start.sh, bin/fm-teardown.sh, and
+# bin/fm-crew-instructions.sh.
 # No side effects on source. set -u / set -e safe.
 
 # shellcheck source=bin/fm-primary-scope-lib.sh
@@ -50,10 +68,13 @@
 FM_CREW_OVERLAY_MARKER='<!-- firstmate-crew-worktree-instructions -->'
 FM_FIRSTMATE_IDENTITY_LINE='You are the first mate.'
 FM_CREW_GUIDELINES_REL='.agents/skills/firstmate-coding-guidelines/SKILL.md'
+# Sidecar paths the superseded save-to-a-private-file mechanism wrote. Kept so a
+# worktree left behind by it is healed rather than handed to the next occupant.
 FM_CREW_AGENTS_WIP='.fm-agents-md-edit'
 FM_CREW_CLAUDE_WIP='.fm-claude-md-edit'
 FM_CREW_HOOKS_DIRNAME='fm-crew-hooks'
 FM_CREW_INSTRUCTION_FILES='AGENTS.md CLAUDE.md'
+FM_CREW_STASH_LABEL='fm-crew: in-progress instruction edits saved before the crew overlay'
 
 fm_crew_overlay_body() {
   cat <<'EOF'
@@ -65,7 +86,7 @@ You are a crewmate: an autonomous worker agent managed by firstmate.
 You are not the first mate.
 Spawn replaced this worktree's harness-loaded project instructions before launch so you cannot adopt the firstmate role from them.
 
-Do not run `bin/fm-session-start.sh`, `bin/fm-spawn.sh`, `bin/fm-brief.sh`, `tasks-axi add`, or any other fleet-management command.
+Do not run `bin/fm-session-start.sh`, `bin/fm-spawn.sh`, `bin/fm-brief.sh`, `tasks-axi add`, or any other fleet-management command, except through this repository's own test suite.
 You have no fleet.
 Do not address anyone as captain.
 Do not open an interactive question dialog.
@@ -78,16 +99,18 @@ It is source you may edit when the task requires it, not your job description.
 Load `.agents/skills/firstmate-coding-guidelines/SKILL.md` before editing firstmate's shared tracked material.
 
 Git still has the committed files.
-This working copy is a spawn-time overlay.
+This working copy is a spawn-time overlay, and git reports it as an ordinary modification to `AGENTS.md` and `CLAUDE.md`.
 
-If this task requires editing `AGENTS.md` itself, restore the committed file first with `git update-index --no-skip-worktree AGENTS.md` and then `git checkout HEAD -- AGENTS.md`.
+If this task requires editing `AGENTS.md` itself, restore the committed file first with `git checkout HEAD -- AGENTS.md`, then edit it.
 You remain a crewmate after that restore.
-Editing an overlaid file without that restore does not fail silently: a pre-commit guard refuses the commit and names the same restore commands.
-Committing this overlay over the committed file is refused for the same reason.
+Committing this overlay over firstmate's own committed file is refused by a pre-commit guard.
 
-If `.fm-agents-md-edit` exists, in-progress `AGENTS.md` edits were saved there before this overlay was installed.
-If `.fm-claude-md-edit` exists, the same is true for `CLAUDE.md`.
-The pre-commit guard refuses every commit while either sidecar exists, so restore the committed file, re-apply the saved edits, and delete the sidecar.
+If `git rebase`, `git merge`, `git checkout`, or `git cherry-pick` refuses because your local changes to `AGENTS.md` or `CLAUDE.md` would be overwritten, this overlay is what it means.
+Every remedy git names works here: `git stash`, or `git checkout HEAD -- AGENTS.md CLAUDE.md`.
+`bin/fm-crew-instructions.sh remove` does both files and the guard in one step.
+
+If `git stash list` shows an `fm-crew:` entry, in-progress instruction edits were saved there before this overlay was installed.
+Recover them with `git stash pop`.
 
 ## Maintaining this file
 
@@ -112,10 +135,6 @@ fm_crew_overlay_content() {  # <rel>
     CLAUDE.md) fm_crew_claude_pointer_body ;;
     *) fm_crew_overlay_body ;;
   esac
-}
-
-fm_crew_write_overlay_body() {  # <dest>
-  fm_crew_overlay_body > "$1"
 }
 
 # The blob hash of <rel>'s overlay content as `git hash-object --no-filters`
@@ -171,14 +190,6 @@ fm_file_is_crew_overlay() {  # <file>
   grep -Fqx "$FM_CREW_OVERLAY_MARKER" "$file"
 }
 
-fm_crew_exclude_path() {  # <worktree> <rel>
-  local wt=$1 rel=$2 excl
-  excl=$(git -C "$wt" rev-parse --git-path info/exclude 2>/dev/null) || return 0
-  [ -n "$excl" ] || return 0
-  mkdir -p "$(dirname "$excl")"
-  grep -qxF "$rel" "$excl" 2>/dev/null || printf '%s\n' "$rel" >> "$excl"
-}
-
 # Return 0 when the working copy of <rel> differs from the committed blob.
 # Compares hashes rather than asking `git diff`, because skip-worktree makes
 # git report a modified instruction file as unchanged.
@@ -190,35 +201,100 @@ fm_crew_file_differs_from_head() {  # <worktree> <rel>
   [ "$head_hash" != "$disk_hash" ]
 }
 
-fm_crew_save_instruction_wip() {  # <worktree> <rel> <dest>
-  local wt=$1 rel=$2 dest=$3
-  [ -f "$wt/$rel" ] || return 0
-  fm_crew_file_is_installed_overlay "$wt" "$rel" && return 0
-  fm_crew_file_differs_from_head "$wt" "$rel" || return 0
-  cp "$wt/$rel" "$wt/$dest" || {
-    echo "error: could not save in-progress $rel to $dest before installing crew instructions" >&2
-    return 1
-  }
-  fm_crew_exclude_path "$wt" "$dest"
-  echo "warning: saved in-progress $rel to $dest before installing crew instructions" >&2
+fm_crew_is_instruction_file() {  # <rel>
+  local rel=$1 known
+  for known in $FM_CREW_INSTRUCTION_FILES; do
+    [ "$rel" = "$known" ] && return 0
+  done
+  return 1
 }
 
-fm_crew_is_skip_worktree() {  # <worktree> <rel>
+# Return 0 when <rel> holds work the overlay would otherwise destroy: it exists,
+# it is not already the installed overlay, and it differs from the committed blob.
+fm_crew_instruction_has_wip() {  # <worktree> <rel>
+  local wt=$1 rel=$2
+  [ -f "$wt/$rel" ] || return 1
+  fm_crew_file_is_installed_overlay "$wt" "$rel" && return 1
+  fm_crew_file_differs_from_head "$wt" "$rel"
+}
+
+# Clear any hiding bit the superseded mechanism left on <rel>.
+# The two flags must be separate invocations: git applies only the last of them
+# per call, so a combined `--no-skip-worktree --no-assume-unchanged` silently
+# leaves the skip-worktree bit set, and the restore that follows then fails with
+# "pathspec did not match any file(s) known to git".
+fm_crew_unhide_file() {  # <worktree> <rel>
+  local wt=$1 rel=$2
+  git -C "$wt" update-index --no-skip-worktree -- "$rel" &&
+    git -C "$wt" update-index --no-assume-unchanged -- "$rel" && return 0
+  echo "error: could not clear the stale hidden-file bit on $rel in $wt" >&2
+  return 1
+}
+
+# Clear the hiding bits before the work-in-progress scan, because `git stash`
+# saves nothing for a file git has been told to report as unchanged, so a
+# relaunch into such a worktree would otherwise overwrite an edit it believed it
+# had saved.
+fm_crew_unhide_instruction_files() {  # <worktree>
+  local wt=$1 rel failed=0
+  for rel in $FM_CREW_INSTRUCTION_FILES; do
+    fm_crew_is_hidden_from_git "$wt" "$rel" || continue
+    fm_crew_unhide_file "$wt" "$rel" || failed=1
+  done
+  [ "$failed" -eq 0 ]
+}
+
+# Move a worker's in-progress instruction edits into git's own stash before the
+# overlay replaces them, restoring the committed files in the same step.
+# A private sidecar file would be overwritten by the next relaunch and lost with
+# no error. The stash is a stack, so a second relaunch pushes a second entry and
+# the first survives; refs/stash is shared ref space, so the entry outlives this
+# disposable worktree; and recovery is `git stash list` plus `git stash pop`.
+# The pathspec keeps unrelated working-tree changes untouched.
+fm_crew_stash_instruction_wip() {  # <worktree>
+  local wt=$1 rel paths=
+  for rel in $FM_CREW_INSTRUCTION_FILES; do
+    fm_crew_instruction_has_wip "$wt" "$rel" || continue
+    paths="${paths:+$paths }$rel"
+  done
+  [ -n "$paths" ] || return 0
+  # shellcheck disable=SC2086
+  git -C "$wt" stash push --quiet -m "$FM_CREW_STASH_LABEL" -- $paths || {
+    echo "error: could not stash in-progress $paths before installing crew instructions; refusing to overwrite uncommitted work" >&2
+    return 1
+  }
+  echo "warning: saved in-progress $paths to the git stash before installing crew instructions; recover with 'git stash list' then 'git stash pop'" >&2
+}
+
+# Print <worktree>'s porcelain status lines with the crew overlay's own
+# modification removed, so a cleanliness check reads launch scaffolding as clean
+# while every real edit stays visible. Reads porcelain lines on stdin.
+# The match is content-exact and worktree-only: an instruction file that no
+# longer holds the overlay byte for byte, or one staged for commit, is reported
+# as the uncommitted work it is.
+fm_crew_filter_overlay_status() {  # <worktree>
+  local wt=$1 line rel
+  while IFS= read -r line; do
+    rel=${line#" M "}
+    if [ "$rel" != "$line" ] && fm_crew_is_instruction_file "$rel" &&
+      fm_crew_file_is_installed_overlay "$wt" "$rel"; then
+      continue
+    fi
+    printf '%s\n' "$line"
+  done
+}
+
+# True while <rel> still carries a bit from the superseded hiding mechanism.
+# `git ls-files -v` reports skip-worktree as `S` and assume-unchanged as a
+# lowercase tag; either one makes git report a clean worktree over a divergent
+# file, so removal clears both.
+fm_crew_is_hidden_from_git() {  # <worktree> <rel>
   local wt=$1 rel=$2 state
   state=$(git -C "$wt" ls-files -v -- "$rel" 2>/dev/null | awk '{print substr($1,1,1)}')
-  [ "$state" = S ]
-}
-
-fm_crew_skip_worktree() {  # <worktree> <rel>
-  local wt=$1 rel=$2
-  git -C "$wt" update-index --skip-worktree -- "$rel" || {
-    echo "error: could not hide $rel from git status after installing crew instructions" >&2
-    return 1
-  }
-  fm_crew_is_skip_worktree "$wt" "$rel" || {
-    echo "error: $rel is not skip-worktree after crew overlay" >&2
-    return 1
-  }
+  case $state in
+    S | [a-z]) return 0 ;;
+  esac
+  return 1
 }
 
 fm_crew_commit_guard_dir() {  # <worktree>
@@ -233,11 +309,15 @@ fm_crew_write_commit_guard() {  # <dest> <agents-blob-hash> <claude-blob-hash>
   cat > "$dest" <<EOF
 #!/usr/bin/env bash
 # Installed by bin/fm-crew-worktree-instructions-lib.sh for this worktree only.
-# The crew overlay hides AGENTS.md and CLAUDE.md with skip-worktree, so a
-# worker's edit to either file is dropped from every commit without an error,
-# and clearing that bit lets the overlay itself be committed over firstmate's
-# own file. This guard turns both silent outcomes into a refused commit, and
-# refuses while a saved sidecar still holds edits the commit would omit.
+# The crew overlay is an ordinary visible modification of AGENTS.md and
+# CLAUDE.md, so \`git add -A\` and \`git commit -a\` stage it like any other
+# change. It is launch scaffolding, never source, so this guard keeps it out of
+# the commit instead of refusing one: an instruction file staged with exactly
+# the overlay content is unstaged, and everything else the worker staged still
+# commits. Unstaging works on both the \`git add\` and the \`commit -a\` paths.
+# A staged instruction file that carries the overlay marker but is NOT the
+# overlay byte for byte is scaffolding mixed into source. Neither dropping nor
+# keeping it is safe to decide here, so that one is refused loudly.
 set -u
 marker='$FM_CREW_OVERLAY_MARKER'
 guard_status=0
@@ -249,44 +329,33 @@ refuse() {
 
 for rel in $FM_CREW_INSTRUCTION_FILES; do
   case "\$rel" in
-    AGENTS.md) overlay='$agents_hash'; sidecar='$FM_CREW_AGENTS_WIP' ;;
-    *) overlay='$claude_hash'; sidecar='$FM_CREW_CLAUDE_WIP' ;;
+    AGENTS.md) overlay='$agents_hash' ;;
+    *) overlay='$claude_hash' ;;
   esac
-  if [ -e "\$sidecar" ]; then
-    refuse "\$sidecar holds in-progress \$rel edits that spawn saved before it reinstalled the crew overlay." \\
-      "this commit would omit them." \\
-      "re-apply them and delete the sidecar:" \\
-      "  git update-index --no-skip-worktree -- \$rel && git checkout HEAD -- \$rel && cp \$sidecar \$rel && rm \$sidecar"
-  fi
   [ -f "\$rel" ] || continue
   head_hash=\$(git rev-parse --verify --quiet "HEAD:\$rel" 2>/dev/null || true)
-  disk_hash=\$(git hash-object --no-filters -- "\$rel" 2>/dev/null || true)
-  if [ "\$(git ls-files -v -- "\$rel" 2>/dev/null | awk '{print substr(\$1,1,1)}')" = S ]; then
-    [ "\$disk_hash" = "\$overlay" ] && continue
-    refuse "\$rel is the crew overlay, hidden from git with skip-worktree, and it has been edited." \\
-      "this commit would silently omit every change to \$rel." \\
-      "restore the committed file, then re-apply the intended source edits:" \\
-      "  git update-index --no-skip-worktree -- \$rel && git checkout HEAD -- \$rel"
+  staged_hash=\$(git ls-files -s -- "\$rel" 2>/dev/null | awk '{print \$2}')
+  [ -n "\$staged_hash" ] && [ "\$staged_hash" != "\$head_hash" ] || continue
+  if [ "\$staged_hash" = "\$overlay" ]; then
+    if git reset -q HEAD -- "\$rel"; then
+      printf 'note: kept the crew overlay out of this commit (%s is launch scaffolding, not source).\n' "\$rel" >&2
+    else
+      refuse "\$rel is staged carrying the crew overlay and it could not be unstaged." \\
+        "committing it would replace firstmate's own committed file with this worktree's scaffolding." \\
+        "unstage it yourself, or drop the overlay entirely:" \\
+        "  git reset -q HEAD -- \$rel" \\
+        "  bin/fm-crew-instructions.sh remove"
+    fi
     continue
   fi
-  staged_hash=\$(git ls-files -s -- "\$rel" 2>/dev/null | awk '{print \$2}')
-  overlay_would_land=0
-  if [ -n "\$staged_hash" ] && [ "\$staged_hash" != "\$head_hash" ]; then
-    if [ "\$staged_hash" = "\$overlay" ] ||
-      git cat-file blob "\$staged_hash" 2>/dev/null | grep -Fqx "\$marker"; then
-      overlay_would_land=1
-    fi
-  fi
-  if [ -n "\$disk_hash" ] && [ "\$disk_hash" != "\$head_hash" ]; then
-    if [ "\$disk_hash" = "\$overlay" ] || grep -Fqx "\$marker" "\$rel" 2>/dev/null; then
-      overlay_would_land=1
-    fi
-  fi
-  [ "\$overlay_would_land" -eq 1 ] || continue
-  refuse "\$rel would be committed carrying the crew overlay, replacing firstmate's own committed file." \\
-    "the crew overlay is this worktree's launch scaffolding, never source to commit." \\
-    "restore the committed file, then re-apply the intended source edits:" \\
-    "  git update-index --no-skip-worktree -- \$rel && git checkout HEAD -- \$rel"
+  git cat-file blob "\$staged_hash" 2>/dev/null | grep -Fqx "\$marker" || continue
+  refuse "\$rel is staged carrying the crew overlay marker mixed into edited content." \\
+    "the crew overlay is this worktree's launch scaffolding, never source to commit," \\
+    "and this staged file is neither the overlay nor a clean edit of the committed file." \\
+    "restore the committed file and re-apply only the intended source edits:" \\
+    "  git checkout HEAD -- \$rel" \\
+    "or drop the overlay from this worktree entirely:" \\
+    "  bin/fm-crew-instructions.sh remove"
 done
 exit "\$guard_status"
 EOF
@@ -358,31 +427,63 @@ fm_crew_remove_commit_guard() {  # <worktree>
   }
 }
 
-# Undo the overlay: clear the skip-worktree bits, restore the committed
-# instruction files, and drop the commit guard.
-# A worktree that never carried the overlay is a no-op, so a pooled slot can
-# call this unconditionally before it refreshes its base.
+# Undo the overlay: restore the committed instruction files and drop the commit
+# guard. A worktree that never carried the overlay is a no-op, so a pooled slot
+# can call this unconditionally before it refreshes its base, and a worker can
+# run it through bin/fm-crew-instructions.sh to clear a branch move.
+# Only an instruction file still holding the overlay byte for byte is restored,
+# so a worker's own uncommitted edit is never discarded here.
+# A worktree left behind by the superseded mechanism is healed too: its hiding
+# bit is cleared first so the restore can land, and its sidecar is folded back
+# into the git stash rather than deleted, because it may be the only copy of an
+# edit that mechanism hid.
 fm_remove_crew_worktree_instructions() {  # <worktree>
   local wt=${1:-} rel failed=0
   [ -n "$wt" ] && [ -d "$wt" ] || return 0
   git -C "$wt" rev-parse --git-dir >/dev/null 2>&1 || return 0
   for rel in $FM_CREW_INSTRUCTION_FILES; do
-    fm_crew_is_skip_worktree "$wt" "$rel" || continue
-    if ! git -C "$wt" update-index --no-skip-worktree -- "$rel"; then
-      echo "error: could not clear the skip-worktree bit on $rel in $wt" >&2
+    if fm_crew_is_hidden_from_git "$wt" "$rel"; then
+      fm_crew_unhide_file "$wt" "$rel" || {
+        failed=1
+        continue
+      }
+    fi
+    fm_crew_file_is_installed_overlay "$wt" "$rel" || continue
+    git -C "$wt" checkout HEAD -- "$rel" || {
+      echo "error: could not restore the committed $rel in $wt" >&2
+      failed=1
+    }
+  done
+  fm_crew_rescue_legacy_sidecars "$wt" || failed=1
+  fm_crew_remove_commit_guard "$wt" || failed=1
+  [ "$failed" -eq 0 ]
+}
+
+# Fold any sidecar the superseded mechanism left into the git stash, then remove
+# it. Deleting it outright could destroy the only copy of an edit that mechanism
+# hid from git, and leaving it hands one worker's work to the next occupant of a
+# pooled slot.
+fm_crew_rescue_legacy_sidecars() {  # <worktree>
+  local wt=$1 rel dest failed=0
+  for rel in $FM_CREW_INSTRUCTION_FILES; do
+    case $rel in
+      AGENTS.md) dest=$FM_CREW_AGENTS_WIP ;;
+      *) dest=$FM_CREW_CLAUDE_WIP ;;
+    esac
+    [ -f "$wt/$dest" ] || continue
+    if cp "$wt/$dest" "$wt/$rel" &&
+      git -C "$wt" stash push --quiet -m "$FM_CREW_STASH_LABEL" -- "$rel"; then
+      echo "warning: recovered $dest into the git stash; run 'git stash list' then 'git stash pop' to restore those $rel edits" >&2
+    else
+      echo "error: could not recover the saved $dest in $wt into the git stash" >&2
       failed=1
       continue
     fi
-    if ! git -C "$wt" checkout HEAD -- "$rel"; then
-      echo "error: could not restore the committed $rel in $wt" >&2
+    rm -f "$wt/$dest" || {
+      echo "error: could not remove the recovered sidecar $dest in $wt" >&2
       failed=1
-    fi
+    }
   done
-  if ! rm -f "$wt/$FM_CREW_AGENTS_WIP" "$wt/$FM_CREW_CLAUDE_WIP"; then
-    echo "error: could not remove the saved instruction sidecars in $wt" >&2
-    failed=1
-  fi
-  fm_crew_remove_commit_guard "$wt" || failed=1
   [ "$failed" -eq 0 ]
 }
 
@@ -402,7 +503,6 @@ fm_crew_install_overlay_file() {  # <worktree> <rel>
     echo "error: could not install crew overlay at $rel" >&2
     return 1
   }
-  fm_crew_skip_worktree "$wt" "$rel" || return 1
   fm_crew_file_is_installed_overlay "$wt" "$rel" || {
     echo "error: crew overlay at $rel does not hold its expected content after install" >&2
     return 1
@@ -442,10 +542,9 @@ fm_install_crew_worktree_instructions() {  # <worktree>
     echo "error: firstmate-shaped worktree AGENTS.md has neither firstmate identity nor the crew overlay; refusing to launch with an unknown instruction file" >&2
     return 1
   fi
-  fm_crew_save_instruction_wip "$wt" AGENTS.md "$FM_CREW_AGENTS_WIP" || return 1
-  if [ -f "$wt/CLAUDE.md" ]; then
-    fm_crew_save_instruction_wip "$wt" CLAUDE.md "$FM_CREW_CLAUDE_WIP" || return 1
-  fi
+  fm_crew_unhide_instruction_files "$wt" || return 1
+  fm_crew_rescue_legacy_sidecars "$wt" || return 1
+  fm_crew_stash_instruction_wip "$wt" || return 1
   fm_crew_install_overlay_file "$wt" AGENTS.md || return 1
   if [ -f "$wt/CLAUDE.md" ]; then
     fm_crew_install_overlay_file "$wt" CLAUDE.md || return 1

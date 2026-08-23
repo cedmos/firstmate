@@ -373,6 +373,10 @@
       "audience": "maintainer-verification"
     },
     {
+      "path": "docs/verification/crew-instruction-overlay.md",
+      "audience": "maintainer-verification"
+    },
+    {
       "path": "docs/verification/stow-memory.md",
       "audience": "maintainer-verification"
     },

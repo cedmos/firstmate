@@ -53,6 +53,8 @@ set -u
 
 # shellcheck source=tests/lib.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+# shellcheck source=bin/fm-crew-worktree-instructions-lib.sh
+. "$ROOT/bin/fm-crew-worktree-instructions-lib.sh"
 fm_git_identity fmtest fmtest@example.invalid
 
 TEARDOWN="$ROOT/bin/fm-teardown.sh"
@@ -713,6 +715,53 @@ test_squash_merged_branch_deleted_allows() {
   expect_code 0 "$rc" "squash-merged: teardown should succeed when the PR is merged"
   ! grep -q REFUSED "$case_dir/stderr" || fail "squash-merged: teardown printed a REFUSED line"
   pass "squash-merged + deleted-branch worktree (PR merged) is torn down (the fix)"
+}
+
+# A firstmate-repo crew worktree carries the crew instruction overlay as a
+# visible modification of AGENTS.md. It is launch scaffolding, so it must not
+# refuse teardown as unlanded work, while any real uncommitted edit to the same
+# file still must (bin/fm-crew-worktree-instructions-lib.sh).
+test_installed_crew_overlay_is_not_unlanded_work() {
+  local case_dir rc pr_head
+  case_dir=$(make_case crew-overlay-clean)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" AGENTS.md 'You are the first mate.' "add AGENTS.md"
+  append_pr_meta_for_current_head "$case_dir"
+  pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  add_gh_pr_merged_for_head "$case_dir" "$pr_head"
+  fm_crew_overlay_body > "$case_dir/wt/AGENTS.md"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 0 "$rc" "crew-overlay-clean: the crew overlay must not refuse teardown as unlanded work"
+  ! grep -q REFUSED "$case_dir/stderr" || fail "crew-overlay-clean: teardown printed a REFUSED line"
+  pass "an installed crew overlay does not read as unlanded work at teardown"
+}
+
+test_real_edit_over_the_crew_overlay_still_refuses() {
+  local case_dir rc pr_head
+  case_dir=$(make_case crew-overlay-dirty)
+  write_meta "$case_dir" no-mistakes ship
+  wt_commit_file "$case_dir" AGENTS.md 'You are the first mate.' "add AGENTS.md"
+  append_pr_meta_for_current_head "$case_dir"
+  pr_head=$(git -C "$case_dir/wt" rev-parse HEAD)
+  add_gh_pr_merged_for_head "$case_dir" "$pr_head"
+  fm_crew_overlay_body > "$case_dir/wt/AGENTS.md"
+  printf '%s\n' 'a real uncommitted worker edit' >> "$case_dir/wt/AGENTS.md"
+
+  set +e
+  run_teardown "$case_dir" > "$case_dir/stdout" 2> "$case_dir/stderr"
+  rc=$?
+  set -e
+
+  expect_code 1 "$rc" "crew-overlay-dirty: a real edit over the overlay must refuse teardown"
+  grep -q REFUSED "$case_dir/stderr" || fail "crew-overlay-dirty: no REFUSED line in stderr"
+  grep -q "uncommitted changes" "$case_dir/stderr" \
+    || fail "crew-overlay-dirty: refusal did not cite uncommitted changes"
+  pass "a real edit made over the crew overlay still refuses teardown"
 }
 
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head() {
@@ -2612,6 +2661,8 @@ test_herdr_projection_teardown_retires_journal_only_after_confirmed_close
 test_herdr_projection_teardown_retains_journal_when_close_unconfirmed
 test_herdr_projection_teardown_surfaces_restore_failure_without_blocking_cleanup
 test_squash_merged_branch_deleted_allows
+test_installed_crew_overlay_is_not_unlanded_work
+test_real_edit_over_the_crew_overlay_still_refuses
 test_squash_merged_pr_allows_when_head_ancestor_of_pr_head
 test_no_pr_recorded_discovers_merged_pr_by_branch_allows
 test_squash_merged_pr_allows_replayed_unpushed_patch
