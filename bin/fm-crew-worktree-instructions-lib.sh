@@ -69,6 +69,12 @@
 # core.hooksPath names the whole hook set rather than one entry in it, so the
 # guard remembers the path it displaced, chains to its pre-commit, forwards its
 # other hooks, and puts a displaced worktree-scoped value back on removal.
+# The generated guard and the forwarding stubs carry no path of their own: they
+# read the displaced directory from the record beside them at run time, and a
+# stub derives the hook to forward from its own name. A path baked into a
+# generated script would make the project's hooks depend on the quoting of that
+# one interpolation, and the failure it produces is the silent one - a hook that
+# is simply not run - so the record is read instead of reproduced.
 # fm_remove_crew_worktree_instructions undoes all of it, and bin/fm-crew-instructions.sh
 # makes it reachable by the worker, so a worker who wants a clean tree for a
 # branch move has a one-command escape. It also heals a worktree still carrying
@@ -760,6 +766,32 @@ fm_crew_previous_hooks_dir() {  # <worktree> <guard-dir>
   printf '%s\n' "$configured"
 }
 
+# One stub body forwards any hook, because it names neither the hook nor the
+# directory it forwards to: it takes the hook name from its own filename and the
+# displaced directory from the record beside it, both at run time.
+fm_crew_write_forwarding_hook() {  # <dest>
+  cat > "$1" <<EOF
+#!/usr/bin/env bash
+# Installed by bin/fm-crew-worktree-instructions-lib.sh.
+# The crew commit guard owns this worktree's core.hooksPath, so this forwards
+# the hook of its own name that the displaced hooks path defined.
+set -u
+hook_dir=\${BASH_SOURCE[0]%/*}
+hook_name=\${BASH_SOURCE[0]##*/}
+record="\$hook_dir/$FM_CREW_PREVIOUS_HOOKS_RECORD"
+if [ ! -f "\$record" ]; then
+  printf 'error: %s\n' \\
+    "the crew hooks path has no $FM_CREW_PREVIOUS_HOOKS_RECORD record, so \$hook_name cannot be forwarded to the hook this worktree had before the crew overlay took over core.hooksPath." \\
+    "drop the overlay to put that hooks path back:" \\
+    "  bin/fm-crew-instructions.sh remove" >&2
+  exit 1
+fi
+IFS= read -r previous_hooks_dir < "\$record" || previous_hooks_dir=''
+[ -n "\$previous_hooks_dir" ] && [ -x "\$previous_hooks_dir/\$hook_name" ] || exit 0
+exec "\$previous_hooks_dir/\$hook_name" "\$@"
+EOF
+}
+
 # Forward every hook the displaced path defined, except pre-commit, which the
 # guard itself chains to. Without this the guard's directory is the whole hook
 # set for this worktree and the project's own formatting and validation hooks
@@ -776,14 +808,7 @@ fm_crew_forward_previous_hooks() {  # <guard-dir> <previous-hooks-dir>
     case $name in
       *.sample | pre-commit) continue ;;
     esac
-    {
-      printf '%s\n' '#!/usr/bin/env bash' \
-        '# Installed by bin/fm-crew-worktree-instructions-lib.sh.' \
-        '# The crew commit guard owns this worktree'"'"'s core.hooksPath, so this' \
-        '# forwards the hook the displaced hooks path defined.' \
-        'set -u'
-      printf 'exec %s "$@"\n' "$(printf '%q' "$hook")"
-    } > "$dir/$name" || return 1
+    fm_crew_write_forwarding_hook "$dir/$name" || return 1
     chmod +x "$dir/$name" || return 1
   done
 }
@@ -803,9 +828,8 @@ fm_crew_clear_forwarded_hooks() {  # <guard-dir>
   done
 }
 
-fm_crew_write_commit_guard() {  # <dest> <agents-blob-hash> <claude-blob-hash> <previous-hooks-dir>
-  local dest=$1 agents_hash=$2 claude_hash=$3 previous=''
-  [ -z "${4:-}" ] || previous=$(printf '%q' "$4/pre-commit")
+fm_crew_write_commit_guard() {  # <dest> <agents-blob-hash> <claude-blob-hash>
+  local dest=$1 agents_hash=$2 claude_hash=$3
   cat > "$dest" <<EOF
 #!/usr/bin/env bash
 # Installed by bin/fm-crew-worktree-instructions-lib.sh for this worktree only.
@@ -820,10 +844,11 @@ fm_crew_write_commit_guard() {  # <dest> <agents-blob-hash> <claude-blob-hash> <
 # keeping it is safe to decide here, so that one is refused loudly.
 # Taking over core.hooksPath would otherwise disable the pre-commit hook this
 # worktree already had, so that one runs after the overlay is unstaged and its
-# verdict is this guard's verdict.
+# verdict is this guard's verdict. The displaced hooks path is read from the
+# record beside this guard rather than carried inside it.
 set -u
 marker='$FM_CREW_OVERLAY_MARKER'
-previous_hook=$previous
+record="\${BASH_SOURCE[0]%/*}/$FM_CREW_PREVIOUS_HOOKS_RECORD"
 guard_status=0
 
 refuse() {
@@ -862,8 +887,17 @@ for rel in $FM_CREW_INSTRUCTION_FILES; do
     "  bin/fm-crew-instructions.sh remove"
 done
 [ "\$guard_status" -eq 0 ] || exit "\$guard_status"
-if [ -n "\$previous_hook" ] && [ -x "\$previous_hook" ]; then
-  exec "\$previous_hook" "\$@"
+if [ ! -f "\$record" ]; then
+  refuse "the crew commit guard has no $FM_CREW_PREVIOUS_HOOKS_RECORD record beside it," \\
+    "so it cannot reach the pre-commit hook this worktree had before the crew overlay took over core.hooksPath." \\
+    "letting the commit through would skip that hook without saying so." \\
+    "drop the overlay to put that hooks path back:" \\
+    "  bin/fm-crew-instructions.sh remove"
+  exit "\$guard_status"
+fi
+IFS= read -r previous_hooks_dir < "\$record" || previous_hooks_dir=''
+if [ -n "\$previous_hooks_dir" ] && [ -x "\$previous_hooks_dir/pre-commit" ]; then
+  exec "\$previous_hooks_dir/pre-commit" "\$@"
 fi
 exit 0
 EOF
@@ -877,6 +911,8 @@ EOF
 # displaces is therefore remembered, its pre-commit is chained to from the
 # guard, its other hooks are forwarded, and removal puts a displaced
 # worktree-scoped value back instead of unsetting it.
+# The record is written before the guard and the stubs, because they read it at
+# run time rather than carrying a copy of the path.
 fm_crew_install_commit_guard() {  # <worktree>
   local wt=$1 dir agents_hash claude_hash tmp previous prior_worktree
   dir=$(fm_crew_commit_guard_dir "$wt") || {
@@ -929,7 +965,7 @@ fm_crew_install_commit_guard() {  # <worktree>
     return 1
   }
   tmp="$dir/pre-commit.new"
-  if ! fm_crew_write_commit_guard "$tmp" "$agents_hash" "$claude_hash" "$previous" ||
+  if ! fm_crew_write_commit_guard "$tmp" "$agents_hash" "$claude_hash" ||
     ! chmod +x "$tmp" || ! mv "$tmp" "$dir/pre-commit"; then
     rm -f "$tmp"
     echo "error: could not write the crew commit guard at $dir/pre-commit" >&2

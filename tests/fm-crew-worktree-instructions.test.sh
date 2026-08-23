@@ -26,7 +26,9 @@
 # and their path is restored when the guard goes, a tracked instruction file the
 # worker deleted refuses the install rather than being passed over, and the
 # brief-mandated bin/fm-ensure-agents-md.sh stays a no-op success in an overlaid
-# worktree.
+# worktree. The hooks the guard chains to are exercised through a path that
+# needs quoting as well as a plain one, because a chain that loses the path skips
+# the project's hooks while still reporting a successful commit.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -1194,6 +1196,40 @@ test_the_guard_keeps_the_projects_own_hooks_running() {
   pass "the crew commit guard chains to the hooks the worktree already had"
 }
 
+# The chain has to survive a displaced hooks path that needs quoting. A space in
+# it is the ordinary case - a checkout under a directory a person named - and
+# the failure it would produce is the silent one: the project's own hooks stop
+# running while the commit still reports success.
+test_the_guard_chains_through_a_hooks_path_with_a_space() {
+  local repo wt hooks out status
+  repo="$TMP_ROOT/hookspace-repo"
+  wt="$TMP_ROOT/hookspace-wt"
+  make_firstmate_repo "$repo"
+  hooks="$repo/git hooks dir"
+  mkdir -p "$hooks"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo spaced-pre-commit-ran >&2' \
+    '[ -f REJECT ] && { echo spaced-pre-commit-refuses >&2; exit 1; }' 'exit 0' > "$hooks/pre-commit"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo spaced-commit-msg-ran >&2' 'exit 0' > "$hooks/commit-msg"
+  chmod +x "$hooks/pre-commit" "$hooks/commit-msg"
+  git -C "$repo" config core.hooksPath "$hooks"
+  make_linked_worktree "$repo" "$wt"
+  fm_install_crew_worktree_instructions "$wt" 'hookspace-task-h3' || fail "overlay install failed"
+  printf '%s\n' 'ordinary crew work' > "$wt/NOTES.md"
+  out=$(commit_all "$wt" 'crew commit with a spaced hooks path'); status=$?
+  expect_code 0 "$status" "an ordinary crew commit must still succeed with a spaced hooks path: $out"
+  assert_contains "$out" 'spaced-pre-commit-ran' \
+    "the crew guard skipped the project's pre-commit hook because its path contains a space"
+  assert_contains "$out" 'spaced-commit-msg-ran' \
+    "the crew guard skipped the project's commit-msg hook because its path contains a space"
+  printf '%s\n' 'reject marker' > "$wt/REJECT"
+  printf '%s\n' 'more crew work' > "$wt/NOTES2.md"
+  out=$(commit_all "$wt" 'commit the spaced project hook must refuse'); status=$?
+  [ "$status" -ne 0 ] || fail "a refusal from a hook under a spaced path was swallowed: $out"
+  assert_contains "$out" 'spaced-pre-commit-refuses' \
+    "the refusal a hook under a spaced path raised never reached the worker"
+  pass "the crew commit guard chains through a hooks path that contains a space"
+}
+
 # Removal has to put back exactly what the install displaced. Unsetting the
 # worktree-scoped value uncovers the shared one, which silently loses a
 # worktree-scoped hooks path the worktree carried before the overlay arrived.
@@ -1284,6 +1320,7 @@ test_restored_agents_md_commits_the_edit
 test_ensure_agents_md_stays_a_no_op_after_overlay
 test_commit_keeps_the_overlay_out_of_the_commit
 test_the_guard_keeps_the_projects_own_hooks_running
+test_the_guard_chains_through_a_hooks_path_with_a_space
 test_removal_restores_a_displaced_worktree_hooks_path
 test_a_deleted_instruction_file_refuses_the_install
 test_a_worktree_left_by_the_superseded_mechanism_is_healed

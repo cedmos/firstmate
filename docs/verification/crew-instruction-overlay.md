@@ -399,6 +399,7 @@ after --unset:   sharedhooks
 Setting `core.hooksPath` did not add the guard to the hooks the repository already ran; it replaced them.
 The default directory's `pre-commit` and `commit-msg` both stopped running the moment the guard's directory became the path, and nothing reported that they had.
 So the install remembers the directory it displaced, chains the guard to that directory's `pre-commit` once the overlay is unstaged, and forwards the other hooks it holds.
+The guard and the forwarding stubs read that remembered directory from the record beside them when they run, rather than carrying a copy of the path, so reaching the project's hooks never depends on a path surviving interpolation into a generated script.
 
 The second half is why removal restores rather than unsets.
 `--unset` at worktree scope does not put back the worktree-scoped value that was overwritten; it uncovers the shared one, which here is a third, unrelated directory.
