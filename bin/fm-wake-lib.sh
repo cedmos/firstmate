@@ -1211,7 +1211,7 @@ fm_wake_commit_secondmate_stall_receipts_through() { # <cutoff>
     rest=${key%-*}
     epoch=${rest##*-}
     task=${rest#secondmate-wake-loop-}
-    task=${task%-$epoch}
+    task=${task%-"$epoch"}
     case "$seq" in ''|*[!0-9]*) return 1 ;; esac
     case "$epoch" in ''|*[!0-9]*) return 1 ;; esac
     case "$task" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac

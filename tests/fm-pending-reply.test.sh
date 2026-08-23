@@ -669,6 +669,8 @@ test_delivery_confirmation_serializes_with_reconciliation() {
     local home state corr rec calls entered release confirm_pid reconcile_pid count i
     home=$(setup_parent delivery-confirm-reconcile-race)
     state="$home/state"
+    # This fixture clock is intentionally scoped to the isolated subshell.
+    # shellcheck disable=SC2030,SC2031
     export FM_PENDING_REPLY_NOW=5900
     corr=$(fm_pending_reply_create "$home" "$state" hibit "serialized delivery")
     rec=$(fm_pending_reply_path "$state" "$corr")
@@ -687,6 +689,8 @@ test_delivery_confirmation_serializes_with_reconciliation() {
         || fm_pending_reply_set "$pending_rec" phase awaiting_report
     }
     fm_pending_reply_confirm_delivery "$state" "$corr" &
+    # The background PID is consumed within this isolated test subshell.
+    # shellcheck disable=SC2031
     confirm_pid=$!
     for i in $(seq 1 100); do
       [ -e "$entered" ] && break
@@ -694,6 +698,8 @@ test_delivery_confirmation_serializes_with_reconciliation() {
     done
     [ -e "$entered" ] || fail "delivery confirmation did not reach its commit boundary"
     fm_pending_reply_reconcile_delivery "$state" "$corr" &
+    # The background PID is consumed within this isolated test subshell.
+    # shellcheck disable=SC2031
     reconcile_pid=$!
     /bin/sleep 0.1
     : > "$release"
