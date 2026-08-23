@@ -147,11 +147,16 @@
 #   containment test reads local refs only and never fetches, so this gate stays
 #   usable offline; a stale remote-tracking ref can therefore make an unpushed
 #   commit look contained, which is exactly why no remedy command is printed.
+#   The refresh first undoes any crew overlay the previous occupant of the slot
+#   left behind, because its skip-worktree bits are invisible to the clean
+#   check and would make `git reset --hard` fail for every later spawn.
 #   After that refresh, a firstmate-repo ship or scout worktree gets crewmate
 #   project instructions installed over the auto-loaded AGENTS.md and CLAUDE.md
 #   so the harness cannot load the firstmate job description as that worker's
-#   role (bin/fm-crew-worktree-instructions-lib.sh). A failed overlay refuses
-#   the spawn. Secondmate homes and non-firstmate projects are unchanged.
+#   role (bin/fm-crew-worktree-instructions-lib.sh). The same install adds a
+#   worktree-local pre-commit guard so an edit to an overlaid file cannot be
+#   dropped from a commit silently. A failed overlay refuses the spawn.
+#   Secondmate homes and non-firstmate projects are unchanged.
 # Batch dispatch: pass one or more `id=repo` pairs instead of a single <id> <project>, e.g.
 #     fm-spawn.sh fix-a-k3=projects/foo add-b-q7=projects/bar [--scout]
 #   Each pair re-execs this script in single-task mode, so the single path stays the only
@@ -1801,6 +1806,13 @@ EOF
 
 freshen_spawn_worktree_base() {  # <worktree>
   local worktree=$1 default target expected actual status
+  # A pooled slot can come back still carrying a previous task's crew overlay:
+  # skip-worktree hides it from the clean check below and then wedges the
+  # reset. Undo it first so a returned slot self-heals however that task ended.
+  if ! fm_remove_crew_worktree_instructions "$worktree"; then
+    echo "error: could not remove stale crew instructions from pooled worktree '$worktree'; refusing to launch from a base git cannot refresh" >&2
+    return 1
+  fi
   if ! git -C "$worktree" fetch --quiet origin; then
     echo "error: could not fetch origin for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
     return 1

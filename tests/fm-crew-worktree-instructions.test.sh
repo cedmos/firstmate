@@ -7,6 +7,10 @@
 # role. These tests prove the inversion is gone at the auto-load corpus, not
 # that a warning string exists: after overlay, the files a harness would load
 # no longer contain the firstmate identity line, while git HEAD still does.
+# The overlay's two live-fire consequences are exercised through real git: a
+# commit that would silently drop an edit to a skip-worktree instruction file
+# is refused, and a pooled worktree returned with the overlay still installed
+# can be refreshed onto a moved default branch instead of wedging.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -44,6 +48,19 @@ assert_skip_worktree() {  # <worktree> <rel> <msg>
   [ "$state" = S ] || fail "$msg ($rel ls-files -v='$state')"
 }
 
+assert_not_skip_worktree() {  # <worktree> <rel> <msg>
+  local wt=$1 rel=$2 msg=$3 state
+  state=$(git -C "$wt" ls-files -v -- "$rel" | awk '{print substr($1,1,1)}')
+  [ "$state" = S ] && fail "$msg ($rel is still skip-worktree)"
+  return 0
+}
+
+commit_all() {  # <worktree> <message>
+  local wt=$1 msg=$2
+  git -C "$wt" add -A >/dev/null 2>&1
+  git -C "$wt" commit -am "$msg" 2>&1
+}
+
 make_firstmate_repo() {  # <dir>
   local repo=$1
   mkdir -p "$repo/bin" "$repo/.agents/skills/firstmate-coding-guidelines"
@@ -62,6 +79,13 @@ make_linked_worktree() {  # <repo> <worktree>
   local repo=$1 worktree=$2
   fm_git_add_origin "$repo" "$repo.origin.git"
   git -C "$repo" worktree add --quiet --detach "$worktree"
+}
+
+overlaid_worktree() {  # <repo> <worktree>
+  local repo=$1 wt=$2
+  make_firstmate_repo "$repo"
+  make_linked_worktree "$repo" "$wt"
+  fm_install_crew_worktree_instructions "$wt" || fail "overlay install failed for $wt"
 }
 
 make_spawn_fakebin() {
@@ -249,39 +273,162 @@ test_session_start_refuses_linked_worktree() {
   pass "session start refuses a linked firstmate worktree with no digest and no lock"
 }
 
-test_spawn_overlays_firstmate_shaped_pool() {
-  local case_dir home project origin pool fakebin id out status
-  id='crew-role-overlay-s1'
-  case_dir="$TMP_ROOT/spawn-case"
-  home="$case_dir/home"
-  project="$case_dir/project"
+test_identity_line_matches_shipped_agents_md() {
+  local shipped
+  shipped="$TMP_ROOT/shipped-AGENTS.md"
+  if fm_file_is_crew_overlay "$ROOT/AGENTS.md"; then
+    git -C "$ROOT" show HEAD:AGENTS.md > "$shipped" \
+      || fail "could not read the committed AGENTS.md of this checkout"
+  else
+    cp "$ROOT/AGENTS.md" "$shipped" || fail "could not read this checkout's AGENTS.md"
+  fi
+  fm_file_presents_firstmate_identity "$shipped" \
+    || fail "the identity predicate no longer recognizes this checkout's own AGENTS.md, so every firstmate-repo crew and scout spawn would refuse"
+  pass "the shipped AGENTS.md still satisfies the identity predicate the overlay gates on"
+}
+
+test_commit_guard_refuses_a_mutated_overlay_file() {
+  local repo wt head_before out status
+  repo="$TMP_ROOT/guard-fail-repo"
+  wt="$TMP_ROOT/guard-fail-wt"
+  overlaid_worktree "$repo" "$wt"
+  head_before=$(git -C "$wt" rev-parse HEAD)
+  printf '%s\n' 'a crewmate edit that must not vanish' >> "$wt/AGENTS.md"
+  printf '%s\n' '#!/bin/sh' 'echo spawn v2' > "$wt/bin/fm-spawn.sh"
+  out=$(commit_all "$wt" 'crew commit that would drop the AGENTS.md edit'); status=$?
+  [ "$status" -ne 0 ] \
+    || fail "commit succeeded even though it omitted the AGENTS.md edit: $out"
+  assert_contains "$out" "AGENTS.md" "guard refusal did not name the file"
+  assert_contains "$out" "would silently omit" \
+    "guard refusal did not say the commit would omit the edit"
+  assert_contains "$out" "git update-index --no-skip-worktree -- AGENTS.md && git checkout HEAD -- AGENTS.md" \
+    "guard refusal did not name the restore commands"
+  [ "$(git -C "$wt" rev-parse HEAD)" = "$head_before" ] \
+    || fail "refused commit still moved HEAD"
+  pass "a commit that would drop an edit to the overlaid AGENTS.md fails loudly"
+}
+
+test_commit_guard_allows_an_untouched_overlay() {
+  local repo wt head_before out status
+  repo="$TMP_ROOT/guard-pass-repo"
+  wt="$TMP_ROOT/guard-pass-wt"
+  overlaid_worktree "$repo" "$wt"
+  head_before=$(git -C "$wt" rev-parse HEAD)
+  printf '%s\n' 'ordinary crew work' > "$wt/NOTES.md"
+  out=$(commit_all "$wt" 'ordinary crew commit'); status=$?
+  expect_code 0 "$status" "an ordinary crew commit must not be blocked by the overlay: $out"
+  [ "$(git -C "$wt" rev-parse HEAD)" != "$head_before" ] \
+    || fail "the ordinary crew commit did not move HEAD"
+  assert_contains "$(git -C "$wt" show HEAD:AGENTS.md)" "$IDENTITY_LINE" \
+    "the crew commit committed the overlay over the firstmate job"
+  assert_corpus_is_crew "$wt" "after an ordinary crew commit"
+  pass "an ordinary crew commit succeeds while the overlay is untouched"
+}
+
+test_restored_agents_md_commits_the_edit() {
+  local repo wt out status
+  repo="$TMP_ROOT/guard-restore-repo"
+  wt="$TMP_ROOT/guard-restore-wt"
+  overlaid_worktree "$repo" "$wt"
+  git -C "$wt" update-index --no-skip-worktree -- AGENTS.md \
+    || fail "documented restore could not clear skip-worktree"
+  git -C "$wt" checkout HEAD -- AGENTS.md || fail "documented restore could not check out AGENTS.md"
+  printf '%s\n' 'A crewmate edited the real job description.' >> "$wt/AGENTS.md"
+  out=$(commit_all "$wt" 'edit the committed AGENTS.md'); status=$?
+  expect_code 0 "$status" "a commit after the documented restore must succeed: $out"
+  assert_contains "$(git -C "$wt" show HEAD:AGENTS.md)" 'A crewmate edited the real job description.' \
+    "the commit omitted the restored AGENTS.md edit"
+  pass "after the documented restore the AGENTS.md edit lands in the commit"
+}
+
+test_removal_unwedges_a_pooled_reset() {
+  local repo wt out status
+  repo="$TMP_ROOT/reuse-repo"
+  wt="$TMP_ROOT/reuse-wt"
+  overlaid_worktree "$repo" "$wt"
+  printf '%s\n' "$IDENTITY_LINE" 'The user is the captain.' 'Main moved on.' > "$repo/AGENTS.md"
+  git -C "$repo" add AGENTS.md
+  git -C "$repo" commit -qm 'move AGENTS.md on main'
+  git -C "$repo" push -q origin main
+  git -C "$wt" fetch -q origin
+  if git -C "$wt" reset --hard origin/main >/dev/null 2>&1; then
+    fail "fixture did not reproduce the wedged reset of a pooled worktree"
+  fi
+  fm_remove_crew_worktree_instructions "$wt" || fail "overlay removal failed"
+  assert_not_skip_worktree "$wt" AGENTS.md "removal left AGENTS.md skip-worktree"
+  assert_not_skip_worktree "$wt" CLAUDE.md "removal left CLAUDE.md skip-worktree"
+  assert_contains "$(cat "$wt/AGENTS.md")" "$IDENTITY_LINE" \
+    "removal did not restore the committed AGENTS.md"
+  out=$(git -C "$wt" reset --hard origin/main 2>&1); status=$?
+  expect_code 0 "$status" "reset onto a new AGENTS.md blob must succeed after removal: $out"
+  assert_contains "$(cat "$wt/AGENTS.md")" 'Main moved on.' \
+    "the reset worktree is not on the new base"
+  [ -z "$(git -C "$wt" status --porcelain)" ] \
+    || fail "removal left the worktree dirty: $(git -C "$wt" status --porcelain)"
+  pass "removal clears the overlay so a pooled worktree can be reset onto a new base"
+}
+
+make_spawn_case() {  # <case-dir>
+  local case_dir=$1 origin
+  SPAWN_HOME="$case_dir/home"
+  SPAWN_PROJECT="$case_dir/project"
+  SPAWN_POOL="$case_dir/pool"
   origin="$case_dir/origin.git"
-  pool="$case_dir/pool"
-  fakebin=$(make_spawn_fakebin "$case_dir/fake")
-  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config"
-  printf 'codex\n' > "$home/config/crew-harness"
-  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
-  touch "$home/state/.last-watcher-beat"
-  make_firstmate_repo "$project"
-  git clone --quiet --bare "$project" "$origin"
-  git -C "$project" remote add origin "file://$origin"
-  git -C "$project" worktree add --quiet --detach "$pool" HEAD
-  out=$(
-    FM_ROOT_OVERRIDE='' FM_HOME="$home" \
-      FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
-      FM_PROJECTS_OVERRIDE="$home/projects" FM_CONFIG_OVERRIDE="$home/config" \
-      FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" FM_FAKE_PANE_PATH="$pool" \
-      PATH="$fakebin:$PATH" \
-      "$SPAWN" "$id" "$project" --scout 2>&1
-  ); status=$?
+  SPAWN_FAKEBIN=$(make_spawn_fakebin "$case_dir/fake")
+  mkdir -p "$SPAWN_HOME/data" "$SPAWN_HOME/projects" "$SPAWN_HOME/state" "$SPAWN_HOME/config"
+  printf 'codex\n' > "$SPAWN_HOME/config/crew-harness"
+  touch "$SPAWN_HOME/state/.last-watcher-beat"
+  make_firstmate_repo "$SPAWN_PROJECT"
+  git clone --quiet --bare "$SPAWN_PROJECT" "$origin"
+  git -C "$SPAWN_PROJECT" remote add origin "file://$origin"
+  git -C "$SPAWN_PROJECT" worktree add --quiet --detach "$SPAWN_POOL" HEAD
+}
+
+spawn_into_pool() {  # <id>
+  local id=$1
+  mkdir -p "$SPAWN_HOME/data/$id"
+  printf 'brief for %s\n' "$id" > "$SPAWN_HOME/data/$id/brief.md"
+  FM_ROOT_OVERRIDE='' FM_HOME="$SPAWN_HOME" \
+    FM_STATE_OVERRIDE="$SPAWN_HOME/state" FM_DATA_OVERRIDE="$SPAWN_HOME/data" \
+    FM_PROJECTS_OVERRIDE="$SPAWN_HOME/projects" FM_CONFIG_OVERRIDE="$SPAWN_HOME/config" \
+    FM_SPAWN_NO_GUARD=1 TMUX="fake,1,0" FM_FAKE_PANE_PATH="$SPAWN_POOL" \
+    PATH="$SPAWN_FAKEBIN:$PATH" \
+    "$SPAWN" "$id" "$SPAWN_PROJECT" --scout 2>&1
+}
+
+test_spawn_overlays_firstmate_shaped_pool() {
+  local id out status
+  id='crew-role-overlay-s1'
+  make_spawn_case "$TMP_ROOT/spawn-case"
+  out=$(spawn_into_pool "$id"); status=$?
   expect_code 0 "$status" "spawn of a firstmate-shaped pool should succeed: $out"
   assert_contains "$out" "spawned $id" "spawn did not report success"
-  assert_corpus_is_crew "$pool" "spawned firstmate-repo worktree"
-  assert_contains "$(git -C "$pool" show HEAD:AGENTS.md)" "$IDENTITY_LINE" \
+  assert_corpus_is_crew "$SPAWN_POOL" "spawned firstmate-repo worktree"
+  assert_contains "$(git -C "$SPAWN_POOL" show HEAD:AGENTS.md)" "$IDENTITY_LINE" \
     "spawn overlay replaced the committed firstmate job"
-  [ -z "$(git -C "$pool" status --porcelain)" ] \
-    || fail "spawn overlay left the pool dirty: $(git -C "$pool" status --porcelain)"
+  [ -z "$(git -C "$SPAWN_POOL" status --porcelain)" ] \
+    || fail "spawn overlay left the pool dirty: $(git -C "$SPAWN_POOL" status --porcelain)"
   pass "spawn overlays a firstmate-repo crew worktree before launch"
+}
+
+test_spawn_reuses_a_pool_the_previous_crew_overlaid() {
+  local out status
+  make_spawn_case "$TMP_ROOT/reuse-spawn-case"
+  out=$(spawn_into_pool 'crew-role-reuse-a1'); status=$?
+  expect_code 0 "$status" "first spawn into the pool should succeed: $out"
+  assert_corpus_is_crew "$SPAWN_POOL" "first spawn"
+  printf '%s\n' "$IDENTITY_LINE" 'The user is the captain.' 'Main moved on.' > "$SPAWN_PROJECT/AGENTS.md"
+  git -C "$SPAWN_PROJECT" add AGENTS.md
+  git -C "$SPAWN_PROJECT" commit -qm 'move AGENTS.md on main'
+  git -C "$SPAWN_PROJECT" push -q origin main
+  out=$(spawn_into_pool 'crew-role-reuse-b2'); status=$?
+  expect_code 0 "$status" "spawn into a pool the previous crew overlaid should succeed: $out"
+  assert_corpus_is_crew "$SPAWN_POOL" "second spawn"
+  assert_contains "$(git -C "$SPAWN_POOL" show HEAD:AGENTS.md)" 'Main moved on.' \
+    "the reused pool was not refreshed onto the new default branch"
+  [ -z "$(git -C "$SPAWN_POOL" status --porcelain)" ] \
+    || fail "reused pool is dirty: $(git -C "$SPAWN_POOL" status --porcelain)"
+  pass "a pooled worktree the previous crew overlaid still refreshes and spawns"
 }
 
 test_overlay_inverts_autoload_corpus
@@ -294,4 +441,10 @@ test_unknown_agents_md_is_refused
 test_missing_guidelines_is_refused
 test_session_start_forbidden_predicate
 test_session_start_refuses_linked_worktree
+test_identity_line_matches_shipped_agents_md
+test_commit_guard_refuses_a_mutated_overlay_file
+test_commit_guard_allows_an_untouched_overlay
+test_restored_agents_md_commits_the_edit
+test_removal_unwedges_a_pooled_reset
 test_spawn_overlays_firstmate_shaped_pool
+test_spawn_reuses_a_pool_the_previous_crew_overlaid
