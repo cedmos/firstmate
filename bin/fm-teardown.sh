@@ -176,6 +176,13 @@ ID=$1
 FORCE=${2:-}
 # shellcheck source=bin/fm-wake-lib.sh
 . "$SCRIPT_DIR/fm-wake-lib.sh"
+# Supervision lease guard: post-landing cleanup is overlap territory between
+# the two Pi supervision actors; refuse while the OTHER actor holds this
+# task's live lease (contract: bin/fm-lease-lib.sh; no-op in homes without
+# leases).
+# shellcheck source=bin/fm-lease-lib.sh
+. "$SCRIPT_DIR/fm-lease-lib.sh"
+fm_lease_guard "$ID" "teardown (fm-teardown)"
 CONTROL_LOCK="$STATE/.control-$ID.lock"
 CONTROL_LOCK_HELD=0
 META_LOCK=

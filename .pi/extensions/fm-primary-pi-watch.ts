@@ -17,6 +17,10 @@ import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { Box, Container, Text, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
+  createBranchDispatchOffer,
+  FM_BRANCH_DISPATCH_EVENT,
+} from "./lib/fm-branch-dispatch.ts";
+import {
   type CalmPresentationState,
   calmTranscriptClassIsVisible,
   FIRSTMATE_CALM_PRESENTATION_EVENT,
@@ -292,6 +296,18 @@ export default function (pi: ExtensionAPI) {
     return confirmHandlingDelivery(snapshot());
   }
 
+  // Offer an ordinary actionable wake to the supervision-branch extension
+  // (lib/fm-branch-dispatch.ts). A synchronous accept means the branch now
+  // owns delivery and handling; no acceptor (no branch extension, branch
+  // disabled, away mode, branch broken) keeps today's wake-to-main path.
+  // Watcher-failure alarms never go through here - only main can repair the
+  // watcher cycle.
+  function offerWakeToBranch(message: string): boolean {
+    const offer = createBranchDispatchOffer(message);
+    pi.events?.emit?.(FM_BRANCH_DISPATCH_EVENT, offer);
+    return offer.accepted;
+  }
+
   async function deliverActionableWake(
     owner: SessionGeneration,
     message: string,
@@ -309,6 +325,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
     }
+    if (offerWakeToBranch(message)) return;
     await sendWake(owner, message);
   }
 

@@ -713,6 +713,16 @@ else
   if [ -n "$INACTIVE_OUT" ]; then
     printf 'inactive outcome reconciliation: %s\n' "$INACTIVE_OUT"
   fi
+  # Pi supervision-branch recovery, locked path only: clear leases whose
+  # supervising process died, and surface outcomes the branch stored durably
+  # that never reached main (docs/pi-supervision-branch.md). Both are silent
+  # no-ops in a home that never ran the branch.
+  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$SCRIPT_DIR/fm-lease.sh" sweep 2>/dev/null || true
+  BRANCH_REPLAY_OUT=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-branch-outcome.sh" startup-replay 2>&1) || BRANCH_REPLAY_OUT=
+  if [ -n "$BRANCH_REPLAY_OUT" ]; then
+    printf '%s\n' "$BRANCH_REPLAY_OUT"
+  fi
   DRAIN_OUT=$("$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
   if [ -n "$DRAIN_OUT" ]; then
     printf '%s\n' "$DRAIN_OUT"

@@ -32,6 +32,7 @@ install_pi_watch_extension_fixture() {
     "$repo/node_modules/@earendil-works/pi-tui" \
     "$repo/node_modules/typebox"
   cp "$EXT" "$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cp "$ROOT/.pi/extensions/lib/fm-branch-dispatch.ts" "$repo/.pi/extensions/lib/fm-branch-dispatch.ts"
   cp "$ROOT/.pi/extensions/lib/fm-calm-visibility.ts" "$repo/.pi/extensions/lib/fm-calm-visibility.ts"
   cp "$ROOT/.pi/extensions/lib/fm-operational-input.ts" "$repo/.pi/extensions/lib/fm-operational-input.ts"
   mkdir -p "$repo/bin"
@@ -420,6 +421,113 @@ EOF
   expect_code 0 "$status" "Pi actionable close must start one successor before wake delivery settles"
   [ -z "$out" ] || fail "Pi continuous-rearm test printed output: $out"
   pass "Pi actionable close starts one successor before wake delivery settles"
+}
+
+test_pi_branch_offer_owns_actionable_wake() {
+  local repo home plugin log stop out status
+  repo="$TMP_ROOT/pi-branch-offer-root"
+  home="$TMP_ROOT/pi-branch-offer-home"
+  log="$TMP_ROOT/pi-branch-offer.log"
+  stop="$TMP_ROOT/pi-branch-offer.stop"
+  mkdir -p "$repo/bin" "$home/state" "$home/config"
+  install_pi_watch_extension_fixture "$repo"
+  plugin="$repo/.pi/extensions/fm-primary-pi-watch.ts"
+  cat > "$repo/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = --handling-delivered ]; then
+  printf 'confirmed generation=%s watcher=%s\n' "$2" "$4" >> "${FM_ARM_LOG:?}"
+  exit 0
+fi
+printf 'arm=%s\n' "$$" >> "${FM_ARM_LOG:?}"
+count=$(grep -c '^arm=' "$FM_ARM_LOG")
+if [ "$count" -eq 1 ]; then
+  printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+  printf 'signal: branch-offer synthetic wake\n'
+  exit 0
+fi
+printf 'watcher: started pid=%s (beacon fresh) recovery-generation=fixture-generation\n' "$$"
+trap 'exit 0' TERM INT
+while [ ! -e "$FM_STOP_FILE" ]; do sleep 0.02; done
+SH
+  chmod +x "$repo/bin/fm-watch-arm.sh"
+  out=$(PLUGIN="$plugin" FM_HOME="$home" FM_ROOT_OVERRIDE="$repo" FM_ARM_LOG="$log" FM_STOP_FILE="$stop" node --input-type=module 2>&1 <<'EOF'
+import { readFileSync, writeFileSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
+// Two independent runs against the SAME dispatcher build: with an accepting
+// branch listener the wake must be owned by the branch (no main follow-up);
+// with a bus but no acceptor the dispatcher must fall back to main. The
+// divergence between the two runs is asserted, so the case cannot go vacuous.
+async function runScenario(withAcceptor) {
+  writeFileSync(process.env.FM_ARM_LOG, "");
+  const offers = [];
+  let mainPrompt = "";
+  let tool = null;
+  const handlers = new Map();
+  const bus = {
+    on(channel, handler) {
+      handlers.set(channel, [...(handlers.get(channel) ?? []), handler]);
+      return () => {};
+    },
+    emit(channel, data) {
+      for (const handler of handlers.get(channel) ?? []) handler(data);
+    },
+  };
+  if (withAcceptor) {
+    bus.on("fm-branch-supervision:dispatch", (offer) => {
+      offers.push(offer.message);
+      offer.accept();
+    });
+  }
+  const pi = {
+    on() {},
+    events: bus,
+    registerCommand() {},
+    registerTool(candidate) {
+      if (candidate.name === "fm_watch_arm_pi") tool = candidate;
+    },
+    sendUserMessage: async (message) => {
+      mainPrompt = message;
+    },
+  };
+  const mod = await import(`${pathToFileURL(process.env.PLUGIN).href}?scenario=${withAcceptor}`);
+  mod.default(pi);
+  await tool.execute("tool-call-branch-offer", {}, undefined, undefined, {});
+  for (let i = 0; i < 250; i += 1) {
+    const settled = withAcceptor ? offers.length > 0 : mainPrompt !== "";
+    if (settled) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  const rows = readFileSync(process.env.FM_ARM_LOG, "utf8").trim().split("\n");
+  return { offers, mainPrompt, rows };
+}
+
+writeFileSync(`${process.env.FM_HOME}/state/.lock`, `${process.pid}\n`);
+const accepted = await runScenario(true);
+if (accepted.offers.length !== 1) throw new Error(`expected one branch offer, got ${accepted.offers.length}`);
+if (!accepted.offers[0].includes("signal: branch-offer synthetic wake")) {
+  throw new Error(`offer missed the wake reason: ${accepted.offers[0]}`);
+}
+if (accepted.mainPrompt !== "") throw new Error(`accepted offer still reached main: ${accepted.mainPrompt}`);
+if (!accepted.rows.some((row) => row.startsWith("confirmed generation=fixture-generation"))) {
+  throw new Error(`handling delivery was not confirmed before the branch handoff: ${accepted.rows.join(" | ")}`);
+}
+const declined = await runScenario(false);
+if (declined.offers.length !== 0) throw new Error("no-acceptor scenario recorded an offer");
+if (!declined.mainPrompt.includes("FIRSTMATE WATCHER WAKE")) {
+  throw new Error(`unaccepted offer did not fall back to main: ${declined.mainPrompt}`);
+}
+if (!declined.mainPrompt.includes("signal: branch-offer synthetic wake")) {
+  throw new Error(`fallback wake lost the reason line: ${declined.mainPrompt}`);
+}
+writeFileSync(process.env.FM_STOP_FILE, "stop\n");
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "Pi dispatcher must hand an accepted wake to the branch and fall back to main otherwise"
+  [ -z "$out" ] || fail "Pi branch-offer test printed output: $out"
+  pass "Pi dispatcher branch offer owns accepted wakes and falls back to main"
 }
 
 test_pi_handling_delivery_failure_is_typed_once() {
@@ -2255,6 +2363,7 @@ test_pi_tool_returns_agent_tool_result
 test_pi_redundant_tool_call_is_owned_noop
 test_pi_scheduled_retry_call_is_owned_noop
 test_pi_actionable_close_starts_single_successor_before_delivery
+test_pi_branch_offer_owns_actionable_wake
 test_pi_handling_delivery_failure_is_typed_once
 test_pi_hung_successor_falls_back_to_typed_wake
 test_pi_unretired_successor_falls_back_without_retry
