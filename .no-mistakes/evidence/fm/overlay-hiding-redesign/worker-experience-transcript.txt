@@ -1,0 +1,128 @@
+git 2.50.1
+
+=== SPAWN: the overlay is installed as a VISIBLE modification
+
+$ head -8 AGENTS.md    # what the harness auto-loads as my role
+  <!-- firstmate-crew-worktree-instructions -->
+  
+  # Role
+  
+  You are a crewmate: an autonomous worker agent managed by firstmate.
+  You are not the first mate.
+  Spawn replaced this worktree's harness-loaded project instructions before launch so you cannot adopt the firstmate role from them.
+  
+
+$ grep -n "except through this repository" AGENTS.md   # fleet fence carve-out
+  9:Do not run `bin/fm-session-start.sh`, `bin/fm-spawn.sh`, `bin/fm-brief.sh`, `tasks-axi add`, or any other fleet-management command, except through this repository's own test suite.
+
+$ git status --porcelain      # the overlay is not hidden from me
+   M AGENTS.md
+
+$ git ls-files -v AGENTS.md CLAUDE.md   # no skip-worktree / assume-unchanged bit
+  H AGENTS.md
+  H CLAUDE.md
+
+$ git log -1 --format=%H:%s HEAD:AGENTS.md is untouched -- committed job description:
+  You are the first mate.
+
+=== DAY OF WORK: git add -A + commit lands my work, not the overlay
+
+$ git add -A && git commit -m "feat: crew work"
+  note: kept the crew overlay out of this commit (AGENTS.md is launch scaffolding, not source).
+
+$ git show --stat --format= HEAD    # the overlay stayed out of the commit
+   feature.txt | 1 +
+   1 file changed, 1 insertion(+)
+
+$ git status --porcelain    # ...and is still installed and still visible
+   M AGENTS.md
+
+=== THE OLD WEDGE: main moves AGENTS.md, I rebase, git refuses
+
+$ git rebase main
+  error: cannot rebase: You have unstaged changes.
+  error: Please commit or stash them.
+
+$ git checkout 700f0337c5560033fa84b18cb98c7019de6205ab    # the same branch move, phrased the way the old bug report quoted it
+  error: Your local changes to the following files would be overwritten by checkout:
+  	AGENTS.md
+  Please commit your changes or stash them before you switch branches.
+  Aborting
+
+$ git status --porcelain    # the refusal is EXPLAINED: I can see the modification
+   M AGENTS.md
+
+$ git stash push -- AGENTS.md CLAUDE.md   # the remedy git names actually saves something
+  Saved working directory and index state WIP on fm/task-alpha: 925ff8f feat: crew work
+
+$ git stash list
+  stash@{0}: WIP on fm/task-alpha: 925ff8f feat: crew work
+
+=== THE ESCAPE: the worker clears it in one step and the rebase goes through
+
+$ bin/fm-crew-instructions.sh status
+  crew instruction overlay: installed in /private/var/folders/sr/jsglj1fs5dngwtr7d4jry7c40000gn/T/crew-overlay-evidence.sku6Ps/task-worktree
+  run 'bin/fm-crew-instructions.sh remove' to restore the committed files.
+
+$ bin/fm-crew-instructions.sh remove
+  removed the crew instruction overlay from /private/var/folders/sr/jsglj1fs5dngwtr7d4jry7c40000gn/T/crew-overlay-evidence.sku6Ps/task-worktree; the committed AGENTS.md and CLAUDE.md are restored.
+  you are still a crewmate: your launch brief governs, and you have no fleet.
+
+$ git status --porcelain    # clean
+  []
+
+$ git rebase main
+  Rebasing (1/1)Successfully rebased and updated refs/heads/fm/task-alpha.
+
+$ git log --oneline -2   # my commit rebased onto the moved main
+  1225fcc feat: crew work
+  700f033 docs: upstream AGENTS.md change
+
+$ bin/fm-crew-instructions.sh status    # honest after removal
+  crew instruction overlay: not installed in /private/var/folders/sr/jsglj1fs5dngwtr7d4jry7c40000gn/T/crew-overlay-evidence.sku6Ps/task-worktree
+
+=== RELAUNCH x2: neither in-progress instruction edit is destroyed
+
+$ relaunch #1 (spawn reinstalls the overlay over my uncommitted AGENTS.md edit)
+  warning: saved in-progress AGENTS.md to refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/1; restore it with: git checkout refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/1 -- AGENTS.md && git reset -q HEAD -- AGENTS.md
+
+$ relaunch #2
+  warning: saved in-progress AGENTS.md to refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/2; restore it with: git checkout refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/2 -- AGENTS.md && git reset -q HEAD -- AGENTS.md
+
+$ bin/fm-crew-instructions.sh saved   # BOTH relaunches are still here
+  saved instruction edits for task 'task-alpha' in /private/var/folders/sr/jsglj1fs5dngwtr7d4jry7c40000gn/T/crew-overlay-evidence.sku6Ps/task-worktree:
+    refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/1
+      working-tree instruction edits saved for task-alpha before the crew overlay
+      AGENTS.md: git checkout refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/1 -- AGENTS.md && git reset -q HEAD -- AGENTS.md
+    refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/2
+      working-tree instruction edits saved for task-alpha before the crew overlay
+      AGENTS.md: git checkout refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/2 -- AGENTS.md && git reset -q HEAD -- AGENTS.md
+
+$ bin/fm-crew-instructions.sh recover
+  restored AGENTS.md from refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/2 as an uncommitted modification in /private/var/folders/sr/jsglj1fs5dngwtr7d4jry7c40000gn/T/crew-overlay-evidence.sku6Ps/task-worktree.
+  the entry is kept, not consumed; restore it again with:
+    git checkout refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/2 -- AGENTS.md && git reset -q HEAD -- AGENTS.md
+  run 'bin/fm-crew-instructions.sh saved' to see this task's other entries.
+
+$ tail -1 AGENTS.md   # the newest saved edit is back on disk
+  SECOND IN-PROGRESS EDIT
+
+$ git show refs/fm-crew/task-alpha-a72eff0d82c2/instruction-wip/1:AGENTS.md | tail -1   # relaunch #1's edit, not overwritten
+  FIRST IN-PROGRESS EDIT
+
+=== OWNERSHIP: the pool's next occupant is refused, not handed my edits
+
+$ bin/fm-crew-instructions.sh recover   # run as task-beta, the slot reused
+  error: task 'task-beta' has no saved instruction edits in /private/var/folders/sr/jsglj1fs5dngwtr7d4jry7c40000gn/T/crew-overlay-evidence.sku6Ps/task-worktree.
+  looked for refs under refs/fm-crew/task-beta-b3794eb2fa60/instruction-wip/.
+  entries another task saved are deliberately not offered here.
+  (exit 1)
+
+=== TEARDOWN: scaffolding reads clean, a real edit still refuses
+
+$ git status --porcelain | fm_crew_filter_overlay_status   # what fm-teardown.sh reads, only the overlay present
+  []
+
+$ git status --porcelain | fm_crew_filter_overlay_status   # with a genuine worker edit on top
+   M AGENTS.md
+

@@ -1,0 +1,35 @@
+git version 2.50.1 (Apple Git-155)
+
+fatal: No current branch.
+One  invocation per (mechanism, shape). Does the overlay survive, and is
+the outcome consistent with what the command reported?
+
+### skip-worktree    / ff-agents-md-differs
+  merge rc:   1
+  merge says: error: Your local changes to the following files would be overwritten by merge:
+  AGENTS.md:  OVERLAY      -> overlay survived
+
+### skip-worktree    / nonff-agents-md-differs
+  merge rc:   2
+  merge says: error: Your local changes to the following files would be overwritten by merge:
+  AGENTS.md:  OVERLAY      -> overlay survived
+
+### assume-unchanged / ff-agents-md-differs
+  merge rc:   1
+  merge says: error: Your local changes to the following files would be overwritten by merge:
+  AGENTS.md:  OVERLAY      -> overlay survived
+
+### assume-unchanged / nonff-agents-md-differs
+  merge rc:   2
+  merge says: error: Your local changes to the following files would be overwritten by merge:
+  AGENTS.md:  committed    -> overlay DESTROYED
+
+### none             / ff-agents-md-differs
+  merge rc:   1
+  merge says: error: Your local changes to the following files would be overwritten by merge:
+  AGENTS.md:  OVERLAY      -> overlay survived
+
+### none             / nonff-agents-md-differs
+  merge rc:   2
+  merge says: error: Your local changes to the following files would be overwritten by merge:
+  AGENTS.md:  OVERLAY      -> overlay survived

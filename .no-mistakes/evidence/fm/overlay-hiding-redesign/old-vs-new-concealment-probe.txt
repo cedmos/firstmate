@@ -1,0 +1,19 @@
+git version 2.50.1 (Apple Git-155)
+
+### skip-worktree
+status:   []
+merge:    error: Your local changes to the following files would be overwritten by merge:
+stash:    No local changes to save
+stashed:  0 entry(ies)
+
+### assume-unchanged
+status:   []
+merge:    error: Your local changes to the following files would be overwritten by merge:
+stash:    No local changes to save
+stashed:  0 entry(ies)
+
+### none
+status:   [ M AGENTS.md]
+merge:    error: Your local changes to the following files would be overwritten by merge:
+stash:    Saved working directory and index state WIP on target: aaa328c base
+stashed:  1 entry(ies)

@@ -1,0 +1,10 @@
+### AFTER the fix (bin/fm-brief.sh at HEAD)
+ok - fm-brief.sh: the ship and scout fleet-command fences carve out this repository's own test suite
+
+### BEFORE the fix (bin/fm-brief.sh reverted to the parent commit 8e3a68e)
+not ok - ship brief fences the fleet commands with no test-suite carve-out: Do not run `bin/fm-session-start.sh`, `bin/fm-spawn.sh`, `bin/fm-brief.sh`, `tasks-axi add`, or any other fleet-management command.
+
+### restored; suite green again
+ok - fm-brief.sh: custom pause verb renders in every scaffold
+ok - fm-brief.sh: investigation and visual-review completions load the shared decision policy
+ok - fm-brief: scout and secondmate code paths still scaffold well-formed briefs
