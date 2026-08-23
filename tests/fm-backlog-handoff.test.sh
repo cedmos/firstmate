@@ -242,7 +242,7 @@ SH
 
 test_move_crash_keeps_wake_pending_for_recovery() {
   local home="$TMP_ROOT/move-crash-main" sub="$TMP_ROOT/move-crash-sub"
-  local fakebin="$TMP_ROOT/move-crash-fakebin" real_tasks rc=0
+  local fakebin="$TMP_ROOT/move-crash-fakebin" real_tasks rc=0 prepared_state
   setup_homes "$home" "$sub"
   mkdir -p "$sub/data" "$fakebin"
   cat > "$home/data/backlog.md" <<'EOF'
@@ -279,6 +279,23 @@ SH
   assert_grep 'crash-item' "$sub/data/backlog.md" "post-move crash did not leave the item durable"
   assert_present "$home/state/.backlog-handoff-design.wake-pending" \
     "post-move crash lost receiver wake intent"
+  prepared_state=$(cat "$home/state/.backlog-handoff-design.wake-pending")
+  cat > "$sub/data/backlog.md" <<'EOF'
+## Queued
+- [ ] crash-item - survive the post-move crash (repo: alpha)
+- [ ] unrelated-ready - already durable from another handoff (repo: alpha)
+
+## Done
+EOF
+  rc=0
+  FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design unrelated-ready \
+    > "$TMP_ROOT/move-crash-unrelated.out" 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || fail "unrelated handoff discarded a post-move prepared wake"
+  assert_contains "$(cat "$TMP_ROOT/move-crash-unrelated.out")" \
+    'belongs to a different routed batch' \
+    "unrelated handoff did not surface the unresolved prepared batch"
+  [ "$(cat "$home/state/.backlog-handoff-design.wake-pending")" = "$prepared_state" ] \
+    || fail "unrelated handoff changed the post-move prepared wake"
 
   : > "$TMP_ROOT/default-tmux.log"
   FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design crash-item \
@@ -337,15 +354,19 @@ SH
 
 ## Done
 EOF
+  rc=0
   FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design unrelated-ready \
-    > "$TMP_ROOT/pre-move-unrelated.out" 2>&1 \
-    || fail "unrelated already-present handoff failed: $(cat "$TMP_ROOT/pre-move-unrelated.out")"
+    > "$TMP_ROOT/pre-move-unrelated.out" 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || fail "unrelated handoff accepted another batch's prepared wake"
+  assert_contains "$(cat "$TMP_ROOT/pre-move-unrelated.out")" \
+    'belongs to a different routed batch' \
+    "unrelated handoff did not report the prepared batch conflict"
   [ ! -s "$TMP_ROOT/default-tmux.log" ] \
     || fail "unrelated already-present work promoted another batch's prepared wake"
   assert_grep 'pre-move-crash' "$home/data/backlog.md" \
     "unrelated handoff changed the prepared batch's source item"
-  assert_absent "$home/state/.backlog-handoff-design.wake-pending" \
-    "unrelated handoff retained another batch's prepared wake"
+  assert_present "$home/state/.backlog-handoff-design.wake-pending" \
+    "unrelated handoff discarded another batch's prepared wake"
 
   FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design pre-move-crash \
     > "$TMP_ROOT/pre-move-crash-retry.out" 2>&1 \

@@ -810,12 +810,15 @@ REQUESTED_BATCH=$(receiver_wake_batch_id "$@") || {
 }
 
 if [ "${#TO_MOVE[@]}" -eq 0 ]; then
-  echo "nothing to move: ${ALREADY[*]:-no keys} already present in $SUB_BACKLOG"
   WAKE_PENDING_MARKER="$STATE/.backlog-handoff-$ID.wake-pending"
   case "$(cat "$WAKE_PENDING_MARKER" 2>/dev/null || true)" in
     prepared:*:"$REQUESTED_BATCH") receiver_wake_promote_prepared "$ID" "$REQUESTED_BATCH" || exit 1 ;;
-    prepared:*) receiver_wake_discard_prepared "$ID" || exit 1 ;;
+    prepared:*)
+      echo "error: a prepared receiver wake for secondmate $ID belongs to a different routed batch; retry that original handoff before handling ${ALREADY[*]}" >&2
+      exit 1
+      ;;
   esac
+  echo "nothing to move: ${ALREADY[*]:-no keys} already present in $SUB_BACKLOG"
   wake_pending_secondmate_receiver "$ID" || exit 1
   exit 0
 fi
