@@ -35,11 +35,18 @@
 # file holds the overlay byte for byte, so a real edit stays visible as the
 # uncommitted work it is.
 #
-# In-progress instruction edits found at (re)launch move into git's own stash
-# rather than a private sidecar. The stash is a stack, so a second relaunch
-# adds an entry instead of destroying the first; refs/stash is shared ref space
-# that outlives this disposable worktree; and `git stash list` plus
-# `git stash pop` are recovery commands a worker already knows.
+# In-progress instruction edits found at (re)launch are saved as commit objects
+# under refs/fm-crew/<task-id>/instruction-wip/<n>, one ref per save.
+# The shared refs/stash stack is deliberately not the carrier: a stash entry
+# carries no owner identity, `git stash pop` is position-based, and refs/stash is
+# shared across every worktree of this repository including the primary checkout,
+# so a pooled slot's next occupant could pop a previous task's instruction edits
+# onto its own branch. A ref name carries the owning task id, is addressed by
+# name rather than by stack position, cannot be consumed by another task, and
+# lives in the common git dir, so it outlives this disposable worktree.
+# The owning task id is recorded in the worktree's own git dir, so
+# bin/fm-crew-instructions.sh restores only what this worktree's task saved and
+# refuses loudly, naming the ref namespace it looked in, when there is nothing.
 #
 # The install also writes a pre-commit guard refusing a commit that would land
 # the overlay over firstmate's own committed file. The guard lives in this
@@ -74,7 +81,16 @@ FM_CREW_AGENTS_WIP='.fm-agents-md-edit'
 FM_CREW_CLAUDE_WIP='.fm-claude-md-edit'
 FM_CREW_HOOKS_DIRNAME='fm-crew-hooks'
 FM_CREW_INSTRUCTION_FILES='AGENTS.md CLAUDE.md'
-FM_CREW_STASH_LABEL='fm-crew: in-progress instruction edits saved before the crew overlay'
+# Saved in-progress instruction edits live at
+# refs/fm-crew/<task-id>/instruction-wip/<n>. The second component is the owning
+# task, so an entry is addressed by owner and sequence rather than by position
+# in a stack every worktree of this repository shares.
+FM_CREW_WIP_REF_NAMESPACE='refs/fm-crew'
+FM_CREW_WIP_REF_LEAF='instruction-wip'
+# Names the task those refs belong to. It lives in this worktree's own git dir,
+# so the next occupant of a pooled slot overwrites it at install instead of
+# inheriting the previous task's identity.
+FM_CREW_OWNER_MARKER_NAME='fm-crew-instruction-owner'
 
 fm_crew_overlay_body() {
   cat <<'EOF'
@@ -109,8 +125,8 @@ If `git rebase`, `git merge`, `git checkout`, or `git cherry-pick` refuses becau
 Every remedy git names works here: `git stash`, or `git checkout HEAD -- AGENTS.md CLAUDE.md`.
 `bin/fm-crew-instructions.sh remove` does both files and the guard in one step.
 
-If `git stash list` shows an `fm-crew:` entry, in-progress instruction edits were saved there before this overlay was installed.
-Recover them with `git stash pop`.
+In-progress edits to these files found when this overlay was installed were saved as commits under this task's own `refs/fm-crew/<task-id>/instruction-wip/` refs, never on the shared `git stash` stack.
+Run `bin/fm-crew-instructions.sh saved` to list the entries this worktree's task owns, and `bin/fm-crew-instructions.sh recover` to restore the newest one.
 
 ## Maintaining this file
 
@@ -152,6 +168,19 @@ fm_crew_file_is_installed_overlay() {  # <worktree> <rel>
   expected=$(fm_crew_overlay_blob_hash "$wt" "$rel") || return 1
   disk=$(git -C "$wt" hash-object --no-filters -- "$wt/$rel" 2>/dev/null) || return 1
   [ "$expected" = "$disk" ]
+}
+
+# Return 0 only when <rel> holds the overlay AND that content differs from the
+# committed blob, so the overlay is a real installed modification.
+# Content equality alone cannot answer "is the overlay installed here": the
+# CLAUDE.md overlay is the canonical `@AGENTS.md` pointer, which is byte for byte
+# what this repository commits, so fm_crew_file_is_installed_overlay is true for
+# CLAUDE.md in every firstmate worktree whether an overlay was installed or not.
+# Reporting state to a worker goes through this predicate instead.
+fm_crew_file_is_overlay_modification() {  # <worktree> <rel>
+  local wt=$1 rel=$2
+  fm_crew_file_is_installed_overlay "$wt" "$rel" || return 1
+  fm_crew_file_differs_from_head "$wt" "$rel"
 }
 
 fm_checkout_is_firstmate_shaped() {  # <root>
@@ -231,10 +260,9 @@ fm_crew_unhide_file() {  # <worktree> <rel>
   return 1
 }
 
-# Clear the hiding bits before the work-in-progress scan, because `git stash`
-# saves nothing for a file git has been told to report as unchanged, so a
-# relaunch into such a worktree would otherwise overwrite an edit it believed it
-# had saved.
+# Clear the hiding bits before the work-in-progress scan, because a file git has
+# been told to report as unchanged reads as identical to the index, so a relaunch
+# into such a worktree would otherwise overwrite an edit it believed it had saved.
 fm_crew_unhide_instruction_files() {  # <worktree>
   local wt=$1 rel failed=0
   for rel in $FM_CREW_INSTRUCTION_FILES; do
@@ -244,26 +272,186 @@ fm_crew_unhide_instruction_files() {  # <worktree>
   [ "$failed" -eq 0 ]
 }
 
-# Move a worker's in-progress instruction edits into git's own stash before the
-# overlay replaces them, restoring the committed files in the same step.
-# A private sidecar file would be overwritten by the next relaunch and lost with
-# no error. The stash is a stack, so a second relaunch pushes a second entry and
-# the first survives; refs/stash is shared ref space, so the entry outlives this
-# disposable worktree; and recovery is `git stash list` plus `git stash pop`.
-# The pathspec keeps unrelated working-tree changes untouched.
-fm_crew_stash_instruction_wip() {  # <worktree>
-  local wt=$1 rel paths=
-  for rel in $FM_CREW_INSTRUCTION_FILES; do
-    fm_crew_instruction_has_wip "$wt" "$rel" || continue
-    paths="${paths:+$paths }$rel"
+# --- per-task saved instruction edits ---------------------------------------
+
+fm_crew_owner_marker_path() {  # <worktree>
+  local git_dir
+  git_dir=$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null) || return 1
+  [ -n "$git_dir" ] || return 1
+  printf '%s\n' "$git_dir/$FM_CREW_OWNER_MARKER_NAME"
+}
+
+fm_crew_read_owner() {  # <worktree>
+  local marker owner
+  marker=$(fm_crew_owner_marker_path "$1") || return 1
+  [ -f "$marker" ] || return 1
+  IFS= read -r owner < "$marker" || return 1
+  [ -n "$owner" ] || return 1
+  printf '%s\n' "$owner"
+}
+
+fm_crew_record_owner() {  # <worktree> <owner>
+  local marker
+  marker=$(fm_crew_owner_marker_path "$1") || return 1
+  printf '%s\n' "$2" > "$marker"
+}
+
+# The task that owns this worktree's saved instruction edits. An explicit id from
+# the caller wins and is recorded for the worker-facing CLI to read back.
+# A worktree that was never told one falls back to an identity derived from its
+# own git dir: still unambiguous, still never shared with another task.
+fm_crew_resolve_owner() {  # <worktree> [task-id]
+  local wt=$1 explicit=${2:-} owner git_dir
+  if [ -n "$explicit" ]; then
+    fm_crew_record_owner "$wt" "$explicit" || return 1
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  if owner=$(fm_crew_read_owner "$wt"); then
+    printf '%s\n' "$owner"
+    return 0
+  fi
+  git_dir=$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null) || return 1
+  [ -n "$git_dir" ] || return 1
+  owner="unowned-$(basename "$git_dir")"
+  fm_crew_record_owner "$wt" "$owner" || return 1
+  printf '%s\n' "$owner"
+}
+
+# The ref namespace <owner>'s saved instruction edits live under.
+# The owner is folded into a single legal ref path component, and git itself
+# rules on the result rather than this function guessing at git's ref grammar.
+fm_crew_wip_ref_base() {  # <worktree> <owner>
+  local wt=$1 owner=$2 slug base
+  [ -n "$owner" ] || return 1
+  slug=${owner//[^A-Za-z0-9._-]/-}
+  base="$FM_CREW_WIP_REF_NAMESPACE/$slug/$FM_CREW_WIP_REF_LEAF"
+  git -C "$wt" check-ref-format "$base/1" 2>/dev/null || return 1
+  printf '%s\n' "$base"
+}
+
+# Every entry <owner> saved, oldest first. Sorted on the numeric sequence rather
+# than lexically, so entry 10 does not sort between 1 and 2.
+fm_crew_list_wip_refs() {  # <worktree> <owner>
+  local wt=$1 owner=$2 base
+  base=$(fm_crew_wip_ref_base "$wt" "$owner") || return 1
+  git -C "$wt" for-each-ref --format='%(refname)' "$base/*" 2>/dev/null | sort -t/ -k5,5n
+}
+
+fm_crew_next_wip_ref() {  # <worktree> <owner>
+  local wt=$1 owner=$2 base n=1
+  base=$(fm_crew_wip_ref_base "$wt" "$owner") || return 1
+  while git -C "$wt" rev-parse --verify --quiet "$base/$n" >/dev/null 2>&1; do
+    n=$((n + 1))
   done
-  [ -n "$paths" ] || return 0
-  # shellcheck disable=SC2086
-  git -C "$wt" stash push --quiet -m "$FM_CREW_STASH_LABEL" -- $paths || {
-    echo "error: could not stash in-progress $paths before installing crew instructions; refusing to overwrite uncommitted work" >&2
+  printf '%s\n' "$base/$n"
+}
+
+# Return 0 when <ref> actually carries an edit to <rel> rather than the committed
+# content it was recorded against.
+fm_crew_ref_holds_edit() {  # <worktree> <ref> <rel>
+  local wt=$1 ref=$2 rel=$3 saved base
+  saved=$(git -C "$wt" rev-parse --verify --quiet "$ref:$rel" 2>/dev/null) || return 1
+  [ -n "$saved" ] || return 1
+  base=$(git -C "$wt" rev-parse --verify --quiet "$ref^:$rel" 2>/dev/null) || base=
+  [ "$saved" != "$base" ]
+}
+
+# Record <rel>=<blob> pairs as a commit whose tree is HEAD's with exactly those
+# paths replaced, and point a fresh per-task ref at it. Prints the ref.
+# `git stash create` is the obvious way to make such a commit and is the wrong
+# one here: it takes no pathspec, so it would fold every unrelated working-tree
+# change into the saved commit and then collide with those same changes on the
+# way back out. Building the tree in a temporary index carries the instruction
+# files and nothing else.
+# Nothing in the working tree is read except through git hash-object upstream of
+# this call, so saving one copy of a file can never overwrite another.
+fm_crew_store_wip_entry() {  # <worktree> <owner> <subject> <rel>=<blob>...
+  local wt=$1 owner=$2 subject=$3 ref head index tree commit pair rel blob
+  shift 3
+  [ "$#" -gt 0 ] || return 0
+  wt=$(CDPATH='' cd -- "$wt" && pwd -P) || return 1
+  head=$(git -C "$wt" rev-parse --verify --quiet HEAD) || head=
+  [ -n "$head" ] || {
+    echo "error: $wt has no HEAD commit to record in-progress instruction edits against" >&2
     return 1
   }
-  echo "warning: saved in-progress $paths to the git stash before installing crew instructions; recover with 'git stash list' then 'git stash pop'" >&2
+  ref=$(fm_crew_next_wip_ref "$wt" "$owner") || {
+    echo "error: task '$owner' does not yield a legal ref name for saved instruction edits in $wt" >&2
+    return 1
+  }
+  index=$(mktemp "$wt/.fm-crew-wip-index.XXXXXX") || {
+    echo "error: could not create a temporary index for the saved instruction edits in $wt" >&2
+    return 1
+  }
+  rm -f "$index"
+  if ! GIT_INDEX_FILE=$index git -C "$wt" read-tree "$head"; then
+    rm -f "$index"
+    echo "error: could not read $wt's HEAD tree while saving instruction edits" >&2
+    return 1
+  fi
+  for pair in "$@"; do
+    rel=${pair%%=*}
+    blob=${pair#*=}
+    if ! GIT_INDEX_FILE=$index git -C "$wt" update-index --add --cacheinfo "100644,$blob,$rel"; then
+      rm -f "$index"
+      echo "error: could not record the in-progress $rel in $wt" >&2
+      return 1
+    fi
+  done
+  tree=$(GIT_INDEX_FILE=$index git -C "$wt" write-tree) || tree=
+  rm -f "$index"
+  [ -n "$tree" ] || {
+    echo "error: could not write a tree for the saved instruction edits in $wt" >&2
+    return 1
+  }
+  commit=$(
+    GIT_AUTHOR_NAME=firstmate GIT_AUTHOR_EMAIL=firstmate@invalid \
+      GIT_COMMITTER_NAME=firstmate GIT_COMMITTER_EMAIL=firstmate@invalid \
+      git -C "$wt" commit-tree "$tree" -p "$head" -m "$subject"
+  ) || commit=
+  [ -n "$commit" ] || {
+    echo "error: could not commit the saved instruction edits in $wt" >&2
+    return 1
+  }
+  git -C "$wt" update-ref "$ref" "$commit" || {
+    echo "error: could not point $ref at the saved instruction edits in $wt" >&2
+    return 1
+  }
+  printf '%s\n' "$ref"
+}
+
+# Save a worker's in-progress instruction edits before the overlay replaces
+# them, restoring the committed files in the same step.
+# A private sidecar was overwritten by the next relaunch and lost with no error,
+# and the shared stash stack hands one task's entry to the next occupant of a
+# pooled slot; a fresh ref under this task's own namespace does neither.
+fm_crew_save_instruction_wip() {  # <worktree> <owner>
+  local wt=$1 owner=$2 rel blob paths='' pairs='' ref
+  for rel in $FM_CREW_INSTRUCTION_FILES; do
+    fm_crew_instruction_has_wip "$wt" "$rel" || continue
+    blob=$(git -C "$wt" hash-object -w --no-filters -- "$wt/$rel") || blob=
+    [ -n "$blob" ] || {
+      echo "error: could not record the in-progress $rel in $wt; refusing to overwrite uncommitted work" >&2
+      return 1
+    }
+    paths="${paths:+$paths }$rel"
+    pairs="${pairs:+$pairs }$rel=$blob"
+  done
+  [ -n "$pairs" ] || return 0
+  # shellcheck disable=SC2086
+  ref=$(fm_crew_store_wip_entry "$wt" "$owner" \
+    "in-progress instruction edits saved for $owner before the crew overlay" $pairs) || {
+    echo "error: could not save in-progress $paths in $wt; refusing to overwrite uncommitted work" >&2
+    return 1
+  }
+  for rel in $paths; do
+    git -C "$wt" checkout HEAD -- "$rel" || {
+      echo "error: could not restore the committed $rel in $wt after saving its edits to $ref" >&2
+      return 1
+    }
+  done
+  echo "warning: saved in-progress $paths to $ref; restore them with 'bin/fm-crew-instructions.sh recover'" >&2
 }
 
 # Print <worktree>'s porcelain status lines with the crew overlay's own
@@ -434,9 +622,9 @@ fm_crew_remove_commit_guard() {  # <worktree>
 # Only an instruction file still holding the overlay byte for byte is restored,
 # so a worker's own uncommitted edit is never discarded here.
 # A worktree left behind by the superseded mechanism is healed too: its hiding
-# bit is cleared first so the restore can land, and its sidecar is folded back
-# into the git stash rather than deleted, because it may be the only copy of an
-# edit that mechanism hid.
+# bit is cleared first so the restore can land, and its sidecar is folded into
+# this worktree's own saved instruction edits rather than deleted, because it may
+# be the only copy of an edit that mechanism hid.
 fm_remove_crew_worktree_instructions() {  # <worktree>
   local wt=${1:-} rel failed=0
   [ -n "$wt" ] && [ -d "$wt" ] || return 0
@@ -459,23 +647,32 @@ fm_remove_crew_worktree_instructions() {  # <worktree>
   [ "$failed" -eq 0 ]
 }
 
-# Fold any sidecar the superseded mechanism left into the git stash, then remove
-# it. Deleting it outright could destroy the only copy of an edit that mechanism
-# hid from git, and leaving it hands one worker's work to the next occupant of a
-# pooled slot.
+# Fold any sidecar the superseded mechanism left into this worktree's own saved
+# instruction edits, then remove it. Deleting it outright could destroy the only
+# copy of an edit that mechanism hid from git, and leaving it hands one worker's
+# work to the next occupant of a pooled slot.
+# The sidecar is hashed straight into git and recorded as its own entry, so the
+# instruction file on disk is never written here. A worker's live uncommitted
+# edit to the same path is therefore a separate, separately recoverable entry
+# instead of being overwritten by the sidecar on its way out.
 fm_crew_rescue_legacy_sidecars() {  # <worktree>
-  local wt=$1 rel dest failed=0
+  local wt=$1 rel dest blob ref owner='' failed=0
   for rel in $FM_CREW_INSTRUCTION_FILES; do
     case $rel in
       AGENTS.md) dest=$FM_CREW_AGENTS_WIP ;;
       *) dest=$FM_CREW_CLAUDE_WIP ;;
     esac
     [ -f "$wt/$dest" ] || continue
-    if cp "$wt/$dest" "$wt/$rel" &&
-      git -C "$wt" stash push --quiet -m "$FM_CREW_STASH_LABEL" -- "$rel"; then
-      echo "warning: recovered $dest into the git stash; run 'git stash list' then 'git stash pop' to restore those $rel edits" >&2
+    if [ -z "$owner" ] && ! owner=$(fm_crew_resolve_owner "$wt"); then
+      echo "error: could not determine which task owns $wt's saved instruction edits; refusing to fold $dest away" >&2
+      return 1
+    fi
+    blob=$(git -C "$wt" hash-object -w --no-filters -- "$wt/$dest") || blob=
+    if [ -n "$blob" ] && ref=$(fm_crew_store_wip_entry "$wt" "$owner" \
+      "$rel edits recovered for $owner from the superseded $dest sidecar" "$rel=$blob"); then
+      echo "warning: recovered $dest into $ref; list it with 'bin/fm-crew-instructions.sh saved'" >&2
     else
-      echo "error: could not recover the saved $dest in $wt into the git stash" >&2
+      echo "error: could not recover the saved $dest in $wt into this task's saved instruction edits" >&2
       failed=1
       continue
     fi
@@ -517,8 +714,10 @@ fm_crew_install_overlay_file() {  # <worktree> <rel>
 # No-op for a non-firstmate project or a secondmate home.
 # Refuses a primary checkout and any firstmate-shaped worktree whose AGENTS.md
 # is neither the firstmate identity nor an already-installed overlay.
-fm_install_crew_worktree_instructions() {  # <worktree>
-  local wt=${1:-} guidelines
+# <task-id> is the owner recorded for anything this install has to save, so the
+# worker-facing CLI restores only what this task saved.
+fm_install_crew_worktree_instructions() {  # <worktree> [task-id]
+  local wt=${1:-} task_id=${2:-} guidelines owner
   [ -n "$wt" ] && [ -d "$wt" ] || {
     echo "error: crew worktree instructions need a directory" >&2
     return 1
@@ -542,9 +741,13 @@ fm_install_crew_worktree_instructions() {  # <worktree>
     echo "error: firstmate-shaped worktree AGENTS.md has neither firstmate identity nor the crew overlay; refusing to launch with an unknown instruction file" >&2
     return 1
   fi
+  owner=$(fm_crew_resolve_owner "$wt" "$task_id") || {
+    echo "error: could not record which task owns the crew instruction overlay in $wt" >&2
+    return 1
+  }
   fm_crew_unhide_instruction_files "$wt" || return 1
+  fm_crew_save_instruction_wip "$wt" "$owner" || return 1
   fm_crew_rescue_legacy_sidecars "$wt" || return 1
-  fm_crew_stash_instruction_wip "$wt" || return 1
   fm_crew_install_overlay_file "$wt" AGENTS.md || return 1
   if [ -f "$wt/CLAUDE.md" ]; then
     fm_crew_install_overlay_file "$wt" CLAUDE.md || return 1

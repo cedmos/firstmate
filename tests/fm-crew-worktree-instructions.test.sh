@@ -12,14 +12,18 @@
 # asserted directly: a branch move onto a commit carrying a different AGENTS.md
 # stays escapable by the worker with the remedy git itself names, and a second
 # relaunch preserves the first relaunch's saved edits instead of destroying
-# them. Alongside those, a commit that would record the overlay over firstmate's
-# own file is refused, an edit made on top of the overlay is never dropped
-# silently, the cleanliness filter separates launch scaffolding from real
+# them. Saved edits are also proven to belong to the task that saved them: the
+# next occupant of a pooled slot cannot be handed or restore the previous task's
+# edits, and recovery with nothing of its own refuses loudly naming the refs it
+# searched. Alongside those, a commit that would record the overlay over
+# firstmate's own file is refused, an edit made on top of the overlay is never
+# dropped silently, the cleanliness filter separates launch scaffolding from real
 # uncommitted work, a pooled worktree can be reset onto a moved default branch
 # with the overlay still installed, a worktree left behind by the superseded
-# skip-worktree mechanism is healed without losing its sidelined edit, and the
-# brief-mandated bin/fm-ensure-agents-md.sh stays a no-op success in an overlaid
-# worktree.
+# skip-worktree mechanism is healed without losing either its sidelined edit or a
+# live one on the same path, the worker-facing status reports an overlay only
+# when one is really installed, and the brief-mandated bin/fm-ensure-agents-md.sh
+# stays a no-op success in an overlaid worktree.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -78,6 +82,14 @@ stash_count() {  # <worktree>
   git -C "$1" stash list | grep -c . || true
 }
 
+wip_ref_count() {  # <worktree> <owner>
+  fm_crew_list_wip_refs "$1" "$2" | grep -c . || true
+}
+
+saved_agents_md() {  # <worktree> <owner> <n>
+  git -C "$1" show "refs/fm-crew/$2/instruction-wip/$3:AGENTS.md" 2>&1
+}
+
 commit_all() {  # <worktree> <message>
   local wt=$1 msg=$2
   git -C "$wt" add -A >/dev/null 2>&1
@@ -104,11 +116,11 @@ make_linked_worktree() {  # <repo> <worktree>
   git -C "$repo" worktree add --quiet --detach "$worktree"
 }
 
-overlaid_worktree() {  # <repo> <worktree>
-  local repo=$1 wt=$2
+overlaid_worktree() {  # <repo> <worktree> [task-id]
+  local repo=$1 wt=$2 id=${3:-overlay-task-t1}
   make_firstmate_repo "$repo"
   make_linked_worktree "$repo" "$wt"
-  fm_install_crew_worktree_instructions "$wt" || fail "overlay install failed for $wt"
+  fm_install_crew_worktree_instructions "$wt" "$id" || fail "overlay install failed for $wt"
 }
 
 make_spawn_fakebin() {
@@ -169,44 +181,118 @@ test_overlay_is_idempotent() {
   pass "overlay install is idempotent"
 }
 
-test_dirty_agents_md_is_stashed_then_overlaid() {
+test_dirty_agents_md_is_saved_then_overlaid() {
   local repo wt
   repo="$TMP_ROOT/wip-repo"
   wt="$TMP_ROOT/wip-wt"
   make_firstmate_repo "$repo"
   make_linked_worktree "$repo" "$wt"
-  fm_install_crew_worktree_instructions "$wt" || fail "initial overlay failed"
+  fm_install_crew_worktree_instructions "$wt" 'wip-task-w1' || fail "initial overlay failed"
   git -C "$wt" checkout HEAD -- AGENTS.md
   printf '%s\n' 'worker edit to the real job description' >> "$wt/AGENTS.md"
-  fm_install_crew_worktree_instructions "$wt" 2>/dev/null || fail "overlay after dirty AGENTS.md failed"
-  expect_code 1 "$(stash_count "$wt")" "the in-progress AGENTS.md edit was not pushed to the git stash"
-  assert_contains "$(git -C "$wt" stash show -p 'stash@{0}')" 'worker edit to the real job description' \
-    "the stashed entry omitted the worker's AGENTS.md edit"
-  assert_corpus_is_crew "$wt" "after stashing dirty AGENTS.md"
-  pass "in-progress AGENTS.md edits go to the git stash, then the overlay is reinstalled"
+  fm_install_crew_worktree_instructions "$wt" 'wip-task-w1' 2>/dev/null \
+    || fail "overlay after dirty AGENTS.md failed"
+  expect_code 1 "$(wip_ref_count "$wt" 'wip-task-w1')" \
+    "the in-progress AGENTS.md edit was not saved under the task's own ref"
+  assert_contains "$(saved_agents_md "$wt" 'wip-task-w1' 1)" 'worker edit to the real job description' \
+    "the saved entry omitted the worker's AGENTS.md edit"
+  expect_code 0 "$(stash_count "$wt")" "the save reached for the shared stash stack instead of its own ref"
+  assert_corpus_is_crew "$wt" "after saving dirty AGENTS.md"
+  pass "in-progress AGENTS.md edits go to the task's own ref, then the overlay is reinstalled"
 }
 
 # The redesign's core claim: relaunching twice must not destroy the first
-# relaunch's saved edits. A private sidecar was cp-overwritten with no error;
-# the git stash is a stack, so both survive and both are recoverable.
+# relaunch's saved edits. A private sidecar was cp-overwritten with no error; a
+# fresh per-task ref per save leaves both entries independently addressable.
 test_two_relaunches_keep_both_saved_edits() {
   local repo wt
   repo="$TMP_ROOT/relaunch-repo"
   wt="$TMP_ROOT/relaunch-wt"
-  overlaid_worktree "$repo" "$wt"
+  overlaid_worktree "$repo" "$wt" 'relaunch-task-r1'
   git -C "$wt" checkout HEAD -- AGENTS.md
   printf '%s\n' 'EDIT E1 from the first incarnation' >> "$wt/AGENTS.md"
-  fm_install_crew_worktree_instructions "$wt" 2>/dev/null || fail "first relaunch overlay failed"
+  fm_install_crew_worktree_instructions "$wt" 'relaunch-task-r1' 2>/dev/null \
+    || fail "first relaunch overlay failed"
   git -C "$wt" checkout HEAD -- AGENTS.md
   printf '%s\n' 'EDIT E2 from the second incarnation' >> "$wt/AGENTS.md"
-  fm_install_crew_worktree_instructions "$wt" 2>/dev/null || fail "second relaunch overlay failed"
-  expect_code 2 "$(stash_count "$wt")" "two relaunches did not leave two recoverable stash entries"
-  assert_contains "$(git -C "$wt" stash show -p 'stash@{1}')" 'EDIT E1 from the first incarnation' \
+  fm_install_crew_worktree_instructions "$wt" 'relaunch-task-r1' 2>/dev/null \
+    || fail "second relaunch overlay failed"
+  expect_code 2 "$(wip_ref_count "$wt" 'relaunch-task-r1')" \
+    "two relaunches did not leave two recoverable entries"
+  assert_contains "$(saved_agents_md "$wt" 'relaunch-task-r1' 1)" 'EDIT E1 from the first incarnation' \
     "the second relaunch destroyed the first relaunch's saved edit"
-  assert_contains "$(git -C "$wt" stash show -p 'stash@{0}')" 'EDIT E2 from the second incarnation' \
+  assert_contains "$(saved_agents_md "$wt" 'relaunch-task-r1' 2)" 'EDIT E2 from the second incarnation' \
     "the second relaunch did not save its own edit"
+  assert_not_contains "$(saved_agents_md "$wt" 'relaunch-task-r1' 2)" 'EDIT E1 from the first incarnation' \
+    "the two saved entries are not independent of each other"
   assert_corpus_is_crew "$wt" "after two relaunches"
   pass "a second relaunch preserves the first relaunch's saved instruction edits"
+}
+
+# The carrier's whole point: an entry belongs to the task that saved it. A
+# pooled slot's next occupant must not be handed, offered, or able to restore
+# the previous task's instruction edits, and must be told so rather than
+# silently getting nothing.
+test_saved_edits_stay_with_the_task_that_saved_them() {
+  local repo wt out status
+  repo="$TMP_ROOT/owner-repo"
+  wt="$TMP_ROOT/owner-wt"
+  overlaid_worktree "$repo" "$wt" 'task-alpha-a1'
+  git -C "$wt" checkout HEAD -- AGENTS.md
+  printf '%s\n' 'EDIT OWNED BY TASK ALPHA' >> "$wt/AGENTS.md"
+  fm_install_crew_worktree_instructions "$wt" 'task-alpha-a1' 2>/dev/null \
+    || fail "task alpha's relaunch overlay failed"
+  assert_contains "$(saved_agents_md "$wt" 'task-alpha-a1' 1)" 'EDIT OWNED BY TASK ALPHA' \
+    "task alpha's edit was not saved under its own ref"
+  # The slot is returned to the pool and a later crew takes it.
+  fm_remove_crew_worktree_instructions "$wt" || fail "pooled removal failed"
+  fm_install_crew_worktree_instructions "$wt" 'task-beta-b2' || fail "the next occupant's overlay failed"
+  assert_not_contains "$(cat "$wt/AGENTS.md")" 'EDIT OWNED BY TASK ALPHA' \
+    "the next occupant was handed the previous task's instruction edits"
+  out=$("$CREW_INSTRUCTIONS" recover "$wt" 2>&1); status=$?
+  expect_code 1 "$status" "the next occupant must not be able to restore another task's edits: $out"
+  assert_contains "$out" 'task-beta-b2' "the refusal did not name the task it looked for"
+  assert_contains "$out" 'refs/fm-crew/task-beta-b2/instruction-wip' \
+    "the refusal did not name the ref namespace it searched"
+  assert_not_contains "$(cat "$wt/AGENTS.md")" 'EDIT OWNED BY TASK ALPHA' \
+    "the refused recovery still applied the previous task's edits"
+  assert_contains "$(saved_agents_md "$wt" 'task-alpha-a1' 1)" 'EDIT OWNED BY TASK ALPHA' \
+    "the next occupant destroyed the previous task's saved edit"
+  pass "saved instruction edits stay with their own task and the next occupant is refused loudly"
+}
+
+test_recover_restores_this_task_s_own_saved_edit() {
+  local repo wt out status
+  repo="$TMP_ROOT/recover-repo"
+  wt="$TMP_ROOT/recover-wt"
+  overlaid_worktree "$repo" "$wt" 'recover-task-c3'
+  git -C "$wt" checkout HEAD -- AGENTS.md
+  printf '%s\n' 'THE EDIT THE WORKER WANTS BACK' >> "$wt/AGENTS.md"
+  fm_install_crew_worktree_instructions "$wt" 'recover-task-c3' 2>/dev/null || fail "relaunch overlay failed"
+  out=$("$CREW_INSTRUCTIONS" saved "$wt" 2>&1); status=$?
+  expect_code 0 "$status" "saved must list this task's own entries: $out"
+  assert_contains "$out" 'refs/fm-crew/recover-task-c3/instruction-wip/1' \
+    "saved did not name the entry this task owns"
+  out=$("$CREW_INSTRUCTIONS" recover "$wt" 2>&1); status=$?
+  expect_code 0 "$status" "recovering this task's own saved edit must succeed: $out"
+  assert_contains "$(cat "$wt/AGENTS.md")" 'THE EDIT THE WORKER WANTS BACK' \
+    "recover did not restore the saved edit into the working tree"
+  assert_status_contains "$wt" " M AGENTS.md" "the recovered edit was left staged rather than uncommitted"
+  pass "recover restores this task's own saved instruction edit as an ordinary uncommitted change"
+}
+
+test_recover_refuses_loudly_when_this_task_saved_nothing() {
+  local repo wt out status
+  repo="$TMP_ROOT/norecover-repo"
+  wt="$TMP_ROOT/norecover-wt"
+  overlaid_worktree "$repo" "$wt" 'empty-task-e4'
+  out=$("$CREW_INSTRUCTIONS" recover "$wt" 2>&1); status=$?
+  expect_code 1 "$status" "recovery with nothing saved must refuse rather than do nothing: $out"
+  assert_contains "$out" 'refs/fm-crew/empty-task-e4/instruction-wip' \
+    "the refusal did not name what it looked for"
+  out=$("$CREW_INSTRUCTIONS" saved "$wt" 2>&1); status=$?
+  expect_code 1 "$status" "listing with nothing saved must refuse rather than print an empty list: $out"
+  pass "recovery refuses loudly, naming the refs it searched, when this task saved nothing"
 }
 
 # The other core claim: a branch move onto a commit carrying a different
@@ -233,6 +319,39 @@ test_branch_move_is_escapable_by_the_worker() {
   expect_code 0 "$status" "the branch move still fails after taking git's own advice: $out"
   assert_contains "$(cat "$wt/AGENTS.md")" 'Main moved on.' "the worktree did not move onto the new base"
   pass "a refused branch move is escapable with the remedy git itself names"
+}
+
+# The CLAUDE.md overlay is the canonical `@AGENTS.md` pointer, which is byte for
+# byte what this repository commits, so "does this file hold the overlay
+# content" is true for CLAUDE.md in every firstmate worktree. Reporting state on
+# that alone told a worker an overlay was installed when none was, including
+# right after a successful removal.
+test_crew_instructions_status_tracks_a_real_overlay() {
+  local repo wt out status
+  repo="$TMP_ROOT/status-repo"
+  wt="$TMP_ROOT/status-wt"
+  make_firstmate_repo "$repo"
+  make_linked_worktree "$repo" "$wt"
+  [ "$(git -C "$wt" hash-object -- "$wt/CLAUDE.md")" = "$(fm_crew_overlay_blob_hash "$wt" CLAUDE.md)" ] \
+    || fail "fixture no longer commits a CLAUDE.md identical to the overlay pointer, so this case is untested"
+  out=$("$CREW_INSTRUCTIONS" status "$wt" 2>&1); status=$?
+  expect_code 0 "$status" "status on a worktree with no overlay must succeed: $out"
+  assert_contains "$out" "overlay: not installed" \
+    "status reported an overlay in a worktree that has none"
+  out=$("$CREW_INSTRUCTIONS" remove "$wt" 2>&1); status=$?
+  expect_code 0 "$status" "removal with nothing installed must succeed: $out"
+  assert_contains "$out" "nothing to restore" "removal claimed it restored files it never touched"
+  fm_install_crew_worktree_instructions "$wt" 'status-task-s7' || fail "overlay install failed"
+  out=$("$CREW_INSTRUCTIONS" status "$wt" 2>&1)
+  assert_contains "$out" "overlay: installed" "status did not report a genuinely installed overlay"
+  out=$("$CREW_INSTRUCTIONS" remove "$wt" 2>&1); status=$?
+  expect_code 0 "$status" "removal of an installed overlay failed: $out"
+  assert_contains "$out" "removed the crew instruction overlay" \
+    "removal did not report restoring the committed files"
+  out=$("$CREW_INSTRUCTIONS" status "$wt" 2>&1)
+  assert_contains "$out" "overlay: not installed" \
+    "status still reported an overlay after a successful removal"
+  pass "status reports an overlay only when one is really installed"
 }
 
 test_crew_instructions_cli_clears_a_branch_move() {
@@ -507,20 +626,48 @@ test_a_worktree_left_by_the_superseded_mechanism_is_healed() {
   local repo wt
   repo="$TMP_ROOT/legacy-repo"
   wt="$TMP_ROOT/legacy-wt"
-  overlaid_worktree "$repo" "$wt"
+  overlaid_worktree "$repo" "$wt" 'legacy-task-l5'
   git -C "$wt" update-index --skip-worktree -- AGENTS.md \
     || fail "could not stage the superseded hidden state"
   printf '%s\n' 'work the superseded mechanism sidelined' > "$wt/.fm-agents-md-edit"
   fm_remove_crew_worktree_instructions "$wt" 2>/dev/null || fail "healing removal failed"
   assert_visible_to_git "$wt" AGENTS.md "healing left AGENTS.md hidden from git"
   assert_absent "$wt/.fm-agents-md-edit" "healing kept the previous task's sidecar for the next worker"
-  assert_contains "$(git -C "$wt" stash list)" 'fm-crew' \
-    "healing discarded the sidecar instead of recovering it into the git stash"
-  assert_contains "$(git -C "$wt" stash show -p 'stash@{0}')" 'work the superseded mechanism sidelined' \
-    "the recovered stash entry does not hold the sidelined edit"
+  expect_code 1 "$(wip_ref_count "$wt" 'legacy-task-l5')" \
+    "healing discarded the sidecar instead of recovering it into this task's saved edits"
+  assert_contains "$(saved_agents_md "$wt" 'legacy-task-l5' 1)" 'work the superseded mechanism sidelined' \
+    "the recovered entry does not hold the sidelined edit"
   assert_contains "$(cat "$wt/AGENTS.md")" "$IDENTITY_LINE" \
     "healing did not restore the committed AGENTS.md"
   pass "a worktree left by the superseded mechanism is healed without losing its sidelined edit"
+}
+
+# The sidecar rescue used to `cp` the sidecar over the instruction file with no
+# check on what that file held, so a worker's own live uncommitted edit was
+# overwritten and lost with exit 0 - the exact "an edit disappears with no
+# error" mode this redesign exists to remove. Both edits must survive as
+# separately recoverable entries, and neither may overwrite the other.
+test_a_live_edit_and_a_legacy_sidecar_both_survive_healing() {
+  local repo wt entries
+  repo="$TMP_ROOT/legacy-live-repo"
+  wt="$TMP_ROOT/legacy-live-wt"
+  overlaid_worktree "$repo" "$wt" 'legacy-live-task-l6'
+  git -C "$wt" checkout HEAD -- AGENTS.md
+  printf '%s\n' 'LIVE EDIT E2 the worker is making right now' >> "$wt/AGENTS.md"
+  printf '%s\n' 'SIDECAR EDIT E1 the superseded mechanism hid' > "$wt/.fm-agents-md-edit"
+  fm_install_crew_worktree_instructions "$wt" 'legacy-live-task-l6' 2>/dev/null \
+    || fail "relaunch over a live edit plus a legacy sidecar failed"
+  entries=$(wip_ref_count "$wt" 'legacy-live-task-l6')
+  expect_code 2 "$entries" "the live edit and the sidecar did not both survive as separate entries"
+  assert_contains "$(saved_agents_md "$wt" 'legacy-live-task-l6' 1)" 'LIVE EDIT E2 the worker is making right now' \
+    "the worker's live AGENTS.md edit was destroyed by the sidecar rescue"
+  assert_contains "$(saved_agents_md "$wt" 'legacy-live-task-l6' 2)" 'SIDECAR EDIT E1 the superseded mechanism hid' \
+    "the sidecar's edit was not recovered"
+  assert_not_contains "$(saved_agents_md "$wt" 'legacy-live-task-l6' 1)" 'SIDECAR EDIT E1 the superseded mechanism hid' \
+    "the sidecar overwrote the live edit instead of being saved beside it"
+  assert_absent "$wt/.fm-agents-md-edit" "the rescued sidecar was left for the next worker"
+  assert_corpus_is_crew "$wt" "after healing a worktree that also held a live edit"
+  pass "a live instruction edit and a legacy sidecar both survive healing as separate entries"
 }
 
 test_removal_lets_a_pooled_worktree_reset_onto_a_new_base() {
@@ -641,9 +788,13 @@ test_fleet_command_fence_carves_out_the_test_suite() {
 
 test_overlay_inverts_autoload_corpus
 test_overlay_is_idempotent
-test_dirty_agents_md_is_stashed_then_overlaid
+test_dirty_agents_md_is_saved_then_overlaid
 test_two_relaunches_keep_both_saved_edits
+test_saved_edits_stay_with_the_task_that_saved_them
+test_recover_restores_this_task_s_own_saved_edit
+test_recover_refuses_loudly_when_this_task_saved_nothing
 test_branch_move_is_escapable_by_the_worker
+test_crew_instructions_status_tracks_a_real_overlay
 test_crew_instructions_cli_clears_a_branch_move
 test_cleanliness_filter_separates_scaffolding_from_real_work
 test_fleet_command_fence_carves_out_the_test_suite
@@ -661,6 +812,7 @@ test_restored_agents_md_commits_the_edit
 test_ensure_agents_md_stays_a_no_op_after_overlay
 test_commit_keeps_the_overlay_out_of_the_commit
 test_a_worktree_left_by_the_superseded_mechanism_is_healed
+test_a_live_edit_and_a_legacy_sidecar_both_survive_healing
 test_removal_lets_a_pooled_worktree_reset_onto_a_new_base
 test_an_installed_overlay_does_not_wedge_a_pooled_reset
 test_spawn_overlays_firstmate_shaped_pool

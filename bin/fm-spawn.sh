@@ -148,8 +148,9 @@
 #   usable offline; a stale remote-tracking ref can therefore make an unpushed
 #   commit look contained, which is exactly why no remedy command is printed.
 #   The refresh first undoes any crew overlay the previous occupant of the slot
-#   left behind, because its skip-worktree bits are invisible to the clean
-#   check and would make `git reset --hard` fail for every later spawn.
+#   left behind, because that overlay is a visible modification the clean check
+#   would otherwise read as a dirty base, and because a slot left by the
+#   superseded skip-worktree mechanism still carries bits that check cannot see.
 #   After that refresh, a firstmate-repo ship or scout worktree gets crewmate
 #   project instructions installed over the auto-loaded AGENTS.md and CLAUDE.md
 #   so the harness cannot load the firstmate job description as that worker's
@@ -1806,9 +1807,12 @@ EOF
 
 freshen_spawn_worktree_base() {  # <worktree>
   local worktree=$1 default target expected actual status
-  # A pooled slot can come back still carrying a previous task's crew overlay:
-  # skip-worktree hides it from the clean check below and then wedges the
-  # reset. Undo it first so a returned slot self-heals however that task ended.
+  # A pooled slot can come back still carrying a previous task's crew overlay.
+  # It is a visible modification, so the clean check below sees it and reads
+  # launch scaffolding as a dirty base. Undo it first so a returned slot
+  # self-heals however that task ended, and so the check judges real work only.
+  # Removal also heals a slot left behind by the superseded skip-worktree
+  # mechanism, whose bits would still be invisible to that check.
   if ! fm_remove_crew_worktree_instructions "$worktree"; then
     echo "error: could not remove stale crew instructions from pooled worktree '$worktree'; refusing to launch from a base git cannot refresh" >&2
     return 1
@@ -2352,7 +2356,7 @@ if [ "$RELAUNCH" -eq 0 ] && [ "$KIND" != secondmate ]; then
   freshen_spawn_worktree_base "$WT" || exit 1
 fi
 if [ "$KIND" != secondmate ]; then
-  fm_install_crew_worktree_instructions "$WT" || exit 1
+  fm_install_crew_worktree_instructions "$WT" "$ID" || exit 1
 fi
 
 # Per-task temp root: /tmp/fm-<id>/ with Go's build temp nested at gotmp/. Go won't

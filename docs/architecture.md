@@ -212,13 +212,16 @@ The same concealment also hides a worker's genuine uncommitted instruction edit 
 Telling git the truth costs one visible modification and buys back every standard remedy, so git's own advice terminates, and `bin/fm-crew-instructions.sh` gives the worker a one-command removal as well.
 Consumers that must not read the overlay as unlanded work filter it through the library, which drops the modification only while the file holds the overlay byte for byte, so a real edit stays visible as the uncommitted work it is.
 
-In-progress instruction edits found at launch or relaunch move into git's own stash rather than a private sidecar.
-The stash is a stack, so a second relaunch adds an entry instead of destroying the first; `refs/stash` is shared ref space that outlives the disposable worktree; and recovery is the `git stash list` and `git stash pop` a worker already knows.
+In-progress instruction edits found at launch or relaunch are saved as commits under `refs/fm-crew/<task-id>/instruction-wip/<n>`, one ref per save, rather than in a private sidecar or on git's shared stash stack.
+A private sidecar was overwritten by the next relaunch and lost with no error, and a stash entry carries no owner identity while `git stash pop` is position-based, so a pooled slot's next occupant could pop a previous task's instruction edits onto its own branch.
+A ref name carries the owning task, is addressed by name rather than by stack position, cannot be consumed by another task or by the primary checkout, and lives in the common git dir, so each save survives a second relaunch and outlives the disposable worktree.
+The owning task id is recorded in the worktree's own git dir, so `bin/fm-crew-instructions.sh saved` and `recover` offer only what this worktree's task saved and refuse loudly, naming the ref namespace they searched, when it saved nothing.
 
 The install also adds a pre-commit guard, because `git add -A` stages the overlay like any other modification.
 The guard keeps commits ordinary rather than blocking them: an instruction file staged with exactly the overlay content is unstaged so the worker's own staged work still lands, and only a staged file that carries the overlay marker without being the overlay byte for byte is refused, because neither dropping nor keeping that mixture is safe to decide automatically.
 The guard lives in the worktree's own git dir and is selected by per-worktree `core.hooksPath`, so the primary's hooks never change.
-Removal is the same library's job and runs before every pooled-worktree refresh in `bin/fm-spawn.sh`, so a slot returned with the overlay still installed self-heals; it also heals a worktree left behind by the superseded mechanism, folding any sidecar it left into the git stash rather than deleting what may be the only copy of an edit that mechanism hid.
+Removal is the same library's job and runs before every pooled-worktree refresh in `bin/fm-spawn.sh`, so a slot returned with the overlay still installed self-heals; it also heals a worktree left behind by the superseded mechanism, folding any sidecar it left into that worktree's own saved instruction edits rather than deleting what may be the only copy of an edit that mechanism hid.
+The sidecar is hashed straight into git rather than written back over the instruction file, so a worker's live uncommitted edit to the same path survives as its own separately recoverable entry instead of being overwritten on the sidecar's way out.
 A secondmate home and a non-firstmate project are left unchanged, and the library refuses to overlay a primary checkout.
 `bin/fm-session-start.sh` separately refuses in the same linked firstmate worktree so a worker that still reaches for it cannot build a ghost home.
 `bin/fm-crew-worktree-instructions-lib.sh` owns the overlay, the session-start predicate, and the loud failure modes.

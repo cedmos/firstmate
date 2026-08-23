@@ -7,7 +7,7 @@ This record supports the active guarantee that the crew instruction overlay stay
 
 The overlay replaces `AGENTS.md` and `CLAUDE.md` in a linked firstmate-repo task worktree.
 Because those paths are tracked, the overlay is a divergence between the worktree and the index, and the only open question is whether git is told about it.
-The two checks below are why it is told: concealing the divergence wedges the worker with no working escape, and git's own stash is a safe place for the edits the overlay would otherwise overwrite.
+The checks below are why it is told, and where the edits the overlay would otherwise overwrite are kept: concealing the divergence wedges the worker with no working escape, and git's shared stash stack cannot say which task an entry belongs to.
 
 ## Concealing the overlay wedges every branch move, and both concealment bits do it
 
@@ -88,46 +88,104 @@ S AGENTS.md
 A restore attempted against that still-concealed entry fails with `error: pathspec 'AGENTS.md' did not match any file(s) known to git`.
 Removal therefore issues the two clears as separate invocations, which reports `H AGENTS.md` and lets `git checkout HEAD -- AGENTS.md` succeed.
 
-## The stash stacks, and its entries outlive the disposable worktree
+## Saved instruction edits belong to a task, so the stash is the wrong carrier
 
-This check ran on 2026-08-23 with git 2.50.1 (Apple Git-155).
-It supports storing in-progress instruction edits in the stash rather than a private sidecar: a second relaunch must not destroy the first relaunch's saved edits, and an entry must remain reachable after the task worktree is removed.
+This check ran on 2026-08-23 with git 2.50.1 (Apple Git-155) in a disposable scratch repository.
+It exists because git's own stash was proposed as the place to keep in-progress instruction edits the overlay would otherwise overwrite.
+It is the wrong place: a stash entry carries no owner identity, `git stash pop` takes whatever sits at `stash@{0}`, and `refs/stash` is one stack shared by every worktree of the repository including the primary checkout.
+The same script demonstrates the carrier that replaced it, a commit under `refs/fm-crew/<task-id>/instruction-wip/<n>`.
 
 The exact script run from this repository root was:
 
 ```bash
 set -eu
-PROBE="$PWD/.crew-stash-probe"
+git --version
+PROBE="$PWD/.crew-carrier-probe"
 rm -rf "$PROBE"; mkdir -p "$PROBE"; cd "$PROBE"
 git init -q -b main primary
 cd primary
 git config user.email probe@example.invalid; git config user.name probe
 printf 'committed\n' > AGENTS.md; git add -A; git commit -qm base
-git worktree add -q ../linked -b task
-cd ../linked
-printf 'EDIT E1\n' > AGENTS.md; git stash push -q -m 'fm-crew' -- AGENTS.md
-printf 'EDIT E2\n' > AGENTS.md; git stash push -q -m 'fm-crew' -- AGENTS.md
-printf 'stash list in the linked worktree:\n'; git stash list | sed 's/^/  /'
-printf 'E1 still present at stash@{1}: %s\n' "$(git stash show -p 'stash@{1}' | grep -c 'EDIT E1')"
-printf 'E2 present at stash@{0}:       %s\n' "$(git stash show -p 'stash@{0}' | grep -c 'EDIT E2')"
-printf 'same list read from the primary worktree:\n'; git -C ../primary stash list | sed 's/^/  /'
+git worktree add -q ../slot -b task
+
+printf '\n### refs/stash is one shared stack, and pop is position-addressed\n'
+cd ../slot
+printf 'TASK A EDIT\n' > AGENTS.md; git stash push -q -m 'fm-crew' -- AGENTS.md
+cd ../primary
+printf 'PRIMARY CHECKOUT EDIT\n' > AGENTS.md; git stash push -q -m 'unrelated primary work' -- AGENTS.md
+cd ../slot
+printf 'list read from the pooled slot:\n'; git stash list | sed 's/^/  /'
+git stash pop -q
+printf 'the slot popped stash@{0} onto its branch: %s\n' "$(head -1 AGENTS.md)"
+printf 'entries left after that pop: %s\n' "$(git stash list | grep -c . || true)"
+git checkout -q HEAD -- AGENTS.md; git stash clear
+
+printf '\n### a per-task ref is addressed by owner and sequence, never by position\n'
+save() {  # <owner> <content>
+  owner=$1; content=$2
+  blob=$(printf '%s\n' "$content" | git hash-object -w --stdin)
+  idx="$PWD/.probe-index"; rm -f "$idx"
+  GIT_INDEX_FILE=$idx git read-tree HEAD
+  GIT_INDEX_FILE=$idx git update-index --add --cacheinfo "100644,$blob,AGENTS.md"
+  tree=$(GIT_INDEX_FILE=$idx git write-tree); rm -f "$idx"
+  n=1; while git rev-parse --verify --quiet "refs/fm-crew/$owner/instruction-wip/$n" >/dev/null; do n=$((n+1)); done
+  git update-ref "refs/fm-crew/$owner/instruction-wip/$n" \
+    "$(git commit-tree "$tree" -p HEAD -m "saved for $owner")"
+  printf 'saved refs/fm-crew/%s/instruction-wip/%s\n' "$owner" "$n"
+}
+save task-alpha 'ALPHA EDIT 1'
+save task-alpha 'ALPHA EDIT 2'
+printf 'both alpha entries survive and stay distinct: %s | %s\n' \
+  "$(git show refs/fm-crew/task-alpha/instruction-wip/1:AGENTS.md)" \
+  "$(git show refs/fm-crew/task-alpha/instruction-wip/2:AGENTS.md)"
+printf 'the slot is reused by task-beta; entries task-beta owns: [%s]\n' \
+  "$(git for-each-ref --format='%(refname)' 'refs/fm-crew/task-beta/instruction-wip/*' | tr -d '\n')"
+
+printf '\n### the refs live in the common git dir and outlive the worktree\n'
+printf 'read from the primary:\n'; git -C ../primary for-each-ref --format='  %(refname)' refs/fm-crew/
+cd ../primary
+git worktree remove --force ../slot
+printf 'after the pooled worktree is removed:\n'; git for-each-ref --format='  %(refname)' refs/fm-crew/
+printf 'ALPHA EDIT 1 still readable: %s\n' "$(git show refs/fm-crew/task-alpha/instruction-wip/1:AGENTS.md)"
 cd ../..; rm -rf "$PROBE"
 ```
 
 Its exact output was:
 
 ```
-stash list in the linked worktree:
-  stash@{0}: On task: fm-crew
+git version 2.50.1 (Apple Git-155)
+
+### refs/stash is one shared stack, and pop is position-addressed
+list read from the pooled slot:
+  stash@{0}: On main: unrelated primary work
   stash@{1}: On task: fm-crew
-E1 still present at stash@{1}: 1
-E2 present at stash@{0}:       1
-same list read from the primary worktree:
-  stash@{0}: On task: fm-crew
-  stash@{1}: On task: fm-crew
+the slot popped stash@{0} onto its branch: PRIMARY CHECKOUT EDIT
+entries left after that pop: 1
+
+### a per-task ref is addressed by owner and sequence, never by position
+saved refs/fm-crew/task-alpha/instruction-wip/1
+saved refs/fm-crew/task-alpha/instruction-wip/2
+both alpha entries survive and stay distinct: ALPHA EDIT 1 | ALPHA EDIT 2
+the slot is reused by task-beta; entries task-beta owns: []
+
+### the refs live in the common git dir and outlive the worktree
+read from the primary:
+  refs/fm-crew/task-alpha/instruction-wip/1
+  refs/fm-crew/task-alpha/instruction-wip/2
+after the pooled worktree is removed:
+  refs/fm-crew/task-alpha/instruction-wip/1
+  refs/fm-crew/task-alpha/instruction-wip/2
+ALPHA EDIT 1 still readable: ALPHA EDIT 1
 ```
 
-The second push added an entry instead of replacing the first, and both entries are readable from the primary worktree, so `refs/stash` is shared rather than per-worktree state.
+The pooled slot's `git stash pop` applied the primary checkout's unrelated work onto the task branch and left the crew's own entry behind, which is the cross-contamination a shared position-addressed stack cannot avoid.
+The per-task refs hold the properties the stash cannot: two saves for one task stay distinct instead of overwriting each other, a later occupant of the same slot owns no entries at all so it has nothing to take, and both entries remain readable from the primary after the worktree is gone.
+
+`refs/stash` being shared rather than per-worktree state is visible in the first block, where the entry pushed from the primary is listed and then consumed from the linked worktree.
+
+Two properties here are asserted rather than shown by this script.
+Refusing loudly when a task owns no entry is a decision in `bin/fm-crew-instructions.sh`, not a git behavior, and it is covered by the colocated tests instead.
+Nothing prunes these refs, so a task's saved edits persist until someone deletes them deliberately; that is the intended trade, because the failure this replaces was work disappearing.
 
 ## Refreshing these facts
 
