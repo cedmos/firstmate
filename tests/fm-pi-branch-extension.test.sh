@@ -297,6 +297,8 @@ for (const command of [
   "FM_SUPERVISION_ACTOR=main bin/fm-pr-merge.sh task-x https://example.com/pr/1",
   "unset FM_SUPERVISION_ACTOR; bin/fm-pr-merge.sh task-x https://example.com/pr/1",
   "env FM_SUPERVISION_ACTOR=main bin/fm-pr-merge.sh task-x https://example.com/pr/1",
+  "env -u FM_SUPERVISION_ACTOR -u FM_LEASE_GENERATION -u FM_PI_BRANCH_GENERATION bash -c 'bin/fm-pr-merge.sh task-x https://example.com/pr/1'",
+  "env -u FM_SUPERVISION_ACTOR -u FM_LEASE_GENERATION -u FM_PI_BRANCH_GENERATION bash -c 'FM_SUPERVISION_ACTOR=main bin/fm-pr-merge.sh task-x https://example.com/pr/1'",
 ]) {
   const fenced = bashTool.__options.spawnHook({ command, cwd: realRoot, env: { ...process.env, PATH: process.env.PATH } });
   const attempt = spawnSync("bash", ["-c", fenced.command], { cwd: realRoot, encoding: "utf8", env: fenced.env });
@@ -304,6 +306,24 @@ for (const command of [
     throw new Error(`branch actor override escaped its authority fence (${attempt.status}): ${command}\n${attempt.stderr}`);
   }
 }
+const mainClaim = spawnSync("bash", ["bin/fm-lease.sh", "claim", "nested-release", "--actor", "main"], {
+  cwd: realRoot,
+  encoding: "utf8",
+  env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: `${home}/state`, FM_SUPERVISION_ACTOR: "main", FM_LEASE_HOLDER_PID: String(process.pid) },
+});
+if (mainClaim.status !== 0) throw new Error(`main lease fixture failed: ${mainClaim.stderr}`);
+const releaseCommand = "env -u FM_SUPERVISION_ACTOR -u FM_LEASE_GENERATION -u FM_PI_BRANCH_GENERATION bash -c 'bin/fm-lease.sh release nested-release --actor main'";
+const fencedRelease = bashTool.__options.spawnHook({ command: releaseCommand, cwd: realRoot, env: { ...process.env, PATH: process.env.PATH } });
+const releaseAttempt = spawnSync("bash", ["-c", fencedRelease.command], { cwd: realRoot, encoding: "utf8", env: fencedRelease.env });
+if (releaseAttempt.status !== 6 || !/cannot release the main actor's lease/.test(releaseAttempt.stderr)) {
+  throw new Error(`nested branch process escaped lease-release authorization (${releaseAttempt.status}): ${releaseAttempt.stderr}`);
+}
+const retained = spawnSync("bash", ["bin/fm-lease.sh", "check", "nested-release"], {
+  cwd: realRoot,
+  encoding: "utf8",
+  env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: `${home}/state` },
+});
+if (retained.status !== 0) throw new Error("nested branch release removed main's lease");
 
 // 3. Shared per-home prompt_cache_key: overrides only payloads that already
 // carry one, stable within the home.
