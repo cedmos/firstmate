@@ -237,6 +237,8 @@ export default function (pi: ExtensionAPI) {
   let activeWake: { reportedWakeSequences: Set<number>; mergedWakeSequences: Set<number> } | null = null;
   let activeBranchTools = 0;
   let branchToolWaiters: Array<() => void> = [];
+  const mergedOutcomeSequences = new Set<number>();
+  const receiptedOutcomeSequences = new Set<number>();
   // Serializes branch work: mirror appends and wake turns run strictly in
   // dispatch order, one at a time (the branch runs drain -> handle -> ack
   // serially by design).
@@ -343,7 +345,9 @@ export default function (pi: ExtensionAPI) {
       if (typeof seq === "number" && Number.isInteger(seq) && seq > 0) delivered.add(seq);
     }
     for (const seq of [...delivered].sort((a, b) => a - b)) {
-      runOutcomeScript(["mark-delivered", "--seq", String(seq)]);
+      if (receiptedOutcomeSequences.has(seq)) continue;
+      const marked = runOutcomeScript(["mark-delivered", "--seq", String(seq)]);
+      if (marked.ok) receiptedOutcomeSequences.add(seq);
     }
   }
 
@@ -402,7 +406,7 @@ export default function (pi: ExtensionAPI) {
         wakeState.reportedWakeSequences.add(wakeSequence);
       }
       const verdict = verdictRaw as Verdict;
-      const appendArgs = ["append", "--task", task, "--verdict", verdict, "--summary", summary];
+      const appendArgs = ["append", "--task", task, "--verdict", verdict, "--summary", summary, "--result-record"];
       if (wake) appendArgs.push("--wake", wake);
       if (wakeSequence !== null) appendArgs.push("--wake-seq", String(wakeSequence));
       beginBranchTool();
@@ -416,10 +420,44 @@ export default function (pi: ExtensionAPI) {
             isError: true,
           };
         }
-        mergeIntoMain(appended.stdout, task, verdict, summary);
+        const separator = appended.stdout.indexOf("\t");
+        const status = separator > 0 ? appended.stdout.slice(0, separator) : "";
+        let stored: { seq?: unknown; task?: unknown; verdict?: unknown; summary?: unknown };
+        try {
+          stored = JSON.parse(separator > 0 ? appended.stdout.slice(separator + 1) : "") as typeof stored;
+        } catch {
+          if (wakeState && wakeSequence !== null) wakeState.reportedWakeSequences.delete(wakeSequence);
+          return {
+            content: [{ type: "text", text: "outcome store returned an invalid append result" }],
+            details: undefined,
+            isError: true,
+          };
+        }
+        const storedSeq = typeof stored.seq === "number" && Number.isInteger(stored.seq) ? stored.seq : 0;
+        const storedTask = typeof stored.task === "string" ? stored.task : "";
+        const storedVerdict = stored.verdict === "routine" || stored.verdict === "captain" ? stored.verdict : null;
+        const storedSummary = typeof stored.summary === "string" ? stored.summary : "";
+        if (
+          !storedSeq ||
+          !storedTask ||
+          !storedVerdict ||
+          !storedSummary ||
+          !["new", "existing-unread", "existing-delivered"].includes(status)
+        ) {
+          if (wakeState && wakeSequence !== null) wakeState.reportedWakeSequences.delete(wakeSequence);
+          return {
+            content: [{ type: "text", text: "outcome store returned an invalid append result" }],
+            details: undefined,
+            isError: true,
+          };
+        }
+        if (status !== "existing-delivered" && !mergedOutcomeSequences.has(storedSeq)) {
+          mergeIntoMain(String(storedSeq), storedTask, storedVerdict, storedSummary);
+          mergedOutcomeSequences.add(storedSeq);
+        }
         if (wakeState && wakeSequence !== null) wakeState.mergedWakeSequences.add(wakeSequence);
         return {
-          content: [{ type: "text", text: `recorded seq ${appended.stdout} and merged [${verdict}] into main` }],
+          content: [{ type: "text", text: `recorded seq ${storedSeq} and merged [${storedVerdict}] into main` }],
           details: undefined,
         };
       } finally {

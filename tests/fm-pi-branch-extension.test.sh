@@ -387,6 +387,25 @@ await settle(
   "reported wake completion",
 );
 if (mainUserMessages.length !== 0) throw new Error("durably reported wake fell back to main");
+if (!dispatch("signal: redelivered wake row").accepted) throw new Error("redelivered wake was not accepted");
+await settle(() => (globalThis.__fmPrompts ?? []).length === 2, "redelivered wake prompt");
+const reused = await report.execute("call-reused", {
+  task: "task-9",
+  verdict: "captain",
+  summary: "must not replace the original outcome",
+  wakeSequence: 1,
+}, undefined, undefined, {});
+if (reused.isError) throw new Error(`existing wake outcome was not reusable: ${JSON.stringify(reused)}`);
+if (sentToMain.length !== 3) throw new Error("existing wake outcome produced another main merge");
+if (readFileSync(`${home}/state/branch-outcomes.jsonl`, "utf8").trim().split("\n").length !== 3) {
+  throw new Error("existing wake outcome appended another durable row");
+}
+writeFileSync(`${home}/state/branch-ack-receipts/receipt-reused`, "1\n");
+session.resolvePrompt();
+await settle(
+  () => !readdirSync(`${home}/state/branch-pending-wakes`).some((name) => name.endsWith(".json")),
+  "reused wake completion",
+);
 process.exit(0);
 EOF
   )

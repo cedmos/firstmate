@@ -26,8 +26,10 @@
 #
 # Usage:
 #   fm-branch-outcome.sh append --task <id> --verdict routine|captain \
-#       --summary <text> [--wake <text>] [--wake-seq <n>]
-#     Append one outcome record; prints the assigned seq.
+#       --summary <text> [--wake <text>] [--wake-seq <n>] [--result-record]
+#     Append one outcome record; prints the assigned seq. A positive wake-seq
+#     is idempotent and returns the existing record instead of appending again.
+#     --result-record prints status<TAB>record for the branch adapter.
 #   fm-branch-outcome.sh unread
 #     Print every unread record (raw JSONL). Exit 0 with no output when none.
 #   fm-branch-outcome.sh mark-read --through <seq>
@@ -52,7 +54,7 @@ DELIVERED_DIR="$STATE/branch-outcomes-delivered"
 LOCK="$STATE/.branch-outcomes.lock"
 
 usage() {
-  echo "usage: fm-branch-outcome.sh append --task <id> --verdict routine|captain --summary <text> [--wake <text>] [--wake-seq <n>] | unread | mark-read --through <seq> | mark-delivered --seq <seq> | list [--recent <n>] | startup-replay | startup-replay-ack --through <seq>" >&2
+  echo "usage: fm-branch-outcome.sh append --task <id> --verdict routine|captain --summary <text> [--wake <text>] [--wake-seq <n>] [--result-record] | unread | mark-read --through <seq> | mark-delivered --seq <seq> | list [--recent <n>] | startup-replay | startup-replay-ack --through <seq>" >&2
   exit 2
 }
 
@@ -140,6 +142,7 @@ case "$CMD" in
     SUMMARY=''
     WAKE=''
     WAKE_SEQ=0
+    RESULT_RECORD=0
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --task) TASK=${2:-}; shift 2 || usage ;;
@@ -147,6 +150,7 @@ case "$CMD" in
         --summary) SUMMARY=${2:-}; shift 2 || usage ;;
         --wake) WAKE=${2:-}; shift 2 || usage ;;
         --wake-seq) WAKE_SEQ=${2:-}; shift 2 || usage ;;
+        --result-record) RESULT_RECORD=1; shift ;;
         *) usage ;;
       esac
     done
@@ -155,12 +159,36 @@ case "$CMD" in
     case "$WAKE_SEQ" in ''|*[!0-9]*) usage ;; esac
     case "$VERDICT" in routine|captain) ;; *) usage ;; esac
     fm_lock_acquire_wait "$LOCK"
+    EXISTING_LINE=
+    if [ "$WAKE_SEQ" -gt 0 ] && [ -s "$STORE" ]; then
+      EXISTING_LINE=$(grep -m 1 '"wake_seq":'"$WAKE_SEQ"',' "$STORE" 2>/dev/null || true)
+    fi
+    if [ -n "$EXISTING_LINE" ]; then
+      SEQ=$(record_seq "$EXISTING_LINE")
+      CURSOR_VALUE=$(read_cursor)
+      STATUS=existing-unread
+      if [ "$SEQ" -le "$CURSOR_VALUE" ] || [ -f "$DELIVERED_DIR/$SEQ" ]; then
+        STATUS=existing-delivered
+      fi
+      fm_lock_release "$LOCK"
+      if [ "$RESULT_RECORD" -eq 1 ]; then
+        printf '%s\t%s\n' "$STATUS" "$EXISTING_LINE"
+      else
+        printf '%s\n' "$SEQ"
+      fi
+      exit 0
+    fi
     SEQ=$(( $(last_seq) + 1 ))
-    printf '{"seq":%s,"wake_seq":%s,"epoch":%s,"task":"%s","wake":"%s","verdict":"%s","summary":"%s"}\n' \
+    LINE=$(printf '{"seq":%s,"wake_seq":%s,"epoch":%s,"task":"%s","wake":"%s","verdict":"%s","summary":"%s"}' \
       "$SEQ" "$WAKE_SEQ" "$(date +%s)" "$(json_escape "$TASK")" "$(json_escape "$WAKE")" \
-      "$VERDICT" "$(json_escape "$SUMMARY")" >> "$STORE"
+      "$VERDICT" "$(json_escape "$SUMMARY")")
+    printf '%s\n' "$LINE" >> "$STORE"
     fm_lock_release "$LOCK"
-    printf '%s\n' "$SEQ"
+    if [ "$RESULT_RECORD" -eq 1 ]; then
+      printf 'new\t%s\n' "$LINE"
+    else
+      printf '%s\n' "$SEQ"
+    fi
     ;;
   unread)
     [ "$#" -eq 0 ] || usage

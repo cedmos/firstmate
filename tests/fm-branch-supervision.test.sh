@@ -111,6 +111,24 @@ PY
   pass "outcome store is append-only with cursor-based unread reads and acknowledged startup replay"
 }
 
+test_outcome_append_is_idempotent_per_wake_sequence() {
+  local home first second
+  home="$TMP_ROOT/outcome-idempotency-home"
+  mkdir -p "$home/state"
+  first=$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append \
+    --task task-5 --verdict captain --summary original --wake-seq 5) \
+    || fail "first wake outcome append failed"
+  second=$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append \
+    --task task-5 --verdict routine --summary duplicate --wake-seq 5) \
+    || fail "duplicate wake outcome append failed"
+  [ "$first" = "$second" ] || fail "duplicate wake sequence returned a different outcome"
+  [ "$(wc -l < "$home/state/branch-outcomes.jsonl" | tr -d ' ')" = 1 ] \
+    || fail "duplicate wake sequence appended another durable outcome"
+  assert_contains "$(cat "$home/state/branch-outcomes.jsonl")" '"summary":"original"' \
+    "duplicate wake sequence replaced the original outcome"
+  pass "outcome append is durable-idempotent for positive wake sequences"
+}
+
 test_outcome_delivery_cursor_requires_contiguous_delivery() {
   local home replay
   home="$TMP_ROOT/delivery-cursor-home"
@@ -406,6 +424,7 @@ SH
 
 test_branch_prompt_is_byte_stable_and_above_cache_floor
 test_outcome_store_is_append_only_with_cursor_reads
+test_outcome_append_is_idempotent_per_wake_sequence
 test_outcome_delivery_cursor_requires_contiguous_delivery
 test_branch_ack_requires_every_presented_outcome
 test_lease_exclusivity_release_stale_and_sweep
