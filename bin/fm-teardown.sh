@@ -259,34 +259,44 @@ handoff_wake_retire_validate() {
   value=$(cat "$marker" 2>/dev/null || true)
   case "$value" in
     pending|confirmed) ;;
-    prepared:*|pending:*|confirmed:*)
+    prepared:*)
+      corr=${value#prepared:}
+      corr=${corr%%:*}
+      printf '%s' "$value" | grep -Eq '^prepared:[a-f0-9]{16}:[a-f0-9]{16}$' || {
+        echo "REFUSED: receiver wake state for secondmate $ID is invalid" >&2
+        return 1
+      }
+      ;;
+    pending:*|confirmed:*)
       corr=${value#*:}
       printf '%s' "$corr" | grep -Eq '^[a-f0-9]{16}$' || {
         echo "REFUSED: receiver wake state for secondmate $ID is invalid" >&2
         return 1
       }
-      rec=$(fm_pending_reply_path "$STATE" "$corr")
-      if [ -e "$rec" ] || [ -L "$rec" ]; then
-        [ -f "$rec" ] && [ ! -L "$rec" ] \
-          && [ "$(fm_pending_reply_get "$rec" task_id)" = "$ID" ] || {
-          echo "REFUSED: receiver wake correlation for secondmate $ID is unsafe or belongs to another task" >&2
-          return 1
-        }
-      fi
-      confirmation=$(fm_pending_reply_delivery_confirmation_path "$STATE" "$corr")
-      if [ -e "$confirmation" ] || [ -L "$confirmation" ]; then
-        [ -f "$confirmation" ] && [ ! -L "$confirmation" ] || {
-          echo "REFUSED: receiver wake delivery state for secondmate $ID is unsafe" >&2
-          return 1
-        }
-      fi
-      HANDOFF_WAKE_RETIRE_CORR=$corr
       ;;
     *)
       echo "REFUSED: receiver wake state for secondmate $ID is invalid" >&2
       return 1
       ;;
   esac
+  if [ -n "$corr" ]; then
+    rec=$(fm_pending_reply_path "$STATE" "$corr")
+    if [ -e "$rec" ] || [ -L "$rec" ]; then
+      [ -f "$rec" ] && [ ! -L "$rec" ] \
+        && [ "$(fm_pending_reply_get "$rec" task_id)" = "$ID" ] || {
+        echo "REFUSED: receiver wake correlation for secondmate $ID is unsafe or belongs to another task" >&2
+        return 1
+      }
+    fi
+    confirmation=$(fm_pending_reply_delivery_confirmation_path "$STATE" "$corr")
+    if [ -e "$confirmation" ] || [ -L "$confirmation" ]; then
+      [ -f "$confirmation" ] && [ ! -L "$confirmation" ] || {
+        echo "REFUSED: receiver wake delivery state for secondmate $ID is unsafe" >&2
+        return 1
+      }
+    fi
+    HANDOFF_WAKE_RETIRE_CORR=$corr
+  fi
   HANDOFF_WAKE_RETIRE_MARKER=$marker
   HANDOFF_WAKE_RETIRE_VALUE=$value
 }
@@ -2636,8 +2646,8 @@ if [ "$BACKEND" = herdr ]; then
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
-  remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit $?
   handoff_wake_retire || { echo "error: receiver wake cleanup failed; preserving the secondmate route for retry" >&2; exit 1; }
+  remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit $?
   remove_secondmate_registry_entry "$ID"
 fi
 remove_grok_turnend_auth "$STATE" "$ID" || exit 1

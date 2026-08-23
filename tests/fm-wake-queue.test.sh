@@ -317,6 +317,43 @@ SH
   pass "foreign secondmate queue stalls notify once, remain byte-stable, and stay quiet when empty or healthy"
 }
 
+test_secondmate_stall_marker_rejects_symlink() {
+  local dir state sub fakebin marker outside expected
+  dir=$(make_case secondmate-stall-marker-symlink)
+  state="$dir/state"
+  sub="$dir/secondmate"
+  mkdir -p "$sub/state"
+  printf 'mate\n' > "$sub/.fm-secondmate-home"
+  printf 'window=firstmate:fm-mate\nkind=secondmate\nhome=%s\n' "$sub" > "$state/mate.meta"
+  printf '%s\t7\tcheck\trouted\tcheck: routed row\n' "$(( $(date +%s) - 10 ))" > "$sub/state/.wake-queue"
+  outside="$dir/outside"
+  expected='must remain unchanged'
+  printf '%s\n' "$expected" > "$outside"
+  marker="$state/.secondmate-wake-stall-mate"
+  ln -s "$outside" "$marker"
+  fakebin="$dir/fakebin"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-windows) printf '%s\n' 'firstmate:fm-mate' ;;
+  capture-pane) : ;;
+  display-message) printf '0\n' ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$fakebin/tmux"
+
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_SECONDMATE_WAKE_STALL_SECS=1 FM_POLL=1 \
+    FM_SIGNAL_GRACE=0 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 2 \
+    > "$dir/watch.out" 2> "$dir/watch.err" || true
+  [ "$(cat "$outside")" = "$expected" ] || fail "stall marker write followed an unsafe symlink"
+  [ -L "$marker" ] || fail "stall marker write replaced rather than rejected an unsafe path"
+  [ ! -s "$state/.wake-queue" ] || fail "unsafe stall marker path still published a parent notification"
+  pass "secondmate stall markers reject symlinks without touching their targets"
+}
+
 test_acknowledged_stall_publication_survives_pre_marker_crash() {
   local dir state sub fakebin out epoch row_before
   dir=$(make_case secondmate-stall-crash)
@@ -959,6 +996,7 @@ test_historical_annotation_skips_announced_status() {
 
 test_self_held_lock_reclaims_instead_of_deadlocking
 test_secondmate_foreign_queue_stall_is_one_shot_and_read_only
+test_secondmate_stall_marker_rejects_symlink
 test_acknowledged_stall_publication_survives_pre_marker_crash
 test_empty_prefix_mate_preserves_other_mate_receipt
 test_self_announced_append_guards

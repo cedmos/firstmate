@@ -316,14 +316,25 @@ warn_stale_public_commitments() { # <secondmate-id> <moved-key>...
 # verified submit and failure semantics. A seeded but not-yet-spawned home is a
 # valid handoff destination, but its missing endpoint is reported rather than
 # pretending the task was started.
+receiver_wake_batch_id() { # <item-key>...
+  local digest
+  if command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s\n' "$@" | LC_ALL=C sort | shasum -a 256 2>/dev/null | awk '{print $1}')
+  else
+    digest=$(printf '%s\n' "$@" | LC_ALL=C sort | sha256sum 2>/dev/null | awk '{print $1}')
+  fi
+  printf '%s' "$digest" | grep -Eq '^[a-f0-9]{64}$' || return 1
+  printf '%s' "${digest:0:16}"
+}
+
 receiver_wake_state_write() { # <secondmate-id> <state>
   local id=$1 value=$2 marker="$STATE/.backlog-handoff-$1.wake-pending" tmp
   case "$id" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
   case "$value" in
     pending|confirmed) ;;
-    prepared:[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) ;;
-    pending:[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) ;;
-    confirmed:[a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9][a-f0-9]) ;;
+    prepared:*) printf '%s' "$value" | grep -Eq '^prepared:[a-f0-9]{16}:[a-f0-9]{16}$' || return 1 ;;
+    pending:*) printf '%s' "$value" | grep -Eq '^pending:[a-f0-9]{16}$' || return 1 ;;
+    confirmed:*) printf '%s' "$value" | grep -Eq '^confirmed:[a-f0-9]{16}$' || return 1 ;;
     *) return 1 ;;
   esac
   tmp=$(umask 077; mktemp "$STATE/.backlog-handoff-wake.XXXXXX") || return 1
@@ -333,8 +344,9 @@ receiver_wake_state_write() { # <secondmate-id> <state>
   fi
 }
 
-receiver_wake_mark() { # <secondmate-id> <prepared|pending>
-  local id=$1 wake_phase=$2 marker="$STATE/.backlog-handoff-$1.wake-pending" value corr rec
+receiver_wake_mark() { # <secondmate-id> <prepared|pending> [batch-id]
+  local id=$1 wake_phase=$2 batch=${3:-} marker="$STATE/.backlog-handoff-$1.wake-pending" value corr rec
+  local wake_state
   case "$wake_phase" in prepared|pending) ;; *) return 1 ;; esac
   if [ -e "$marker" ] || [ -L "$marker" ]; then
     [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
@@ -342,6 +354,7 @@ receiver_wake_mark() { # <secondmate-id> <prepared|pending>
     case "$value" in
       prepared:*|pending:*)
         corr=${value#*:}
+        corr=${corr%%:*}
         rec=$(fm_pending_reply_path "$STATE" "$corr")
         [ -f "$rec" ] && [ ! -L "$rec" ] \
           && [ "$(fm_pending_reply_get "$rec" task_id)" = "$id" ]
@@ -352,7 +365,12 @@ receiver_wake_mark() { # <secondmate-id> <prepared|pending>
     esac
   fi
   corr=$(fm_pending_reply_create "$FM_HOME" "$STATE" "$id" "$RECEIVER_WAKE_MESSAGE") || return 1
-  if ! receiver_wake_state_write "$id" "$wake_phase:$corr"; then
+  wake_state="$wake_phase:$corr"
+  if [ "$wake_phase" = prepared ]; then
+    printf '%s' "$batch" | grep -Eq '^[a-f0-9]{16}$' || return 1
+    wake_state="$wake_state:$batch"
+  fi
+  if ! receiver_wake_state_write "$id" "$wake_state"; then
     fm_pending_reply_discard_undelivered "$STATE" "$corr" || true
     return 1
   fi
@@ -362,8 +380,8 @@ receiver_wake_mark_pending() { # <secondmate-id>
   receiver_wake_mark "$1" pending
 }
 
-receiver_wake_mark_prepared() { # <secondmate-id>
-  receiver_wake_mark "$1" prepared
+receiver_wake_mark_prepared() { # <secondmate-id> <batch-id>
+  receiver_wake_mark "$1" prepared "$2"
 }
 
 receiver_wake_discard_prepared() { # <secondmate-id>
@@ -371,19 +389,25 @@ receiver_wake_discard_prepared() { # <secondmate-id>
   [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
   value=$(cat "$marker" 2>/dev/null || true)
   case "$value" in
-    prepared:*) corr=${value#prepared:} ;;
+    prepared:*)
+      corr=${value#prepared:}
+      corr=${corr%%:*}
+      ;;
     *) return 1 ;;
   esac
   fm_pending_reply_discard_undelivered "$STATE" "$corr" || return 1
   rm -f -- "$marker"
 }
 
-receiver_wake_promote_prepared() { # <secondmate-id>
-  local id=$1 marker="$STATE/.backlog-handoff-$1.wake-pending" value corr
+receiver_wake_promote_prepared() { # <secondmate-id> <batch-id>
+  local id=$1 batch=$2 marker="$STATE/.backlog-handoff-$1.wake-pending" value corr
   [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
   value=$(cat "$marker" 2>/dev/null || true)
   case "$value" in
-    prepared:*) corr=${value#prepared:} ;;
+    prepared:*:"$batch")
+      corr=${value#prepared:}
+      corr=${corr%%:*}
+      ;;
     pending:*) return 0 ;;
     *) return 1 ;;
   esac
@@ -780,11 +804,17 @@ if [ "$FAILED" -ne 0 ]; then
   exit 1
 fi
 
+REQUESTED_BATCH=$(receiver_wake_batch_id "$@") || {
+  echo "error: receiver wake batch identity could not be recorded; nothing was moved" >&2
+  exit 1
+}
+
 if [ "${#TO_MOVE[@]}" -eq 0 ]; then
   echo "nothing to move: ${ALREADY[*]:-no keys} already present in $SUB_BACKLOG"
   WAKE_PENDING_MARKER="$STATE/.backlog-handoff-$ID.wake-pending"
   case "$(cat "$WAKE_PENDING_MARKER" 2>/dev/null || true)" in
-    prepared:*) receiver_wake_promote_prepared "$ID" || exit 1 ;;
+    prepared:*:"$REQUESTED_BATCH") receiver_wake_promote_prepared "$ID" "$REQUESTED_BATCH" || exit 1 ;;
+    prepared:*) receiver_wake_discard_prepared "$ID" || exit 1 ;;
   esac
   wake_pending_secondmate_receiver "$ID" || exit 1
   exit 0
@@ -820,7 +850,7 @@ if [ -e "$WAKE_PENDING_MARKER" ] || [ -L "$WAKE_PENDING_MARKER" ]; then
       ;;
   esac
 fi
-receiver_wake_mark_prepared "$ID" || {
+receiver_wake_mark_prepared "$ID" "$REQUESTED_BATCH" || {
   echo "error: receiver wake state for secondmate $ID could not be recorded; nothing was moved" >&2
   exit 1
 }
@@ -858,7 +888,7 @@ fi
 
 echo "handed off ${#TO_MOVE[@]} item(s) to $ID: ${TO_MOVE[*]}"
 echo "  into $SUB_BACKLOG"
-receiver_wake_promote_prepared "$ID" || {
+receiver_wake_promote_prepared "$ID" "$REQUESTED_BATCH" || {
   echo "error: handed off work to secondmate $ID, but durable receiver wake state could not be recorded" >&2
   exit 1
 }

@@ -363,6 +363,9 @@ EOF
     [ "$age" -ge "$threshold" ] || continue
     row_key="$epoch-$seq"
     receipt="$receipt_dir/$row_key"
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+      [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+    fi
     [ "$(cat "$marker" 2>/dev/null || true)" = "$row_key" ] && continue
     [ "$(cat "$receipt" 2>/dev/null || true)" = "$row_key" ] && continue
     notify_key="secondmate-wake-loop-$task-$row_key"
@@ -372,7 +375,7 @@ EOF
       fm_wake_append check "$notify_key" "$reason" || return 1
     fi
     fm_wake_secondmate_stall_receipt_write "$task" "$row_key" || return 1
-    printf '%s\n' "$row_key" > "$marker"
+    fm_wake_secondmate_stall_marker_write "$task" "$row_key" || return 1
     wake "$reason"
   done
   return 0
