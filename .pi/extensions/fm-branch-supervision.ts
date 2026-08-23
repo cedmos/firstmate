@@ -527,15 +527,15 @@ export default function (pi: ExtensionAPI) {
     const bashTool = createBashToolDefinition(fmRoot, {
       spawnHook: (context) => ({
         ...context,
-        // Keep the actor fence immutable in the tool shell and record that
-        // shell as branch provenance for its whole descendant process tree.
-        // A nested shell may discard environment variables, but lease guards
-        // still identify it through the live ancestor marker.
-        command: `FM_BRANCH_SHELL_MARKER="$FM_STATE_OVERRIDE/.pi-branch-shell-${"${BASHPID:-$$}"}"
-printf '%s\\n' "$FM_LEASE_GENERATION" > "$FM_BRANCH_SHELL_MARKER"
-trap 'rm -f -- "$FM_BRANCH_SHELL_MARKER"' EXIT
-readonly FM_SUPERVISION_ACTOR FM_LEASE_HOLDER_PID FM_LEASE_GENERATION FM_PI_BRANCH_GENERATION FM_BRANCH_SHELL_MARKER
-${context.command}`,
+        // Keep the actor fence immutable in a retained wrapper shell. Lease
+        // guards recognize the live wrapper in the process ancestry, so a
+        // nested shell cannot discard branch provenance with env -u or by
+        // deleting a writable state marker.
+        command: `: "fm-branch-shell:${generationToken}"
+readonly FM_SUPERVISION_ACTOR FM_LEASE_HOLDER_PID FM_LEASE_GENERATION FM_PI_BRANCH_GENERATION
+(
+${context.command}
+)`,
         env: {
           ...context.env,
           ...scriptEnv,

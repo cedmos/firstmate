@@ -20,11 +20,11 @@
 #     $FM_SUPERVISION_ACTOR when set, else "main". The branch's shell gets an
 #     immutable FM_SUPERVISION_ACTOR=branch plus its active generation injected
 #     deterministically by the Pi branch extension's bash-tool spawnHook, not
-#     by agent memory. The hook also records the branch tool shell pid for the
-#     lifetime of the command. The lease layer recognizes that shell throughout
-#     its descendant process tree, binds it to BRANCH, and rejects a conflicting
-#     or discarded actor environment. Any other value is refused loudly - an
-#     unknown actor is a wiring bug, not a third role.
+#     by agent memory. The hook retains a tagged branch tool wrapper shell for
+#     the lifetime of the command. The lease layer recognizes that live wrapper
+#     throughout its descendant process tree, binds it to BRANCH, and rejects a
+#     conflicting or discarded actor environment. Any other value is refused
+#     loudly - an unknown actor is a wiring bug, not a third role.
 #   - Staleness: the recorded pid is the long-lived supervising process (the
 #     session-lock holder, or FM_LEASE_HOLDER_PID - see bin/fm-lease.sh), and
 #     both actors live inside that one pi process, so a dead recorded pid
@@ -62,7 +62,7 @@ FM_LEASE_REFUSE_EXIT=6
 # stderr) for an unknown FM_SUPERVISION_ACTOR value.
 fm_lease_actor() {
   local actor=${FM_SUPERVISION_ACTOR:-main} active_generation branch_generation
-  local pid=${BASHPID:-$$} parent marker_generation hops=0
+  local pid=${BASHPID:-$$} parent process_command hops=0
   case "$actor" in
     main|branch) ;;
     *)
@@ -72,19 +72,24 @@ fm_lease_actor() {
   esac
   active_generation=$(cat "$STATE/.pi-branch-generation" 2>/dev/null || true)
 
-  # Environment is not process provenance: a nested shell can discard or
-  # replace inherited variables. The branch spawn hook records its tool-shell
-  # pid, so every descendant (including an exec replacement) remains BRANCH.
+  # Environment and writable files are not process provenance: a nested shell
+  # can discard the former and delete the latter. The branch spawn hook keeps a
+  # tagged wrapper alive while its command runs, so descendants (including an
+  # exec replacement) remain BRANCH without trusting child-controlled state.
   while [ "$hops" -lt 32 ] && [ -n "$pid" ]; do
-    marker_generation=$(cat "$STATE/.pi-branch-shell-$pid" 2>/dev/null || true)
-    if [ -n "$active_generation" ] && [ "$marker_generation" = "$active_generation" ]; then
-      if [ "$actor" != branch ] && [ -n "${FM_SUPERVISION_ACTOR+x}" ]; then
-        echo "error: actor override refused - a branch tool process cannot impersonate main" >&2
-        return 1
-      fi
-      printf '%s\n' branch
-      return 0
-    fi
+    process_command=$(ps -ww -o command= -p "$pid" 2>/dev/null || true)
+    case "$process_command" in
+      *"fm-branch-shell:$active_generation"*)
+        if [ -n "$active_generation" ]; then
+          if [ "$actor" != branch ] && [ -n "${FM_SUPERVISION_ACTOR+x}" ]; then
+            echo "error: actor override refused - a branch tool process cannot impersonate main" >&2
+            return 1
+          fi
+          printf '%s\n' branch
+          return 0
+        fi
+        ;;
+    esac
     parent=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
     case "$parent" in ''|*[!0-9]*|1) break ;; esac
     pid=$parent

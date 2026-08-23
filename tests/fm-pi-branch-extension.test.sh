@@ -285,7 +285,7 @@ for (const key of ["noExtensions", "noSkills", "noPromptTemplates", "noThemes", 
   if (loader.options[key] !== true) throw new Error(`branch loader must set ${key}`);
 }
 if (!loader.options.systemPrompt || !loader.options.systemPrompt.startsWith("You are the SUPERVISION BRANCH")) {
-  throw new Error("branch system prompt is not the generator's output");
+  throw new Error("branch system prompt did not come from the generator");
 }
 if (loader.options.systemPrompt.length < 4096) throw new Error("branch prompt is below the provider caching minimum");
 const bashTool = session.options.customTools.find((tool) => tool.name === "bash");
@@ -297,8 +297,9 @@ for (const command of [
   "FM_SUPERVISION_ACTOR=main bin/fm-pr-merge.sh task-x https://example.com/pr/1",
   "unset FM_SUPERVISION_ACTOR; bin/fm-pr-merge.sh task-x https://example.com/pr/1",
   "env FM_SUPERVISION_ACTOR=main bin/fm-pr-merge.sh task-x https://example.com/pr/1",
-  "env -u FM_SUPERVISION_ACTOR -u FM_LEASE_GENERATION -u FM_PI_BRANCH_GENERATION bash -c 'bin/fm-pr-merge.sh task-x https://example.com/pr/1'",
-  "env -u FM_SUPERVISION_ACTOR -u FM_LEASE_GENERATION -u FM_PI_BRANCH_GENERATION bash -c 'FM_SUPERVISION_ACTOR=main bin/fm-pr-merge.sh task-x https://example.com/pr/1'",
+  "env -u FM_SUPERVISION_ACTOR -u FM_LEASE_GENERATION -u FM_PI_BRANCH_GENERATION bash bin/fm-pr-merge.sh task-x https://example.com/pr/1",
+  "env -u FM_SUPERVISION_ACTOR -u FM_LEASE_GENERATION -u FM_PI_BRANCH_GENERATION env FM_SUPERVISION_ACTOR=main bash bin/fm-pr-merge.sh task-x https://example.com/pr/1",
+  "rm -f $FM_STATE_OVERRIDE/.pi-branch-shell-*; env -u FM_SUPERVISION_ACTOR -u FM_LEASE_GENERATION -u FM_PI_BRANCH_GENERATION bash bin/fm-pr-merge.sh task-x https://example.com/pr/1",
 ]) {
   const fenced = bashTool.__options.spawnHook({ command, cwd: realRoot, env: { ...process.env, PATH: process.env.PATH } });
   const attempt = spawnSync("bash", ["-c", fenced.command], { cwd: realRoot, encoding: "utf8", env: fenced.env });
@@ -312,10 +313,10 @@ const mainClaim = spawnSync("bash", ["bin/fm-lease.sh", "claim", "nested-release
   env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: `${home}/state`, FM_SUPERVISION_ACTOR: "main", FM_LEASE_HOLDER_PID: String(process.pid) },
 });
 if (mainClaim.status !== 0) throw new Error(`main lease fixture failed: ${mainClaim.stderr}`);
-const releaseCommand = "env -u FM_SUPERVISION_ACTOR -u FM_LEASE_GENERATION -u FM_PI_BRANCH_GENERATION bash -c 'bin/fm-lease.sh release nested-release --actor main'";
+const releaseCommand = "env -u FM_SUPERVISION_ACTOR -u FM_LEASE_GENERATION -u FM_PI_BRANCH_GENERATION bash bin/fm-lease.sh release nested-release --actor main";
 const fencedRelease = bashTool.__options.spawnHook({ command: releaseCommand, cwd: realRoot, env: { ...process.env, PATH: process.env.PATH } });
 const releaseAttempt = spawnSync("bash", ["-c", fencedRelease.command], { cwd: realRoot, encoding: "utf8", env: fencedRelease.env });
-if (releaseAttempt.status !== 6 || !/cannot release the main actor's lease/.test(releaseAttempt.stderr)) {
+if (releaseAttempt.status !== 6 || !/cannot release the main actor\x27s lease/.test(releaseAttempt.stderr)) {
   throw new Error(`nested branch process escaped lease-release authorization (${releaseAttempt.status}): ${releaseAttempt.stderr}`);
 }
 const retained = spawnSync("bash", ["bin/fm-lease.sh", "check", "nested-release"], {
@@ -323,7 +324,7 @@ const retained = spawnSync("bash", ["bin/fm-lease.sh", "check", "nested-release"
   encoding: "utf8",
   env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: `${home}/state` },
 });
-if (retained.status !== 0) throw new Error("nested branch release removed main's lease");
+if (retained.status !== 0) throw new Error("nested branch release removed the main lease");
 
 // 3. Shared per-home prompt_cache_key: overrides only payloads that already
 // carry one, stable within the home.
@@ -342,7 +343,7 @@ if (untouched !== undefined) throw new Error("cache-key hook rewrote a provider 
 console.log(`CACHE_KEY=${rewriteA.prompt_cache_key}`);
 
 // 4. Two-stage filter, stage 2: routine while main is idle appends with no
-// turn; routine while main is busy defers to after the captain's next prompt;
+// turn; routine while main is busy defers until after the next captain prompt;
 // captain-relevant appends and triggers exactly one turn. Store rows are
 // written BEFORE the merge note and marked read after it.
 const report = session.options.customTools.find((tool) => tool.name === "fm_branch_report");
@@ -504,7 +505,7 @@ await eval(`(async () => { ${prelude}; globalThis.__t = { dispatch, settle, home
 const { dispatch, settle, home } = globalThis.__t;
 import { rmSync, writeFileSync } from "node:fs";
 
-// Disabled by config: today's wake-to-main path keeps the wake.
+// Disabled by config: the existing wake-to-main path keeps the wake.
 writeFileSync(`${home}/config/pi-supervision-branch`, "off\n");
 if (dispatch("signal: while disabled").accepted) throw new Error("disabled branch accepted a wake");
 
@@ -529,7 +530,7 @@ const prelude = process.env.DRIVER_PRELUDE;
 await eval(`(async () => { ${prelude}; globalThis.__t = { dispatch, settle, mainUserMessages }; })()`);
 const { dispatch, settle, mainUserMessages } = globalThis.__t;
 
-// A branch that cannot come up must degrade to today's behavior: the accepted
+// A branch that cannot come up must degrade to the existing behavior: the accepted
 // wake falls back to main with the failure named, and later wakes are no
 // longer accepted (no wake is ever lost).
 if (!dispatch("signal: first wake").accepted) throw new Error("first offer was not accepted");
@@ -994,7 +995,7 @@ const ctx = {
   },
 };
 
-// Dialog collected at main's turn_end, delivered into the branch BEFORE the
+// Dialog collected at main turn_end, delivered into the branch BEFORE the
 // next wake, tagged and filtered: no tool traffic, no operational injections,
 // no merge notes, long messages capped.
 fire("turn_end", {}, ctx);
