@@ -111,6 +111,25 @@ PY
   pass "outcome store is append-only with cursor-based unread reads and acknowledged startup replay"
 }
 
+test_outcome_delivery_cursor_requires_contiguous_delivery() {
+  local home
+  home="$TMP_ROOT/delivery-cursor-home"
+  mkdir -p "$home/state"
+  FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append \
+    --task task-1 --verdict routine --summary first >/dev/null || fail "first delivery outcome append failed"
+  FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append \
+    --task task-2 --verdict routine --summary second >/dev/null || fail "second delivery outcome append failed"
+  FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" mark-delivered --seq 2 \
+    || fail "out-of-order delivery receipt failed"
+  [ "$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" unread | wc -l | tr -d ' ')" = 2 ] \
+    || fail "later delivery advanced across an undelivered outcome"
+  FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" mark-delivered --seq 1 \
+    || fail "first delivery receipt failed"
+  [ -z "$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" unread)" ] \
+    || fail "contiguous delivered outcomes did not advance the cursor"
+  pass "outcome cursor advances only across contiguous delivered merge notes"
+}
+
 test_branch_ack_requires_every_presented_outcome() {
   local home drain_out drain_err through generation first_seq second_seq out
   home="$TMP_ROOT/ack-coverage-home"
@@ -197,9 +216,8 @@ SH
   PATH="$home/no-python:$PATH" FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ \
     "$ROOT/bin/fm-lease.sh" claim portable --actor main || fail "portable lease claim depended on python3"
 
-  printf '%s\n' "$$" > "$home/state/.pi-branch-extension-loaded"
   rm -f "$home/guard-ready" "$home/guard-release"
-  (STATE="$home/state" FM_HOME="$home" bash -c '
+  (STATE="$home/state" FM_HOME="$home" FM_SUPERVISION_ACTOR=main bash -c '
     . "$1"
     fm_lease_guard guarded "guard probe"
     : > "$2/guard-ready"
@@ -258,11 +276,10 @@ test_mutating_scripts_refuse_the_other_actors_lease() {
 
   # fm-control: refused while the branch holds the lease; the ordinary no-task
   # error (a different failure) proves pass-through once the lease is gone.
-  out=$(FM_HOME="$home" "$ROOT/bin/fm-control.sh" task-held interrupt 2>&1)
+  out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=main "$ROOT/bin/fm-control.sh" task-held interrupt 2>&1)
   status=$?
   [ "$status" -eq 6 ] || fail "leased fm-control exited $status, not 6: $out"
   assert_contains "$out" "leased to the branch supervision actor" "fm-control refusal lost the holder"
-  printf '%s\n' "$$" > "$home/state/.pi-branch-extension-loaded"
   out=$(FM_HOME="$home" "$ROOT/bin/fm-control.sh" task-unheld interrupt 2>&1)
   status=$?
   [ "$status" -ne 6 ] || fail "unleased fm-control still hit the lease refusal"
@@ -276,7 +293,7 @@ test_mutating_scripts_refuse_the_other_actors_lease() {
   [ ! -e "$home/state/.lease-task-unheld" ] || fail "refused branch forced teardown acquired a lease"
 
   # fm-teardown: same refusal shape before any teardown work.
-  out=$(FM_HOME="$home" "$ROOT/bin/fm-teardown.sh" task-held 2>&1)
+  out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=main "$ROOT/bin/fm-teardown.sh" task-held 2>&1)
   status=$?
   [ "$status" -eq 6 ] || fail "leased fm-teardown exited $status, not 6: $out"
   assert_contains "$out" "teardown (fm-teardown) refused" "fm-teardown refusal lost its action label"
@@ -348,15 +365,29 @@ test_main_owned_actions_refuse_the_branch_actor() {
 test_home_without_branch_is_untouched() {
   local home out status
   home="$TMP_ROOT/untouched-home"
-  mkdir -p "$home/state"
+  mkdir -p "$home/state" "$home/fakebin"
+  printf '%s\n%s\nstale-generation\n' "$$" "$$" > "$home/state/.pi-branch-extension-loaded"
+  printf '%s\n' "$$" > "$home/state/.lock"
+  cat > "$home/fakebin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *'comm='*) printf '%s\n' claude ;;
+  *'args='*) printf '%s\n' claude ;;
+  *'ppid='*) printf '%s\n' 1 ;;
+esac
+SH
+  chmod +x "$home/fakebin/ps"
 
   # No lease files, no actor variable: the guard layer must be invisible - the
   # scripts fail (or succeed) exactly on their pre-existing logic, and nothing
   # branch-related appears in state/.
-  out=$(FM_HOME="$home" "$ROOT/bin/fm-control.sh" task-any interrupt 2>&1)
+  printf 'branch\t%s\t123\n' "$$" > "$home/state/.lease-task-any"
+  out=$(PATH="$home/fakebin:$PATH" FM_HOME="$home" "$ROOT/bin/fm-control.sh" task-any interrupt 2>&1)
   status=$?
   [ "$status" -ne 6 ] || fail "no-branch home hit a lease refusal in fm-control"
   assert_contains "$out" "no task 'task-any'" "no-branch fm-control lost its ordinary error"
+  [ -e "$home/state/.lease-task-any" ] || fail "non-Pi guard mutated a stale Pi lease"
+  rm -f "$home/state/.lease-task-any"
   out=$(FM_HOME="$home" "$ROOT/bin/fm-pr-merge.sh" 2>&1)
   status=$?
   [ "$status" -eq 2 ] || fail "no-branch fm-pr-merge usage error changed: $status: $out"
@@ -364,13 +395,14 @@ test_home_without_branch_is_untouched() {
     || fail "guard layer created branch state in a home that never ran the branch"
 
   # The guard helpers themselves: silent pass with no lease and no actor.
-  out=$(STATE="$home/state" bash -c '. "$1"; fm_lease_guard task-any "probe"; fm_lease_forbid_branch "probe"; echo silent-pass' _ "$ROOT/bin/fm-lease-lib.sh" 2>&1)
+  out=$(PATH="$home/fakebin:$PATH" STATE="$home/state" bash -c '. "$1"; fm_lease_guard task-any "probe"; fm_lease_forbid_branch "probe"; echo silent-pass' _ "$ROOT/bin/fm-lease-lib.sh" 2>&1)
   [ "$out" = "silent-pass" ] || fail "guard helpers were not silent in a no-branch home: $out"
   pass "a home that never runs the branch sees no lease files, no refusals, and no new state"
 }
 
 test_branch_prompt_is_byte_stable_and_above_cache_floor
 test_outcome_store_is_append_only_with_cursor_reads
+test_outcome_delivery_cursor_requires_contiguous_delivery
 test_branch_ack_requires_every_presented_outcome
 test_lease_exclusivity_release_stale_and_sweep
 test_mutating_scripts_refuse_the_other_actors_lease

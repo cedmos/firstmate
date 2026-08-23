@@ -15,6 +15,9 @@
 #     or via the session-start replay). Records above the cursor are "unread":
 #     the branch wrote them durably but main never saw them - the crash window
 #     between the store write and the merge append.
+#   - Delivery receipts live under $STATE/branch-outcomes-delivered/ until all
+#     preceding outcome sequences are delivered; the cursor advances only over
+#     that contiguous prefix.
 #   - Every mutation runs under $STATE/.branch-outcomes.lock so the branch
 #     extension and a concurrent session-start replay cannot interleave.
 #   - The store is written BEFORE the merge note is appended to main
@@ -45,10 +48,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 STORE="$STATE/branch-outcomes.jsonl"
 CURSOR="$STATE/.branch-outcomes-cursor"
+DELIVERED_DIR="$STATE/branch-outcomes-delivered"
 LOCK="$STATE/.branch-outcomes.lock"
 
 usage() {
-  echo "usage: fm-branch-outcome.sh append --task <id> --verdict routine|captain --summary <text> [--wake <text>] [--wake-seq <n>] | unread | mark-read --through <seq> | list [--recent <n>] | startup-replay | startup-replay-ack --through <seq>" >&2
+  echo "usage: fm-branch-outcome.sh append --task <id> --verdict routine|captain --summary <text> [--wake <text>] [--wake-seq <n>] | unread | mark-read --through <seq> | mark-delivered --seq <seq> | list [--recent <n>] | startup-replay | startup-replay-ack --through <seq>" >&2
   exit 2
 }
 
@@ -103,6 +107,11 @@ advance_cursor() { # <seq>
   tmp=$(mktemp "$STATE/.branch-outcomes-cursor.XXXXXX")
   printf '%s\n' "$through" > "$tmp"
   mv -f -- "$tmp" "$CURSOR"
+  for tmp in "$DELIVERED_DIR"/*; do
+    [ -f "$tmp" ] || continue
+    case "${tmp##*/}" in ''|*[!0-9]*) continue ;; esac
+    [ "${tmp##*/}" -gt "$through" ] || rm -f -- "$tmp"
+  done
 }
 
 CMD=${1:-}
@@ -150,6 +159,25 @@ case "$CMD" in
     [ "$#" -eq 2 ] || usage
     fm_lock_acquire_wait "$LOCK"
     advance_cursor "$THROUGH"
+    fm_lock_release "$LOCK"
+    ;;
+  mark-delivered)
+    [ "${1:-}" = --seq ] || usage
+    DELIVERED=${2:-}
+    case "$DELIVERED" in ''|*[!0-9]*|0) usage ;; esac
+    [ "$#" -eq 2 ] || usage
+    fm_lock_acquire_wait "$LOCK"
+    CURSOR_VALUE=$(read_cursor)
+    if [ "$DELIVERED" -gt "$CURSOR_VALUE" ]; then
+      mkdir -p "$DELIVERED_DIR"
+      : > "$DELIVERED_DIR/$DELIVERED"
+      NEXT=$((CURSOR_VALUE + 1))
+      LAST=$(last_seq)
+      while [ "$NEXT" -le "$LAST" ] && [ -f "$DELIVERED_DIR/$NEXT" ]; do
+        advance_cursor "$NEXT"
+        NEXT=$((NEXT + 1))
+      done
+    fi
     fm_lock_release "$LOCK"
     ;;
   list)

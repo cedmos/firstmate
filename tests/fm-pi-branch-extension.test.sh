@@ -162,13 +162,14 @@ JS
 # captured main-bound messages.
 DRIVER_PRELUDE=$(cat <<'JS'
 const { spawnSync } = await import("node:child_process");
-const { mkdirSync } = await import("node:fs");
+const { mkdirSync, writeFileSync } = await import("node:fs");
 const { pathToFileURL } = await import("node:url");
 
 const home = process.env.FM_HOME;
 const realRoot = process.env.FM_ROOT_OVERRIDE;
 mkdirSync(`${home}/state`, { recursive: true });
 mkdirSync(`${home}/config`, { recursive: true });
+writeFileSync(`${home}/state/.lock`, `${process.env.FM_TEST_LOCK_PID || process.pid}\n`);
 
 const busHandlers = new Map();
 const bus = {
@@ -206,8 +207,8 @@ const pi = {
     mainUserMessages.push({ content, options: options ?? {} });
   },
 };
-function fire(event, payload, ctx) {
-  for (const handler of piHandlers.get(event) ?? []) handler(payload, ctx);
+async function fire(event, payload, ctx) {
+  for (const handler of piHandlers.get(event) ?? []) await handler(payload, ctx);
 }
 function makeOffer(message) {
   const offer = {
@@ -329,13 +330,25 @@ if (!sentToMain[2].message.content.includes("[captain] task-9: PR https://exampl
   throw new Error(`captain note lost its content: ${sentToMain[2].message.content}`);
 }
 
-// The store (the owned durable contract) holds all three outcomes in order,
-// and each merged note advanced the read cursor.
+// The store (the owned durable contract) holds all three outcomes in order.
 const rows = readFileSync(`${home}/state/branch-outcomes.jsonl`, "utf8").trim().split("\n").map((line) => JSON.parse(line));
 if (rows.length !== 3) throw new Error(`expected 3 store rows, got ${rows.length}`);
 if (rows[0].verdict !== "routine" || rows[2].verdict !== "captain") throw new Error("store verdicts out of order");
 if (rows[0].wake !== "signal: working") throw new Error("store lost the wake reason");
-if (outcomeScript(["unread"]) !== "") throw new Error("merged outcomes were not marked read");
+if (outcomeScript(["unread"]).split("\n").length !== 3) {
+  throw new Error("queued merge notes advanced the outcome cursor before main-session delivery");
+}
+const deliveredEntries = sentToMain.map(({ message }) => ({
+  type: "message",
+  message: { role: "custom", ...message },
+}));
+await fire("turn_end", {}, {
+  sessionManager: {
+    getSessionFile: () => `${home}/main.jsonl`,
+    getEntries: () => deliveredEntries,
+  },
+});
+if (outcomeScript(["unread"]) !== "") throw new Error("delivered merge notes did not advance the outcome cursor");
 
 // 5. Main-side surfaces: the on-demand store reader tool and the merge-note
 // renderer.
@@ -633,21 +646,22 @@ const claim = spawnSync("bash", [`${process.env.FM_ROOT_OVERRIDE}/bin/fm-lease.s
   env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: `${home}/state`, FM_LEASE_HOLDER_PID: String(process.pid), FM_LEASE_GENERATION: generation },
 });
 if (claim.status !== 0) throw new Error(`branch fixture lease claim failed: ${claim.stderr}`);
+const sessionCtx = {
+  sessionManager: { getSessionFile: () => `${home}/main.jsonl`, getEntries: () => [] },
+};
 globalThis.__fmRejectMainDelivery = true;
-fire("session_shutdown");
+let shutdownFinished = false;
+const shutdown = fire("session_shutdown", {}, sessionCtx).then(() => { shutdownFinished = true; });
 await new Promise((resolve) => setTimeout(resolve, 30));
+if (shutdownFinished) throw new Error("session shutdown completed before branch tools quiesced");
 if (mainUserMessages.length !== 0) throw new Error("shutdown used the invalidated extension API");
-globalThis.__fmRejectMainDelivery = false;
-fire("session_start");
-if (dispatch("signal: replacement before cleanup").accepted) {
-  throw new Error("replacement branch accepted work before old tools quiesced");
-}
-await new Promise((resolve) => setTimeout(resolve, 30));
 const { existsSync, readdirSync } = await import("node:fs");
 if (!existsSync(`${home}/state/.lease-shutdown-task`)) throw new Error("shutdown released a lease before its tool quiesced");
-if (mainUserMessages.length !== 0) throw new Error("replacement fallback ran before branch tools quiesced");
 globalThis.__fmResolveBash();
 await bashRun;
+await shutdown;
+globalThis.__fmRejectMainDelivery = false;
+await fire("session_start", {}, sessionCtx);
 await settle(() => mainUserMessages.length === 2, "replacement-session fallbacks");
 const delivered = mainUserMessages.map((item) => item.content).join("\n");
 if (!delivered.includes("signal: active during shutdown")) throw new Error("active accepted wake was lost");
@@ -692,8 +706,11 @@ const { fire, dispatch, settle, mainUserMessages } = globalThis.__t;
 globalThis.__fmBlockPrompt = true;
 if (!dispatch("signal: cleanup failure wake").accepted) throw new Error("wake was not accepted");
 await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "cleanup-failure prompt");
-fire("session_shutdown");
-fire("session_start");
+const sessionCtx = {
+  sessionManager: { getSessionFile: () => "main.jsonl", getEntries: () => [] },
+};
+await fire("session_shutdown", {}, sessionCtx);
+await fire("session_start", {}, sessionCtx);
 await settle(() => mainUserMessages.length === 1, "cleanup-failure fallback");
 if (!mainUserMessages[0].content.includes("signal: cleanup failure wake")) {
   throw new Error("lease cleanup failure stranded the accepted wake");
@@ -707,6 +724,42 @@ EOF
   status=$?
   expect_code 0 "$status" "lease cleanup failure must still replay accepted wakes: $out"
   pass "lease cleanup failure replays accepted wakes while branch dispatch stays disabled"
+}
+
+test_secondary_session_cannot_mutate_primary_branch_state() {
+  local repo home out status owner
+  repo="$TMP_ROOT/secondary-session-root"
+  home="$TMP_ROOT/secondary-session-home"
+  mkdir -p "$home/state" "$home/config"
+  install_pi_branch_extension_fixture "$repo"
+  sleep 30 &
+  owner=$!
+  printf 'primary-marker\n' > "$home/state/.pi-branch-extension-loaded"
+  FM_HOME="$home" FM_LEASE_HOLDER_PID="$owner" "$ROOT/bin/fm-lease.sh" claim primary-task --actor branch \
+    || fail "could not seed the primary branch lease"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_TEST_LOCK_PID="$owner" DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, home }; })()`);
+const { fire, dispatch, home } = globalThis.__t;
+import { existsSync, readFileSync } from "node:fs";
+const markerBefore = readFileSync(`${home}/state/.pi-branch-extension-loaded`, "utf8");
+const ctx = { sessionManager: { getSessionFile: () => "secondary.jsonl", getEntries: () => [] } };
+await fire("session_start", {}, ctx);
+await fire("turn_end", {}, ctx);
+if (dispatch("signal: secondary offer").accepted) throw new Error("secondary session accepted a branch wake");
+if (!existsSync(`${home}/state/.lease-primary-task`)) throw new Error("secondary session released the primary lease");
+if (readFileSync(`${home}/state/.pi-branch-extension-loaded`, "utf8") !== markerBefore) {
+  throw new Error("secondary session rewrote the primary branch marker");
+}
+process.exit(0);
+EOF
+  )
+  status=$?
+  kill "$owner" 2>/dev/null || true
+  wait "$owner" 2>/dev/null || true
+  expect_code 0 "$status" "secondary Pi session must not mutate primary branch state: $out"
+  pass "a secondary Pi session cannot mutate primary branch state"
 }
 
 test_branch_mirror_filters_order_and_cursor() {
@@ -837,5 +890,6 @@ test_partial_ack_preserves_wake_fallback
 test_failed_merge_preserves_wake_fallback
 test_accepted_wakes_fall_back_during_shutdown
 test_cleanup_failure_still_replays_accepted_wakes
+test_secondary_session_cannot_mutate_primary_branch_state
 test_branch_mirror_filters_order_and_cursor
 test_branch_session_persists_across_process_restarts

@@ -23,7 +23,7 @@
 // to delivering the wake to MAIN exactly as before the branch existed - a
 // broken branch degrades to today's behavior, never to a lost wake.
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -87,6 +87,7 @@ const MIRROR_MESSAGE_CAP = 4000;
 type MirrorItem = { tag: "captain" | "main"; text: string };
 type MirrorCursor = { file: string; index: number };
 type Verdict = "routine" | "captain";
+type LockOwnership = "owned" | "other" | "missing";
 
 const scriptEnv = {
   ...process.env,
@@ -108,6 +109,38 @@ function branchEnabled(): boolean {
 
 function afkActive(): boolean {
   return existsSync(afkFlag);
+}
+
+function parentPid(pid: string): string {
+  const result = spawnSync("ps", ["-o", "ppid=", "-p", pid], { encoding: "utf8" });
+  if (result.status !== 0) return "";
+  return result.stdout.trim();
+}
+
+function pidAlive(pid: string): boolean {
+  try {
+    process.kill(Number(pid), 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function lockOwnership(): LockOwnership {
+  let lockPid = "";
+  try {
+    lockPid = readFileSync(`${state}/.lock`, "utf8").trim();
+  } catch {
+    return "missing";
+  }
+  if (!/^[0-9]+$/.test(lockPid) || lockPid === "1") return "other";
+  let pid = String(process.pid);
+  for (let i = 0; i < 8; i += 1) {
+    if (pid === lockPid) return "owned";
+    pid = parentPid(pid);
+    if (!pid || pid === "1") break;
+  }
+  return pidAlive(lockPid) ? "other" : "missing";
 }
 
 function textOfContent(content: unknown): string {
@@ -196,25 +229,29 @@ export default function (pi: ExtensionAPI) {
   let branchBroken = "";
   let mainStreaming = false;
   let shuttingDown = false;
-  let sessionGeneration = 0;
+  let runtimeOwnsLock = lockOwnership() === "owned";
+  let generationToken = randomUUID();
   let pendingWakeCounter = 0;
   let activeWake: { mergedWakeSequences: Set<number> } | null = null;
   let activeBranchTools = 0;
   let branchToolWaiters: Array<() => void> = [];
-  let branchCleanup: Promise<boolean> = Promise.resolve(true);
   // Serializes branch work: mirror appends and wake turns run strictly in
   // dispatch order, one at a time (the branch runs drain -> handle -> ack
   // serially by design).
   let branchChain: Promise<void> = Promise.resolve();
   const pendingMirror: MirrorItem[] = [];
 
-  function markLoaded(): void {
+  function markLoaded(): boolean {
+    if (!runtimeOwnsLock || lockOwnership() !== "owned") return false;
     try {
+      const lockPid = readFileSync(`${state}/.lock`, "utf8").trim();
       mkdirSync(state, { recursive: true });
-      writeFileSync(loadedMarker, `${process.pid}\n`);
-      writeFileSync(branchGenerationFile, `${process.pid}:${sessionGeneration}\n`);
+      process.env.FM_PI_BRANCH_GENERATION = generationToken;
+      writeFileSync(loadedMarker, `${process.pid}\n${lockPid}\n${generationToken}\n`);
+      writeFileSync(branchGenerationFile, `${generationToken}\n`);
+      return true;
     } catch {
-      // Diagnostic marker only; never block loading on it.
+      return false;
     }
   }
 
@@ -273,18 +310,36 @@ export default function (pi: ExtensionAPI) {
   // one turn (queued as a follow-up while main is busy).
   function mergeIntoMain(seq: string, task: string, verdict: Verdict, summary: string): void {
     const note = `⎇ branch merged [${verdict}] ${task}: ${summary}`;
+    const message = {
+      customType: "fm-branch-merge",
+      content: note,
+      display: true,
+      details: { outcomeSeq: Number(seq) },
+    };
     if (verdict === "captain") {
-      pi.sendMessage(
-        { customType: "fm-branch-merge", content: note, display: true },
-        { triggerTurn: true, deliverAs: "followUp" },
-      );
+      pi.sendMessage(message, { triggerTurn: true, deliverAs: "followUp" });
     } else if (mainStreaming) {
-      pi.sendMessage({ customType: "fm-branch-merge", content: note, display: true }, { deliverAs: "nextTurn" });
+      pi.sendMessage(message, { deliverAs: "nextTurn" });
     } else {
-      pi.sendMessage({ customType: "fm-branch-merge", content: note, display: true }, {});
+      pi.sendMessage(message, {});
     }
-    if (/^[0-9]+$/.test(seq)) {
-      runOutcomeScript(["mark-read", "--through", seq]);
+  }
+
+  function markDeliveredOutcomes(sessionManager: ReadonlyEntries): void {
+    const delivered = new Set<number>();
+    for (const entry of sessionManager.getEntries()) {
+      if (entry.type !== "message") continue;
+      const message = (
+        entry as {
+          message?: { role?: string; customType?: string; details?: { outcomeSeq?: unknown } };
+        }
+      ).message;
+      if (message?.role !== "custom" || message.customType !== "fm-branch-merge") continue;
+      const seq = message.details?.outcomeSeq;
+      if (typeof seq === "number" && Number.isInteger(seq) && seq > 0) delivered.add(seq);
+    }
+    for (const seq of [...delivered].sort((a, b) => a - b)) {
+      runOutcomeScript(["mark-delivered", "--seq", String(seq)]);
     }
   }
 
@@ -421,7 +476,7 @@ export default function (pi: ExtensionAPI) {
           ...scriptEnv,
           FM_SUPERVISION_ACTOR: "branch",
           FM_LEASE_HOLDER_PID: String(process.pid),
-          FM_LEASE_GENERATION: `${process.pid}:${sessionGeneration}`,
+          FM_LEASE_GENERATION: generationToken,
         },
       }),
     });
@@ -568,10 +623,10 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function enqueueWake(message: string, pendingPath: string, acceptedGeneration: number): void {
+  function enqueueWake(message: string, pendingPath: string, acceptedGeneration: string): void {
     branchChain = branchChain
       .then(async () => {
-        if (shuttingDown || acceptedGeneration !== sessionGeneration) {
+        if (shuttingDown || acceptedGeneration !== generationToken || !runtimeOwnsLock) {
           throw new Error("supervision session shut down before handling the accepted wake");
         }
         const session = await ensureBranch();
@@ -595,7 +650,7 @@ export default function (pi: ExtensionAPI) {
         }
       })
       .catch((error: unknown) => {
-        if (shuttingDown || acceptedGeneration !== sessionGeneration) return;
+        if (shuttingDown || acceptedGeneration !== generationToken || !runtimeOwnsLock) return;
         try {
           fallbackToMain(message, error instanceof Error ? error.message : String(error));
           clearAcceptedWake(pendingPath);
@@ -619,7 +674,7 @@ export default function (pi: ExtensionAPI) {
   pi.events?.on?.(FM_BRANCH_DISPATCH_EVENT, (data) => {
     const offer = data as BranchDispatchOffer;
     if (!offer || typeof offer.accept !== "function") return;
-    if (shuttingDown) return;
+    if (shuttingDown || !runtimeOwnsLock || lockOwnership() !== "owned") return;
     if (!branchEnabled()) return;
     if (afkActive()) return; // the away daemon owns supervision while afk
     if (branchBroken) return; // fail back to today's wake-to-main path
@@ -629,7 +684,7 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return;
     }
-    const acceptedGeneration = sessionGeneration;
+    const acceptedGeneration = generationToken;
     offer.accept();
     enqueueWake(offer.message, pendingPath, acceptedGeneration);
   });
@@ -648,8 +703,9 @@ export default function (pi: ExtensionAPI) {
   // durably (cursor-advanced) right away, deliver it into the branch through
   // the serialized chain so it lands before any later wake.
   pi.on?.("turn_end", (_event, ctx) => {
-    if (!branchEnabled()) return;
+    if (!runtimeOwnsLock || lockOwnership() !== "owned" || !branchEnabled()) return;
     try {
+      markDeliveredOutcomes(ctx.sessionManager);
       pendingMirror.push(...collectMainDialog(ctx.sessionManager));
     } catch {
       return;
@@ -663,25 +719,25 @@ export default function (pi: ExtensionAPI) {
   // branch session; a replacement session_start re-arms, and the next wake
   // reopens the persistent branch from its recorded pointer. Terminal quit
   // simply never fires another session_start.
-  pi.on?.("session_start", () => {
+  pi.on?.("session_start", (_event, ctx) => {
     shuttingDown = true;
     branchBroken = "";
-    markLoaded();
-    const startedGeneration = sessionGeneration;
-    void branchCleanup.then(() => {
-      if (startedGeneration !== sessionGeneration) return;
-      const leasesReleased = releaseBranchLeases();
-      replayAcceptedWakes();
-      if (leasesReleased) shuttingDown = false;
-    });
-    // A replacement main session (/new, /resume) restarts dialog mirroring
-    // from the new session file; collectMainDialog re-anchors the cursor.
+    runtimeOwnsLock = lockOwnership() === "owned";
+    generationToken = randomUUID();
+    if (!markLoaded()) return;
+    markDeliveredOutcomes(ctx.sessionManager);
+    const leasesReleased = releaseBranchLeases();
+    replayAcceptedWakes();
+    if (leasesReleased) shuttingDown = false;
   });
 
-  pi.on?.("session_shutdown", () => {
+  pi.on?.("session_shutdown", async (_event, ctx) => {
+    if (!runtimeOwnsLock) return;
     shuttingDown = true;
-    sessionGeneration += 1;
-    markLoaded();
+    const stillOwnsLock = lockOwnership() === "owned";
+    if (stillOwnsLock) markDeliveredOutcomes(ctx.sessionManager);
+    generationToken = randomUUID();
+    if (stillOwnsLock) markLoaded();
     if (branch) {
       try {
         branch.dispose();
@@ -690,7 +746,9 @@ export default function (pi: ExtensionAPI) {
       }
       branch = null;
     }
-    branchCleanup = waitForBranchTools().then(() => releaseBranchLeases());
+    await waitForBranchTools();
+    if (stillOwnsLock) releaseBranchLeases();
+    runtimeOwnsLock = false;
   });
 
   pi.registerTool?.({

@@ -124,25 +124,48 @@ fm_lease_clear_stale() {
 FM_LEASE_GUARD_ACQUIRED=
 FM_LEASE_GUARD_ACTOR=
 
+fm_lease_pid_is_ancestor() {
+  local target=$1 pid=${BASHPID:-$$} parent hops=0
+  while [ "$hops" -lt 12 ]; do
+    [ "$pid" = "$target" ] && return 0
+    parent=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    case "$parent" in ''|*[!0-9]*|1) return 1 ;; esac
+    pid=$parent
+    hops=$((hops + 1))
+  done
+  return 1
+}
+
+fm_lease_pi_session_active() {
+  local marker="$STATE/.pi-branch-extension-loaded" marker_pid marker_lock marker_generation lock_pid
+  marker_pid=$(sed -n '1p' "$marker" 2>/dev/null || true)
+  marker_lock=$(sed -n '2p' "$marker" 2>/dev/null || true)
+  marker_generation=$(sed -n '3p' "$marker" 2>/dev/null || true)
+  lock_pid=$(head -n 1 "$STATE/.lock" 2>/dev/null | tr -d '[:space:]' || true)
+  case "$marker_pid:$marker_lock:$lock_pid" in *[!0-9:]*) return 1 ;; esac
+  [ -n "$marker_pid" ] && [ "$marker_lock" = "$lock_pid" ] || return 1
+  [ -n "${FM_PI_BRANCH_GENERATION:-}" ] \
+    && [ "$marker_generation" = "$FM_PI_BRANCH_GENERATION" ] || return 1
+  fm_lease_pid_is_ancestor "$marker_pid" || return 1
+  fm_lease_pid_is_ancestor "$lock_pid"
+}
+
 # fm_lease_guard <task> <action-label>: refuse (exit FM_LEASE_REFUSE_EXIT) when
 # a live lease held by the OTHER actor exists for <task>. Passes silently
 # otherwise. Call after the task id is resolved and before the first mutation.
 fm_lease_guard() {
-  local task=$1 action=$2 actor marker marker_pid lease_script holder_pid
+  local task=$1 action=$2 actor lease_script holder_pid
   fm_lease_valid_id "$task" || return 0
   actor=$(fm_lease_actor) || exit "$FM_LEASE_REFUSE_EXIT"
+  if [ -z "${FM_SUPERVISION_ACTOR+x}" ] && ! fm_lease_pi_session_active; then
+    return 0
+  fi
   if fm_lease_live "$task"; then
     if [ "$FM_LEASE_ACTOR" != "$actor" ]; then
       echo "error: $action refused - task '$task' is leased to the $FM_LEASE_ACTOR supervision actor (state/.lease-$task); retry after it releases, or clear a wedged lease with bin/fm-lease.sh release $task --actor $FM_LEASE_ACTOR" >&2
       exit "$FM_LEASE_REFUSE_EXIT"
     fi
     return 0
-  fi
-  if [ -z "${FM_SUPERVISION_ACTOR+x}" ]; then
-    marker="$STATE/.pi-branch-extension-loaded"
-    marker_pid=$(cat "$marker" 2>/dev/null || true)
-    case "$marker_pid" in ''|*[!0-9]*) return 0 ;; esac
-    kill -0 "$marker_pid" 2>/dev/null || return 0
   fi
   lease_script="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/fm-lease.sh"
   holder_pid=${FM_LEASE_HOLDER_PID:-${BASHPID:-$$}}

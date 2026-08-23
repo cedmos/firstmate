@@ -102,7 +102,7 @@ state/               runtime records and signals; gitignored
   <id>.pr-poll       private validated data sidecar for the byte-static PR merge poll
   <id>.pr-poll-registration  private transactional provenance record binding the task, canonical metadata identity, sidecar, and static poll publication
   <id>.pr-poll-retirement  private identity-bound crash-recovery receipt for one exact validated merged result; removed after its poll artifacts retire
-  branch-outcomes.jsonl .branch-outcomes-cursor  Pi supervision-branch durable outcome store and its read cursor; bin/fm-branch-outcome.sh owns the format
+  branch-outcomes.jsonl .branch-outcomes-cursor branch-outcomes-delivered/  Pi supervision-branch durable outcome store, read cursor, and contiguous-delivery receipts; bin/fm-branch-outcome.sh owns the format
   branch-session/ .branch-session .branch-mirror-cursor  the branch's persistent conversation, its pointer, and the dialog-mirror cursor; extension-owned (docs/pi-supervision-branch.md)
   branch-pending-wakes/ .pi-branch-generation  accepted Pi branch dispatches and the active lease-generation fence; extension-owned (docs/pi-supervision-branch.md)
   branch-ack-receipts/  successful branch wake acknowledgements consumed by the extension; bin/fm-wake-drain.sh owns the format
