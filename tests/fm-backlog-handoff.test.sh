@@ -43,7 +43,7 @@ EOF
 # requests use. This test drives the real handoff and fm-send path through the
 # fake tmux adapter, then asserts the adapter received a submission.
 test_handoff_wakes_live_local_receiver() {
-  local home="$TMP_ROOT/live-wake-main" sub="$TMP_ROOT/live-wake-sub" fakebin out
+  local home="$TMP_ROOT/live-wake-main" sub="$TMP_ROOT/live-wake-sub" fakebin out wake_count
   setup_homes "$home" "$sub"
   mkdir -p "$sub/state" "$sub/data"
   cat > "$home/state/design.meta" <<EOF
@@ -76,7 +76,17 @@ EOF
     || fail "handoff did not wake the live receiver endpoint"
   grep -F 'New routed work is in your backlog.' "$TMP_ROOT/live-wake-tmux.log" >/dev/null \
     || fail "receiver wake did not carry the routed-work instruction"
-  pass "a routed handoff wakes the live local receiver through its verified endpoint"
+  wake_count=$(grep -cF 'New routed work is in your backlog.' "$TMP_ROOT/live-wake-tmux.log")
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" PATH="$fakebin:$PATH" \
+    FM_FAKE_TMUX_WINDOW='firstmate:fm-design' \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/live-wake-tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/live-wake-fake/pane.txt" \
+    FM_SEND_SETTLE=0 FM_SEND_SLEEP=0 FM_SEND_RETRIES=1 \
+    "$ROOT/bin/fm-backlog-handoff.sh" design wake-item > "$TMP_ROOT/live-wake-rerun.out" 2>&1 \
+    || fail "idempotent successful handoff rerun failed: $(cat "$TMP_ROOT/live-wake-rerun.out")"
+  [ "$(grep -cF 'New routed work is in your backlog.' "$TMP_ROOT/live-wake-tmux.log")" -eq "$wake_count" ] \
+    || fail "idempotent successful handoff rerun duplicated the receiver wake"
+  pass "a routed handoff wakes once and a successful rerun stays idempotent"
 }
 
 test_failed_wake_retries_when_the_item_is_already_present() {

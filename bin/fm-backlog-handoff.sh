@@ -52,8 +52,8 @@
 # then an idempotent confined transfer and fm-backlog-receive.sh deliver it.
 # A present outbox is the whole recovery record. No two-phase journal exists.
 # Every successful delivery also sends one marked wake to the receiving endpoint.
-# A missing endpoint is reported as an observable warning, while a live endpoint
-# that rejects the wake makes the handoff fail with the delivered backlog intact.
+# A missing endpoint or a live endpoint that rejects the wake makes the handoff
+# fail with the delivered backlog intact.
 # Usage: fm-backlog-handoff.sh <secondmate-id> <item-key>...
 #        fm-backlog-handoff.sh --resume-pending
 set -eu
@@ -308,6 +308,23 @@ warn_stale_public_commitments() { # <secondmate-id> <moved-key>...
 # verified submit and failure semantics. A seeded but not-yet-spawned home is a
 # valid handoff destination, but its missing endpoint is reported rather than
 # pretending the task was started.
+receiver_wake_mark_pending() { # <secondmate-id>
+  local id=$1 marker="$STATE/.backlog-handoff-$1.wake-pending" tmp
+  case "$id" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    if [ -f "$marker" ] && [ ! -L "$marker" ] \
+      && [ "$(cat "$marker" 2>/dev/null || true)" = pending ]; then
+      return 0
+    fi
+    return 1
+  fi
+  tmp=$(umask 077; mktemp "$STATE/.backlog-handoff-wake.XXXXXX") || return 1
+  if ! printf 'pending\n' > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$marker"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
 wake_secondmate_receiver() { # <secondmate-id>
   local id=$1 meta="$STATE/$1.meta" out rc=0
   if [ ! -f "$meta" ] || [ -L "$meta" ]; then
@@ -327,6 +344,21 @@ wake_secondmate_receiver() { # <secondmate-id>
     return 1
   fi
   [ -z "$out" ] || printf '%s\n' "$out"
+}
+
+wake_pending_secondmate_receiver() { # <secondmate-id>
+  local id=$1 marker="$STATE/.backlog-handoff-$1.wake-pending"
+  [ -e "$marker" ] || [ -L "$marker" ] || return 0
+  if [ ! -f "$marker" ] || [ -L "$marker" ] \
+    || [ "$(cat "$marker" 2>/dev/null || true)" != pending ]; then
+    printf 'error: receiver wake state for secondmate %s is unsafe or invalid\n' "$id" >&2
+    return 1
+  fi
+  wake_secondmate_receiver "$id" || return 1
+  rm -f -- "$marker" || {
+    printf 'error: receiver wake for secondmate %s was confirmed, but pending state could not be cleared\n' "$id" >&2
+    return 1
+  }
 }
 
 outbox_item_count() { # <path>
@@ -377,7 +409,11 @@ remote_deliver_outbox() { # <secondmate-id> <outbox-path>
     echo "error: handoff receipt by $id was unavailable or completion is unknown; outbox preserved at $outbox" >&2
     return 1
   fi
-  if ! wake_secondmate_receiver "$id"; then
+  receiver_wake_mark_pending "$id" || {
+    echo "error: remote backlog is durable at $id, but receiver wake state could not be recorded; outbox preserved at $outbox" >&2
+    return 1
+  }
+  if ! wake_pending_secondmate_receiver "$id"; then
     echo "error: remote backlog is durable at $id; outbox preserved at $outbox for wake retry" >&2
     return 1
   fi
@@ -591,7 +627,7 @@ fi
 
 if [ "${#TO_MOVE[@]}" -eq 0 ]; then
   echo "nothing to move: ${ALREADY[*]:-no keys} already present in $SUB_BACKLOG"
-  wake_secondmate_receiver "$ID" || exit 1
+  wake_pending_secondmate_receiver "$ID" || exit 1
   exit 0
 fi
 
@@ -642,7 +678,11 @@ fi
 
 echo "handed off ${#TO_MOVE[@]} item(s) to $ID: ${TO_MOVE[*]}"
 echo "  into $SUB_BACKLOG"
-wake_secondmate_receiver "$ID" || exit 1
+receiver_wake_mark_pending "$ID" || {
+  echo "error: backlog delivery to secondmate $ID succeeded, but receiver wake state could not be recorded" >&2
+  exit 1
+}
+wake_pending_secondmate_receiver "$ID" || exit 1
 if [ "${#ALREADY[@]}" -gt 0 ]; then
   echo "  already present (skipped): ${ALREADY[*]}"
 fi
