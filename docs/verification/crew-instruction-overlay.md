@@ -1,4 +1,4 @@
-# Crew instruction overlay hiding verification
+# Crew instruction overlay verification
 
 Audience: maintainer verification.
 

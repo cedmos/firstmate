@@ -673,6 +673,45 @@ test_herdr_lab_contract_applies_to_scouts_but_not_secondmates() {
   pass "fm-brief.sh: Herdr lab contract covers scouts and rejects secondmate misuse"
 }
 
+# The generated brief is this script's output contract: it is the prompt a crew
+# or scout agent is launched with, so the fence it emits is the artifact under
+# test, not an incidental source string.
+# The fence forbids fm-spawn.sh, fm-brief.sh and the rest of the fleet commands,
+# and this repository's own test suite invokes exactly those, so a crew working
+# on firstmate was being told to skip the tests. Every fence line the scaffold
+# emits must therefore carry the test-suite carve-out, in both crew variants.
+test_fleet_command_fence_carves_out_the_test_suite() {
+  local home kind id brief line fenced
+  home="$TMP_ROOT/fleet-fence-home"
+  mkdir -p "$home/data"
+
+  for kind in ship scout; do
+    id="brief-fleet-fence-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --scout >/dev/null 2>&1
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode no-mistakes >/dev/null 2>&1
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$kind: brief was not scaffolded"
+
+    fenced=0
+    while IFS= read -r line; do
+      case $line in
+        *'fleet-management command'*) ;;
+        *) continue ;;
+      esac
+      fenced=1
+      case $line in
+        *"except through this repository's own test suite"*) ;;
+        *) fail "$kind brief fences the fleet commands with no test-suite carve-out: $line" ;;
+      esac
+    done < "$brief"
+    [ "$fenced" -eq 1 ] || fail "$kind brief emitted no fleet-command fence at all"
+  done
+  pass "fm-brief.sh: the ship and scout fleet-command fences carve out this repository's own test suite"
+}
+
 test_pause_verb_override_renders_all_brief_scaffolds() {
   local home kind id brief
   home="$TMP_ROOT/pause-verb-home"
@@ -770,6 +809,7 @@ test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_documented_global_replace_leaves_the_herdr_gate_intact
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
+test_fleet_command_fence_carves_out_the_test_suite
 test_secondmate_no_projects_charter
 test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable
