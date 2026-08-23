@@ -196,6 +196,10 @@ teardown_release_locks() {
     fm_lock_release "${DESCENDANT_LOCK_PATHS[$i]}" || true
   done
   DESCENDANT_LOCK_PATHS=()
+  if [ -n "${HANDOFF_WAKE_RETIRE_LOCK:-}" ]; then
+    fm_lock_release "$HANDOFF_WAKE_RETIRE_LOCK" || true
+    HANDOFF_WAKE_RETIRE_LOCK=
+  fi
   if [ -n "${LOCAL_HANDOFF_LOCK:-}" ]; then
     fm_lock_release "$LOCAL_HANDOFF_LOCK" || true
     LOCAL_HANDOFF_LOCK=
@@ -245,6 +249,8 @@ LOCAL_REGISTRY_LOCK=
 HANDOFF_WAKE_RETIRE_MARKER=
 HANDOFF_WAKE_RETIRE_VALUE=
 HANDOFF_WAKE_RETIRE_CORR=
+HANDOFF_WAKE_RETIRE_LOCK=
+HANDOFF_WAKE_RETIRE_STAGE=
 
 handoff_wake_retire_validate() {
   local marker="$STATE/.backlog-handoff-$ID.wake-pending" value corr rec confirmation
@@ -322,6 +328,123 @@ handoff_wake_retire() {
     return "$rc"
   fi
   rm -f -- "$marker"
+}
+
+handoff_wake_retire_stage_restore() {
+  local stage=$HANDOFF_WAKE_RETIRE_STAGE marker rec confirmation name destination
+  [ -n "$stage" ] || return 0
+  marker="$STATE/.backlog-handoff-$ID.wake-pending"
+  rec=
+  confirmation=
+  if [ -n "$HANDOFF_WAKE_RETIRE_CORR" ]; then
+    rec=$(fm_pending_reply_path "$STATE" "$HANDOFF_WAKE_RETIRE_CORR")
+    confirmation=$(fm_pending_reply_delivery_confirmation_path "$STATE" "$HANDOFF_WAKE_RETIRE_CORR")
+  fi
+  for name in record confirmation marker; do
+    [ -e "$stage/$name" ] || continue
+    case "$name" in
+      record) destination=$rec ;;
+      confirmation) destination=$confirmation ;;
+      marker) destination=$marker ;;
+    esac
+    [ -n "$destination" ] && [ ! -e "$destination" ] && [ ! -L "$destination" ] \
+      && mv -- "$stage/$name" "$destination" || return 1
+  done
+  rm -f -- "$stage/corr" || return 1
+  rmdir -- "$stage" || return 1
+  if [ -n "$HANDOFF_WAKE_RETIRE_LOCK" ]; then
+    fm_lock_release "$HANDOFF_WAKE_RETIRE_LOCK" || return 1
+    HANDOFF_WAKE_RETIRE_LOCK=
+  fi
+  HANDOFF_WAKE_RETIRE_STAGE=
+}
+
+handoff_wake_retire_stage_commit() {
+  local stage=$HANDOFF_WAKE_RETIRE_STAGE retired
+  [ -n "$stage" ] || return 0
+  retired="$stage.retired.$$"
+  [ ! -e "$retired" ] && [ ! -L "$retired" ] || return 1
+  mv -- "$stage" "$retired" || return 1
+  HANDOFF_WAKE_RETIRE_STAGE=
+  if [ -n "$HANDOFF_WAKE_RETIRE_LOCK" ]; then
+    fm_lock_release "$HANDOFF_WAKE_RETIRE_LOCK" || return 1
+    HANDOFF_WAKE_RETIRE_LOCK=
+  fi
+  rm -rf -- "$retired" || echo "warning: retired receiver wake state remains at $retired" >&2
+}
+
+handoff_wake_retire_stage_recover() {
+  local home=$1 stage="$STATE/.backlog-handoff-$ID.wake-retiring" corr
+  [ -e "$stage" ] || [ -L "$stage" ] || return 0
+  [ -d "$stage" ] && [ ! -L "$stage" ] || {
+    echo "REFUSED: receiver wake retirement state for secondmate $ID is unsafe" >&2
+    return 1
+  }
+  if [ ! -e "$stage/corr" ] && [ ! -L "$stage/corr" ]; then
+    rmdir -- "$stage" 2>/dev/null && return 0
+    echo "REFUSED: receiver wake retirement state for secondmate $ID is incomplete" >&2
+    return 1
+  fi
+  [ -f "$stage/corr" ] && [ ! -L "$stage/corr" ] || {
+    echo "REFUSED: receiver wake retirement state for secondmate $ID is unsafe" >&2
+    return 1
+  }
+  corr=$(cat "$stage/corr" 2>/dev/null || true)
+  [ -z "$corr" ] || printf '%s' "$corr" | grep -Eq '^[a-f0-9]{16}$' || {
+    echo "REFUSED: receiver wake retirement correlation for secondmate $ID is invalid" >&2
+    return 1
+  }
+  local staged
+  for staged in "$stage/marker" "$stage/record" "$stage/confirmation"; do
+    [ ! -e "$staged" ] && [ ! -L "$staged" ] && continue
+    [ -f "$staged" ] && [ ! -L "$staged" ] || {
+      echo "REFUSED: receiver wake retirement state for secondmate $ID is unsafe" >&2
+      return 1
+    }
+  done
+  HANDOFF_WAKE_RETIRE_CORR=$corr
+  HANDOFF_WAKE_RETIRE_STAGE=$stage
+  if [ -n "$corr" ]; then
+    HANDOFF_WAKE_RETIRE_LOCK="$STATE/.pending-reply-$corr.lock"
+    fm_lock_acquire_wait "$HANDOFF_WAKE_RETIRE_LOCK" || return 1
+  fi
+  if [ -e "$home" ] || [ -L "$home" ]; then
+    handoff_wake_retire_stage_restore
+  else
+    handoff_wake_retire_stage_commit
+  fi
+}
+
+handoff_wake_retire_stage() {
+  local stage="$STATE/.backlog-handoff-$ID.wake-retiring" marker=$HANDOFF_WAKE_RETIRE_MARKER
+  local corr=$HANDOFF_WAKE_RETIRE_CORR rec confirmation
+  [ -n "$marker" ] || return 0
+  [ ! -e "$stage" ] && [ ! -L "$stage" ] || return 1
+  (umask 077; mkdir -- "$stage") || return 1
+  HANDOFF_WAKE_RETIRE_STAGE=$stage
+  printf '%s\n' "$corr" > "$stage/corr" || { handoff_wake_retire_stage_restore || true; return 1; }
+  if [ -n "$corr" ]; then
+    HANDOFF_WAKE_RETIRE_LOCK="$STATE/.pending-reply-$corr.lock"
+    fm_lock_acquire_wait "$HANDOFF_WAKE_RETIRE_LOCK" || {
+      HANDOFF_WAKE_RETIRE_LOCK=
+      handoff_wake_retire_stage_restore || true
+      return 1
+    }
+    rec=$(fm_pending_reply_path "$STATE" "$corr")
+    confirmation=$(fm_pending_reply_delivery_confirmation_path "$STATE" "$corr")
+    if [ -e "$rec" ] && ! mv -- "$rec" "$stage/record"; then
+      handoff_wake_retire_stage_restore || true
+      return 1
+    fi
+    if [ -e "$confirmation" ] && ! mv -- "$confirmation" "$stage/confirmation"; then
+      handoff_wake_retire_stage_restore || true
+      return 1
+    fi
+  fi
+  if ! mv -- "$marker" "$stage/marker"; then
+    handoff_wake_retire_stage_restore || true
+    return 1
+  fi
 }
 
 remote_teardown_locks_release() {
@@ -2384,8 +2507,9 @@ if [ "$KIND" = secondmate ]; then
   fm_lock_acquire_wait "$LOCAL_REGISTRY_LOCK" || exit 1
   LOCAL_HANDOFF_LOCK="$STATE/.backlog-handoff-$ID.lock"
   fm_lock_acquire_wait "$LOCAL_HANDOFF_LOCK" || exit 1
-  handoff_wake_retire_validate || exit 1
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
+  handoff_wake_retire_stage_recover "$HOME_PATH" || exit 1
+  handoff_wake_retire_validate || exit 1
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
     validate_firstmate_home_children_removal "$HOME_PATH" || exit 1
@@ -2646,11 +2770,18 @@ if [ "$BACKEND" = herdr ]; then
 fi
 if [ "$KIND" = secondmate ]; then
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
-  # Keep the durable wake intact until home retirement succeeds. If home
-  # removal fails, the registered receiver and its routed backlog still have
-  # their recovery signal; a teardown retry can remove both in order.
-  remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID" || exit $?
-  handoff_wake_retire || { echo "error: receiver wake cleanup failed; preserving the secondmate route for retry" >&2; exit 1; }
+  handoff_wake_retire_stage \
+    || { echo "error: receiver wake cleanup could not be staged; preserving the secondmate home and route" >&2; exit 1; }
+  if remove_firstmate_home "$HOME_PATH" "secondmate home" "$ID"; then
+    :
+  else
+    rc=$?
+    handoff_wake_retire_stage_restore \
+      || echo "error: receiver wake restoration failed; recovery state remains at $HANDOFF_WAKE_RETIRE_STAGE" >&2
+    exit "$rc"
+  fi
+  handoff_wake_retire_stage_commit \
+    || { echo "error: receiver wake cleanup failed; preserving the secondmate route for retry" >&2; exit 1; }
   remove_secondmate_registry_entry "$ID"
 fi
 remove_grok_turnend_auth "$STATE" "$ID" || exit 1
