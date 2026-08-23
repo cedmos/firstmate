@@ -112,7 +112,7 @@ PY
 }
 
 test_outcome_delivery_cursor_requires_contiguous_delivery() {
-  local home
+  local home replay
   home="$TMP_ROOT/delivery-cursor-home"
   mkdir -p "$home/state"
   FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append \
@@ -121,13 +121,17 @@ test_outcome_delivery_cursor_requires_contiguous_delivery() {
     --task task-2 --verdict routine --summary second >/dev/null || fail "second delivery outcome append failed"
   FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" mark-delivered --seq 2 \
     || fail "out-of-order delivery receipt failed"
-  [ "$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" unread | wc -l | tr -d ' ')" = 2 ] \
-    || fail "later delivery advanced across an undelivered outcome"
-  FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" mark-delivered --seq 1 \
-    || fail "first delivery receipt failed"
-  [ -z "$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" unread)" ] \
-    || fail "contiguous delivered outcomes did not advance the cursor"
-  pass "outcome cursor advances only across contiguous delivered merge notes"
+  replay=$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" startup-replay) \
+    || fail "out-of-order startup replay failed"
+  assert_contains "$replay" '"seq":1' "startup replay omitted the undelivered first outcome"
+  assert_not_contains "$replay" '"seq":2' "startup replay duplicated the already delivered second outcome"
+  FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" startup-replay-ack --through 1 \
+    || fail "first outcome replay acknowledgement failed"
+  [ "$(cat "$home/state/.branch-outcomes-cursor")" = 2 ] \
+    || fail "replay acknowledgement did not advance across the second outcome receipt"
+  [ -z "$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" startup-replay)" ] \
+    || fail "delivered outcomes replayed after contiguous acknowledgement"
+  pass "out-of-order delivered outcomes replay exactly once and advance contiguously"
 }
 
 test_branch_ack_requires_every_presented_outcome() {

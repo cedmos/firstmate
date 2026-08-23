@@ -549,7 +549,7 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function fallbackToMain(message: string, detail: string): void {
+  async function fallbackToMain(message: string, detail: string): Promise<void> {
     const body = `FIRSTMATE WATCHER WAKE: ${message}\n\nRun bin/fm-wake-drain.sh first and handle the queued wake. (Supervision branch unavailable, falling back to main: ${detail})`;
     let content = body;
     try {
@@ -559,7 +559,7 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // An encoding failure must not lose the wake; deliver it unmarked.
     }
-    pi.sendUserMessage(content, { deliverAs: "followUp" });
+    await pi.sendUserMessage(content, { deliverAs: "followUp" });
   }
 
   function persistAcceptedWake(message: string): string {
@@ -629,15 +629,17 @@ export default function (pi: ExtensionAPI) {
     } catch {
       return;
     }
-    for (const name of names) {
-      const path = join(pendingWakesDir, name);
-      try {
-        const parsed = JSON.parse(readFileSync(path, "utf8")) as { message?: unknown };
-        if (typeof parsed.message !== "string") continue;
-        fallbackToMain(parsed.message, "accepted wake recovered after supervision session shutdown");
-        clearAcceptedWake(path);
-      } catch {}
-    }
+    branchChain = branchChain.then(async () => {
+      for (const name of names) {
+        const path = join(pendingWakesDir, name);
+        try {
+          const parsed = JSON.parse(readFileSync(path, "utf8")) as { message?: unknown };
+          if (typeof parsed.message !== "string") continue;
+          await fallbackToMain(parsed.message, "accepted wake recovered after supervision session shutdown");
+          clearAcceptedWake(path);
+        } catch {}
+      }
+    });
   }
 
   function activateOwnership(): boolean {
@@ -684,7 +686,7 @@ export default function (pi: ExtensionAPI) {
           if (activeWake === wakeState) activeWake = null;
         }
       })
-      .catch((error: unknown) => {
+      .catch(async (error: unknown) => {
         if (
           shuttingDown ||
           acceptedGeneration !== generationToken ||
@@ -692,7 +694,7 @@ export default function (pi: ExtensionAPI) {
           lockOwnership() !== "owned"
         ) return;
         try {
-          fallbackToMain(message, error instanceof Error ? error.message : String(error));
+          await fallbackToMain(message, error instanceof Error ? error.message : String(error));
           clearAcceptedWake(pendingPath);
         } catch {}
       });

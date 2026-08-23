@@ -205,7 +205,9 @@ const pi = {
     sentToMain.push({ message, options: options ?? {} });
   },
   sendUserMessage(content, options) {
+    globalThis.__fmMainDeliveryAttempts = (globalThis.__fmMainDeliveryAttempts ?? 0) + 1;
     if (globalThis.__fmRejectMainDelivery) throw new Error("stale extension API");
+    if (globalThis.__fmRejectMainDeliveryAsync) return Promise.reject(new Error("async main delivery failed"));
     mainUserMessages.push({ content, options: options ?? {} });
   },
 };
@@ -523,6 +525,41 @@ EOF
   status=$?
   expect_code 0 "$status" "a completed wake without a report must fall back: $out"
   pass "a completed branch wake without a durable report falls back to main"
+}
+
+test_async_fallback_rejection_retains_wake_for_replay() {
+  local repo home out status
+  repo="$TMP_ROOT/async-fallback-root"
+  home="$TMP_ROOT/async-fallback-home"
+  mkdir -p "$home/state" "$home/config"
+  install_pi_branch_extension_fixture "$repo"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, mainUserMessages, home }; })()`);
+const { fire, dispatch, settle, mainUserMessages, home } = globalThis.__t;
+import { readdirSync } from "node:fs";
+globalThis.__fmRejectMainDeliveryAsync = true;
+if (!dispatch("signal: async fallback rejection").accepted) throw new Error("wake was not accepted");
+await settle(() => (globalThis.__fmMainDeliveryAttempts ?? 0) === 1, "rejected async fallback attempt");
+if (mainUserMessages.length !== 0) throw new Error("rejected async fallback appeared delivered");
+const pending = () => readdirSync(`${home}/state/branch-pending-wakes`).filter((name) => name.endsWith(".json"));
+if (pending().length !== 1) throw new Error("rejected async fallback deleted its durable wake marker");
+globalThis.__fmRejectMainDeliveryAsync = false;
+const ctx = { sessionManager: { getSessionFile: () => "main.jsonl", getEntries: () => [] } };
+await fire("session_shutdown", {}, ctx);
+await fire("session_start", {}, ctx);
+await settle(() => mainUserMessages.length === 1, "replacement-session wake replay");
+await settle(() => pending().length === 0, "delivered replay marker cleanup");
+if (!mainUserMessages[0].content.includes("signal: async fallback rejection")) {
+  throw new Error("replacement replay lost the retained wake");
+}
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "async fallback rejection must retain its accepted wake: $out"
+  pass "async fallback rejection retains the wake until replacement replay"
 }
 
 test_completed_wake_without_ack_falls_back() {
@@ -1000,6 +1037,7 @@ test_branch_dispatch_two_stage_filter_and_prefix_contract
 test_branch_cache_key_is_per_home_stable
 test_branch_gating_config_afk_and_fallback
 test_completed_wake_without_report_falls_back
+test_async_fallback_rejection_retains_wake_for_replay
 test_completed_wake_without_ack_falls_back
 test_partial_ack_preserves_wake_fallback
 test_failed_merge_preserves_wake_fallback

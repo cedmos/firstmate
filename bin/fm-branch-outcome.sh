@@ -96,6 +96,7 @@ print_unread() {
     seq=$(record_seq "$line")
     [ -n "$seq" ] || continue
     [ "$seq" -gt "$cursor" ] || continue
+    [ ! -f "$DELIVERED_DIR/$seq" ] || continue
     printf '%s\n' "$line"
   done < "$STORE"
 }
@@ -112,6 +113,21 @@ advance_cursor() { # <seq>
     case "${tmp##*/}" in ''|*[!0-9]*) continue ;; esac
     [ "${tmp##*/}" -gt "$through" ] || rm -f -- "$tmp"
   done
+}
+
+advance_delivered_cursor() {
+  local next last
+  next=$(( $(read_cursor) + 1 ))
+  last=$(last_seq)
+  while [ "$next" -le "$last" ] && [ -f "$DELIVERED_DIR/$next" ]; do
+    advance_cursor "$next"
+    next=$((next + 1))
+  done
+}
+
+acknowledge_through() { # <seq>
+  advance_cursor "$1"
+  advance_delivered_cursor
 }
 
 CMD=${1:-}
@@ -158,7 +174,7 @@ case "$CMD" in
     case "$THROUGH" in ''|*[!0-9]*) usage ;; esac
     [ "$#" -eq 2 ] || usage
     fm_lock_acquire_wait "$LOCK"
-    advance_cursor "$THROUGH"
+    acknowledge_through "$THROUGH"
     fm_lock_release "$LOCK"
     ;;
   mark-delivered)
@@ -171,12 +187,7 @@ case "$CMD" in
     if [ "$DELIVERED" -gt "$CURSOR_VALUE" ]; then
       mkdir -p "$DELIVERED_DIR"
       : > "$DELIVERED_DIR/$DELIVERED"
-      NEXT=$((CURSOR_VALUE + 1))
-      LAST=$(last_seq)
-      while [ "$NEXT" -le "$LAST" ] && [ -f "$DELIVERED_DIR/$NEXT" ]; do
-        advance_cursor "$NEXT"
-        NEXT=$((NEXT + 1))
-      done
+      advance_delivered_cursor
     fi
     fm_lock_release "$LOCK"
     ;;
@@ -207,7 +218,7 @@ case "$CMD" in
     case "$THROUGH" in ''|*[!0-9]*) usage ;; esac
     [ "$#" -eq 2 ] || usage
     fm_lock_acquire_wait "$LOCK"
-    advance_cursor "$THROUGH"
+    acknowledge_through "$THROUGH"
     fm_lock_release "$LOCK"
     ;;
   *) usage ;;
