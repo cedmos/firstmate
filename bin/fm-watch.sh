@@ -1098,9 +1098,11 @@ $pending
 EOF
     reason="signal:$files"
     # Record every terminal result this signal carries into the durable Flowy
-    # outbox BEFORE the triage below advances the seen markers. Recording is a
-    # local write that cannot fail on the network, and the per-pass drain above
-    # owns getting it delivered, so a result is never lost to one bad POST.
+    # outbox BEFORE the triage below advances the seen markers. --no-drain keeps
+    # this to the local write: it opens no socket and reads no Keychain, so an
+    # unreachable Flowy cannot delay the wake below it. The per-pass drain above
+    # is the sole owner of getting a record delivered, so a result is never lost
+    # to one bad POST either.
     flowy_result_files=""
     while IFS=$(printf '\t') read -r sf sig f; do
       [ -n "$sf" ] || continue
@@ -1110,8 +1112,8 @@ EOF
         done:*|failed:*|blocked:*|needs-decision:*)
           flowy_result_files="$flowy_result_files $f"
           if [ -x "$FLOWY_COMPLETION_OUTBOX" ]; then
-            FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$FLOWY_COMPLETION_OUTBOX" --status "$f" \
-              || triage_log "Flowy completion outbox has undelivered results for $(basename "$f")"
+            FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$FLOWY_COMPLETION_OUTBOX" --status "$f" --no-drain \
+              || triage_log "Flowy completion outbox could not record the result for $(basename "$f")"
           fi
           ;;
       esac

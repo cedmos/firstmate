@@ -2,7 +2,7 @@
 # Durably deliver a captain-visible crew result to Flowy.
 #
 # Usage:
-#   fm-completion-outbox.sh --status STATUS_FILE [--dry-run]
+#   fm-completion-outbox.sh --status STATUS_FILE [--no-drain] [--dry-run]
 #   fm-completion-outbox.sh --drain [--dry-run]
 #
 # Delivery is a two-stage durable outbox, never one best-effort POST.
@@ -11,29 +11,46 @@
 # only done:, failed:, blocked:, and needs-decision: are results; anything else
 # is a silent no-op. A result becomes an immutable record at
 # state/flowy-outbox/pending/<task>.<digest> BEFORE any network call, where
-# <digest> covers the result line. Re-recording an identical result is a no-op,
-# and a second distinct result for the same task gets its own record, so no
-# result can overwrite another. --status then drains.
+# <digest> covers the result line together with the status file's wake
+# signature. Re-observing an unchanged status file is therefore a no-op, while
+# the same result text written again as a genuinely new event gets its own
+# record, as does a second distinct result for the same task, so no result can
+# overwrite another. --status then drains unless --no-drain is given.
 #
-# DRAIN (--drain, and implicitly after --status). Every pending record is
-# POSTed as JSON to the URL in config/grok-flowy-webhook, authenticated with the
-# Keychain Bearer key for service firstmate-flowy-webhook. No environment
-# variable configures the endpoint. A record retires ONLY on HTTP 2xx, at which
-# point its per-record receipt is written to
+# RECORD ONLY (--status --no-drain). Records exactly as above and returns
+# without any network call, Keychain read, or endpoint-configuration read, so a
+# caller on a latency-sensitive path can never be stalled by an unreachable
+# Flowy. Some later --drain is the sole owner of delivering what it recorded.
+#
+# DRAIN (--drain, and implicitly after --status). Pending records are drained
+# oldest first and POSTed as JSON to the URL in config/grok-flowy-webhook,
+# authenticated with the Keychain Bearer key for service firstmate-flowy-webhook.
+# No environment variable configures the endpoint. A record retires ONLY on
+# HTTP 2xx, at which point its per-record receipt is written to
 # state/flowy-outbox/delivered/<task>.<digest>.md. Any other outcome - a non-2xx
 # code, a transport failure, a missing URL file, an unavailable key - leaves the
 # record pending, so the next drain retries it and delivery state survives a
-# restart. A receipt therefore never exists without a 2xx.
+# restart. A receipt therefore never exists without a 2xx. A transport failure
+# is endpoint-wide rather than record-specific, so the first one ends the pass
+# and every remaining record simply stays pending for the next drain; a
+# per-record HTTP code such as 503 keeps the pass going.
 #
-# state/flowy-last.md is refreshed after a delivery as an aggregate DISPLAY
-# snapshot and is never delivery authority. Its pending: line lists the task ids
-# whose results are still undelivered, or (none).
+# state/flowy-last.md is an aggregate DISPLAY snapshot and is never delivery
+# authority. Only a 2xx creates it or moves its files: and status: lines, which
+# then describe the NEWEST result that actually reached Flowy. Its pending: line
+# lists the task ids whose results are still undelivered, or (none), and is
+# refreshed in an existing snapshot whenever the pending set changes, including
+# on a record-only run and on a pass that delivered nothing; every other line is
+# carried forward unchanged, so pending: is the one line that moves without a
+# 2xx.
 #
 # --dry-run reports what it would record and send and writes nothing at all: no
 # record, no receipt, no aggregate snapshot, and no network or Keychain call.
 #
-# Exit 0 when nothing is left pending, 1 when a record is still pending or the
-# run could not complete, 2 on usage.
+# Exit 2 on usage. A draining run exits 0 when nothing is left pending and 1
+# when a record is still pending or the run could not complete. A --no-drain run
+# exits 0 whenever the result is durably recorded, and 1 only when recording
+# itself failed.
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,7 +75,7 @@ KEYCHAIN_ACCOUNT=flowy
 HTTP_TIMEOUT=${FM_FLOWY_HTTP_TIMEOUT:-20}
 
 usage() {
-  echo "usage: fm-completion-outbox.sh --status STATUS_FILE [--dry-run]" >&2
+  echo "usage: fm-completion-outbox.sh --status STATUS_FILE [--no-drain] [--dry-run]" >&2
   echo "       fm-completion-outbox.sh --drain [--dry-run]" >&2
   exit 2
 }
@@ -75,6 +92,7 @@ note() { echo "fm-completion-outbox: $*" >&2; }
 status_file=
 mode=
 dry_run=0
+no_drain=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --status)
@@ -89,6 +107,10 @@ while [ "$#" -gt 0 ]; do
       mode=drain
       shift
       ;;
+    --no-drain)
+      no_drain=1
+      shift
+      ;;
     --dry-run)
       dry_run=1
       shift
@@ -98,6 +120,9 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 [ -n "$mode" ] || usage
+# --no-drain narrows --status to its record stage; it cannot narrow a run whose
+# only stage is the drain.
+[ "$mode" = status ] || [ "$no_drain" -eq 0 ] || usage
 
 digest_of() {  # <text>
   local sum
@@ -126,12 +151,17 @@ artifact_for() {  # <task> <status-file>
   fi
 }
 
+# Oldest recorded result first. A plain glob is collation-ordered, which would
+# let the drain finish on an older record and hand the display snapshot a result
+# that is not the newest one delivered.
 pending_records() {
-  local record
+  local record recorded tab
+  tab=$(printf '\t')
   for record in "$PENDING_DIR"/*; do
     [ -f "$record" ] || continue
-    printf '%s\n' "$record"
-  done
+    recorded=$(record_field "$record" recorded)
+    printf '%s%s%s\n' "${recorded:-0}" "$tab" "$record"
+  done | LC_ALL=C sort -t"$tab" -k1,1n -k2,2 | cut -d"$tab" -f2-
 }
 
 pending_task_ids() {
@@ -153,7 +183,7 @@ EOF
 }
 
 record_result() {  # <status-file>
-  local file=$1 result task digest record artifact tmp
+  local file=$1 result task digest record artifact tmp signature
   [ -f "$file" ] && [ ! -L "$file" ] || {
     note "status file is unavailable or unsafe: $file"
     return 1
@@ -173,7 +203,13 @@ record_result() {  # <status-file>
   esac
 
   task=$(basename "$file" .status)
-  digest=$(digest_of "$result") || {
+  # The digest covers the watcher's own wake signature for this status file as
+  # well as the result line, so re-observing unchanged bytes still de-duplicates
+  # while a genuinely new event that happens to carry identical text - the same
+  # templated blocked: line raised a second time - is recorded and delivered
+  # again instead of being suppressed forever.
+  signature=$(fm_wake_signal_sig "$file") || signature=
+  digest=$(digest_of "$signature|$result") || {
     note "cannot digest the result for $task"
     return 1
   }
@@ -206,6 +242,9 @@ record_result() {  # <status-file>
   } > "$tmp"
   chmod 600 "$tmp"
   mv -f "$tmp" "$record"
+  # The pending set just grew, so the snapshot's pending: line would otherwise
+  # keep claiming this result is already delivered.
+  refresh_snapshot_pending || true
 }
 
 webhook_url() {
@@ -239,10 +278,16 @@ webhook_key() {
 }
 
 # Set by deliver_record on success so the aggregate snapshot describes the last
-# result that actually reached Flowy, never one that merely reached disk.
+# result that actually reached Flowy, never one that merely reached disk. The
+# drain walks its records oldest first, so the last one set here is the newest.
 DELIVERED_TASK=
 DELIVERED_RESULT=
 DELIVERED_ARTIFACT=
+
+# Set by deliver_record when the endpoint gave no HTTP response at all. That is
+# an endpoint-wide condition, not a property of the record being sent, so the
+# drain stops attempting further records for this pass.
+TRANSPORT_FAILED=0
 
 deliver_record() {  # <record> <url> <key>
   local record=$1 url=$2 key=$3 base task digest result artifact recorded payload code receipt tmp
@@ -289,6 +334,7 @@ deliver_record() {  # <record> <url> <key>
   case "$code" in
     2??) ;;
     *)
+      [ -n "$code" ] || TRANSPORT_FAILED=1
       note "Flowy webhook returned ${code:-no response} for $task; result stays pending"
       return 1
       ;;
@@ -331,6 +377,30 @@ write_snapshot() {  # <task> <result> <artifact>
   mv -f "$tmp" "$SNAPSHOT"
 }
 
+# Move ONLY the pending: line of an existing snapshot, carrying every other line
+# forward unchanged. A snapshot that does not exist yet is left alone: creating
+# one here would give the display a files:/status: pair no 2xx ever authorized.
+refresh_snapshot_pending() {
+  local tmp ids
+  [ -f "$SNAPSHOT" ] || return 0
+  ids=$(pending_task_ids)
+  tmp=$(umask 077; mktemp "$STATE/.flowy-last.XXXXXX") || {
+    note "cannot refresh the display snapshot's pending line"
+    return 1
+  }
+  awk -v ids="$ids" '
+    /^pending: / { print "pending: " ids; seen = 1; next }
+    { print }
+    END { if (!seen) print "pending: " ids }
+  ' "$SNAPSHOT" > "$tmp" || {
+    rm -f "$tmp"
+    note "cannot refresh the display snapshot's pending line"
+    return 1
+  }
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$SNAPSHOT"
+}
+
 drain() {
   local records record url key delivered=0 remaining=0 rc=0
 
@@ -368,9 +438,17 @@ EOF
     return 1
   fi
 
+  TRANSPORT_FAILED=0
   while IFS= read -r record; do
     [ -n "$record" ] || continue
     [ -f "$record" ] || continue
+    # The endpoint already proved unreachable this pass, so every further POST
+    # would only buy another full timeout. Count the record as still pending and
+    # leave it untouched for the next drain.
+    if [ "$TRANSPORT_FAILED" -eq 1 ]; then
+      remaining=$((remaining + 1))
+      continue
+    fi
     if deliver_record "$record" "$url" "$key"; then
       delivered=$((delivered + 1))
     else
@@ -380,8 +458,14 @@ EOF
 $records
 EOF
 
+  if [ "$TRANSPORT_FAILED" -eq 1 ] && [ "$remaining" -gt 1 ]; then
+    note "the Flowy endpoint did not respond, so $remaining results stay pending for the next drain"
+  fi
+
   if [ "$delivered" -gt 0 ]; then
     write_snapshot "$DELIVERED_TASK" "$DELIVERED_RESULT" "$DELIVERED_ARTIFACT" || rc=1
+  else
+    refresh_snapshot_pending || rc=1
   fi
   [ "$remaining" -eq 0 ] || rc=1
 
@@ -394,5 +478,7 @@ rc=0
 if [ "$mode" = status ]; then
   record_result "$status_file" || rc=1
 fi
-drain || rc=1
+if [ "$no_drain" -eq 0 ]; then
+  drain || rc=1
+fi
 exit "$rc"
