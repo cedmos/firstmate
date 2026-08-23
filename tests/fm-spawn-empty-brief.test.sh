@@ -10,8 +10,8 @@
 # charter (the other file this one gate covers) is refused under a remediation
 # that fits it, and an ordinary brief still launches a worker.
 #
-# The two refusal cases are reached before any tmux/treehouse side effect, so
-# they create no windows or worktrees. The launch case needs the full fixture
+# Every refusal case is reached before any tmux/treehouse side effect, so none
+# of them create windows or worktrees. The launch case needs the full fixture
 # (fake terminal, real git origin and pooled worktree) because proving "still
 # launches" honestly means reaching `spawned <id>`, not just clearing the gate.
 set -u
