@@ -8,7 +8,11 @@
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
 #   per task at intake (AGENTS.md section 7); data/projects.md holds the captain's
 #   standing posture as context, not as this task's answer, so a spawn never looks
-#   the mode up. A ship spawn additionally reads the brief's recorded
+#   the mode up. Every spawn refuses a missing brief, and refuses an EMPTY brief
+#   under its own distinct error, because a zero-byte brief is a launch with no
+#   instructions in it at all: the agent comes up idle while the task records as
+#   spawned. The two faults have different fixes, so they never share a message.
+#   A ship spawn additionally reads the brief's recorded
 #   "Delivery contract: mode=<mode>" line and REFUSES a mismatch, so the worker's
 #   instructions and the recorded task delivery cannot drift apart; a brief
 #   scaffolded before that line existed warns once and launches on the flag. When
@@ -1641,7 +1645,14 @@ else
   WT=""
   BRIEF="$DATA/$ID/brief.md"
 fi
+# Existence and content are separate faults with separate fixes, so they get
+# separate errors. A brief truncated to zero bytes (a writer that opened it
+# before reading it, an interrupted scaffold) still satisfies -f, and every
+# launch template pipes the brief into the agent as its whole instruction set:
+# the worker comes up at an idle prompt with nothing to do while the task
+# records as spawned. Refuse the launch instead.
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
+[ -s "$BRIEF" ] || { echo "error: the brief at $BRIEF is empty; a worker launched on it would have no instructions to read - re-scaffold it with bin/fm-brief.sh and fill in the task before spawning" >&2; exit 1; }
 
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
   case "$1" in
