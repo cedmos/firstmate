@@ -269,6 +269,12 @@ test_mutating_scripts_refuse_the_other_actors_lease() {
   assert_contains "$out" "no task 'task-unheld'" "unleased fm-control lost its ordinary error"
   [ ! -e "$home/state/.lease-task-unheld" ] || fail "fm-control cleanup left its acquired lease behind"
 
+  out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-teardown.sh" task-unheld --force 2>&1)
+  status=$?
+  [ "$status" -eq 6 ] || fail "branch forced teardown exited $status, not 6: $out"
+  assert_contains "$out" "cannot discard work" "branch forced teardown refusal lost its destructive boundary"
+  [ ! -e "$home/state/.lease-task-unheld" ] || fail "refused branch forced teardown acquired a lease"
+
   # fm-teardown: same refusal shape before any teardown work.
   out=$(FM_HOME="$home" "$ROOT/bin/fm-teardown.sh" task-held 2>&1)
   status=$?
@@ -310,6 +316,25 @@ test_main_owned_actions_refuse_the_branch_actor() {
   status=$?
   [ "$status" -eq 6 ] || fail "branch fm-spawn exited $status, not 6: $out"
   assert_contains "$out" "new-task spawn (fm-spawn) refused" "spawn refusal lost its action label"
+
+  out=$(FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_SUPERVISION_ACTOR=branch \
+    "$ROOT/bin/fm-spawn.sh" task-relaunch --relaunch 2>&1)
+  status=$?
+  [ "$status" -eq 6 ] || fail "direct branch relaunch exited $status, not 6: $out"
+  assert_contains "$out" "must relaunch through fm-control" "direct branch relaunch refusal lost its control boundary"
+
+  out=$(STATE="$home/state" FM_HOME="$home" FM_ROOT_OVERRIDE="$root" FM_SUPERVISION_ACTOR=branch bash -c '
+    . "$1/bin/fm-wake-lib.sh"
+    lock="$2/.control-task-parent.lock"
+    fm_lock_acquire_wait "$lock"
+    FM_CONTROL_RELAUNCH_TX=test-transaction "$1/bin/fm-spawn.sh" task-parent --relaunch
+    status=$?
+    fm_lock_release "$lock"
+    exit "$status"
+  ' _ "$ROOT" "$home/state" 2>&1)
+  status=$?
+  [ "$status" -ne 6 ] || fail "fm-control-parented branch relaunch hit the role refusal: $out"
+  assert_contains "$out" "needs an existing task record" "parented branch relaunch did not reach ordinary validation"
 
   # The same calls as MAIN fail on their ORDINARY validation instead - the
   # partition guard never fires for the main actor.

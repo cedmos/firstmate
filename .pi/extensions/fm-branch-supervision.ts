@@ -71,6 +71,7 @@ const leaseScript = join(fmRoot, "bin", "fm-lease.sh");
 const loadedMarker = join(state, ".pi-branch-extension-loaded");
 const branchGenerationFile = join(state, ".pi-branch-generation");
 const pendingWakesDir = join(state, "branch-pending-wakes");
+const ackReceiptsDir = join(state, "branch-ack-receipts");
 
 // Same tool set in the same order on every request (part of the cached
 // prefix). "bash" resolves to the customTools override below, which injects
@@ -506,6 +507,47 @@ export default function (pi: ExtensionAPI) {
     } catch {}
   }
 
+  function clearAckReceipts(): void {
+    let names: string[];
+    try {
+      names = readdirSync(ackReceiptsDir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      try {
+        unlinkSync(join(ackReceiptsDir, name));
+      } catch {}
+    }
+  }
+
+  function consumeMatchingAckReceipt(mergedWakeSequences: Set<number>): boolean {
+    let names: string[];
+    try {
+      names = readdirSync(ackReceiptsDir);
+    } catch {
+      return false;
+    }
+    let matched = false;
+    for (const name of names) {
+      const path = join(ackReceiptsDir, name);
+      try {
+        const sequences = readFileSync(path, "utf8")
+          .split(/\s+/)
+          .filter(Boolean)
+          .map(Number);
+        if (
+          sequences.length > 0 &&
+          sequences.every((sequence) => Number.isInteger(sequence) && mergedWakeSequences.has(sequence))
+        ) {
+          matched = true;
+        }
+        unlinkSync(path);
+      } catch {}
+    }
+    return matched;
+  }
+
   function replayAcceptedWakes(): void {
     let names: string[];
     try {
@@ -533,6 +575,7 @@ export default function (pi: ExtensionAPI) {
         const session = await ensureBranch();
         await flushMirror(session);
         const wakeState = { mergedWakeSequences: new Set<number>() };
+        clearAckReceipts();
         activeWake = wakeState;
         try {
           await session.prompt(
@@ -540,6 +583,9 @@ export default function (pi: ExtensionAPI) {
           );
           if (wakeState.mergedWakeSequences.size === 0) {
             throw new Error("supervision branch completed without a durable outcome report");
+          }
+          if (!consumeMatchingAckReceipt(wakeState.mergedWakeSequences)) {
+            throw new Error("supervision branch completed without acknowledging its reported wake batch");
           }
           clearAcceptedWake(pendingPath);
         } finally {
@@ -616,13 +662,15 @@ export default function (pi: ExtensionAPI) {
   // reopens the persistent branch from its recorded pointer. Terminal quit
   // simply never fires another session_start.
   pi.on?.("session_start", () => {
-    shuttingDown = false;
+    shuttingDown = true;
     branchBroken = "";
     markLoaded();
     const startedGeneration = sessionGeneration;
     void branchCleanup.then(() => {
-      if (shuttingDown || startedGeneration !== sessionGeneration) return;
-      if (releaseBranchLeases()) replayAcceptedWakes();
+      if (startedGeneration !== sessionGeneration) return;
+      if (!releaseBranchLeases()) return;
+      replayAcceptedWakes();
+      shuttingDown = false;
     });
     // A replacement main session (/new, /resume) restarts dialog mirroring
     // from the new session file; collectMainDialog re-anchors the cursor.

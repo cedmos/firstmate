@@ -255,7 +255,7 @@ test_branch_dispatch_two_stage_filter_and_prefix_contract() {
 const prelude = process.env.DRIVER_PRELUDE;
 await eval(`(async () => { ${prelude}; globalThis.__t = { pi, fire, dispatch, settle, outcomeScript, sentToMain, mainUserMessages, mainTools, renderers, home, realRoot }; })()`);
 const { fire, dispatch, settle, outcomeScript, sentToMain, mainUserMessages, mainTools, renderers, home, realRoot } = globalThis.__t;
-import { readFileSync, readdirSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 
 // 1. An accepted wake reaches the branch session, never main.
 globalThis.__fmBlockPrompt = true;
@@ -349,6 +349,8 @@ if (listedText.split("\n").length !== 2 || !listedText.includes("checks green"))
 if (!renderers.has("fm-branch-merge")) throw new Error("merge-note renderer missing");
 const rendered = renderers.get("fm-branch-merge")({ content: "note body" }, { expanded: false }, { fg: (_c, text) => text });
 if (rendered.text !== "note body") throw new Error("merge-note renderer dropped the note");
+mkdirSync(`${home}/state/branch-ack-receipts`, { recursive: true });
+writeFileSync(`${home}/state/branch-ack-receipts/receipt-test`, "1\n2\n3\n");
 session.resolvePrompt();
 await settle(
   () => !readdirSync(`${home}/state/branch-pending-wakes`).some((name) => name.endsWith(".json")),
@@ -494,6 +496,37 @@ EOF
   pass "a completed branch wake without a durable report falls back to main"
 }
 
+test_completed_wake_without_ack_falls_back() {
+  local repo home out status
+  repo="$TMP_ROOT/missing-ack-root"
+  home="$TMP_ROOT/missing-ack-home"
+  mkdir -p "$home/state" "$home/config"
+  install_pi_branch_extension_fixture "$repo"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { dispatch, settle, mainUserMessages }; })()`);
+const { dispatch, settle, mainUserMessages } = globalThis.__t;
+globalThis.__fmBlockPrompt = true;
+if (!dispatch("signal: branch omitted acknowledgement").accepted) throw new Error("wake was not accepted");
+await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "missing-ack prompt");
+const session = globalThis.__fmSessions[0];
+const report = session.options.customTools.find((tool) => tool.name === "fm_branch_report");
+const result = await report.execute("missing-ack", { task: "task-a", verdict: "routine", summary: "handled", wakeSequence: 0 });
+if (result.isError) throw new Error("durable report failed");
+session.resolvePrompt();
+await settle(() => mainUserMessages.length === 1, "missing-ack fallback");
+if (!mainUserMessages[0].content.includes("without acknowledging its reported wake batch")) {
+  throw new Error("missing acknowledgement did not preserve fallback to main");
+}
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "a completed wake without acknowledgement must fall back: $out"
+  pass "a completed branch wake without acknowledgement falls back to main"
+}
+
 test_failed_merge_preserves_wake_fallback() {
   local repo home out status
   repo="$TMP_ROOT/merge-failure-root"
@@ -565,6 +598,9 @@ await new Promise((resolve) => setTimeout(resolve, 30));
 if (mainUserMessages.length !== 0) throw new Error("shutdown used the invalidated extension API");
 globalThis.__fmRejectMainDelivery = false;
 fire("session_start");
+if (dispatch("signal: replacement before cleanup").accepted) {
+  throw new Error("replacement branch accepted work before old tools quiesced");
+}
 await new Promise((resolve) => setTimeout(resolve, 30));
 const { existsSync, readdirSync } = await import("node:fs");
 if (!existsSync(`${home}/state/.lease-shutdown-task`)) throw new Error("shutdown released a lease before its tool quiesced");
@@ -716,6 +752,7 @@ test_branch_dispatch_two_stage_filter_and_prefix_contract
 test_branch_cache_key_is_per_home_stable
 test_branch_gating_config_afk_and_fallback
 test_completed_wake_without_report_falls_back
+test_completed_wake_without_ack_falls_back
 test_failed_merge_preserves_wake_fallback
 test_accepted_wakes_fall_back_during_shutdown
 test_branch_mirror_filters_order_and_cursor

@@ -715,16 +715,17 @@ else
   fi
   # Pi supervision-branch recovery, locked path only: clear leases whose
   # supervising process died, and surface outcomes the branch stored durably
-  # that never reached main (docs/pi-supervision-branch.md). Both are silent
-  # no-ops in a home that never ran the branch.
-  FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$SCRIPT_DIR/fm-lease.sh" sweep 2>/dev/null || true
-  BRANCH_REPLAY_OUT=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
-    "$SCRIPT_DIR/fm-branch-outcome.sh" startup-replay 2>&1) || BRANCH_REPLAY_OUT=
-  if [ -n "$BRANCH_REPLAY_OUT" ]; then
-    BRANCH_REPLAY_LAST=$(printf '%s\n' "$BRANCH_REPLAY_OUT" | sed -n 's/^{"seq":\([0-9][0-9]*\),.*/\1/p' | tail -n 1)
-    if printf '%s\n' "$BRANCH_REPLAY_OUT" && [ -n "$BRANCH_REPLAY_LAST" ]; then
-      FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
-        "$SCRIPT_DIR/fm-branch-outcome.sh" startup-replay-ack --through "$BRANCH_REPLAY_LAST" 2>/dev/null || true
+  # that never reached main (docs/pi-supervision-branch.md).
+  if [ "$PRIMARY_HARNESS" = pi ] || [ "$PRIMARY_HARNESS" = pi-signed ]; then
+    FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$SCRIPT_DIR/fm-lease.sh" sweep 2>/dev/null || true
+    BRANCH_REPLAY_OUT=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+      "$SCRIPT_DIR/fm-branch-outcome.sh" startup-replay 2>&1) || BRANCH_REPLAY_OUT=
+    if [ -n "$BRANCH_REPLAY_OUT" ]; then
+      BRANCH_REPLAY_LAST=$(printf '%s\n' "$BRANCH_REPLAY_OUT" | sed -n 's/^{"seq":\([0-9][0-9]*\),.*/\1/p' | tail -n 1)
+      if printf '%s\n' "$BRANCH_REPLAY_OUT" && [ -n "$BRANCH_REPLAY_LAST" ]; then
+        FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" \
+          "$SCRIPT_DIR/fm-branch-outcome.sh" startup-replay-ack --through "$BRANCH_REPLAY_LAST" 2>/dev/null || true
+      fi
     fi
   fi
   DRAIN_OUT=$("$SCRIPT_DIR/fm-wake-drain.sh" 2>&1)
