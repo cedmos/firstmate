@@ -105,17 +105,17 @@ command -v jq   >/dev/null 2>&1 || { emit_error_once "missing jq"; exit 0; }
 fmx_context_registry_prune "$STATE"
 
 BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/fm-x-poll.XXXXXX") || exit 0
-AUTH_HEADER_FILE=
-trap 'rm -f "$BODY_FILE" "$AUTH_HEADER_FILE"' EXIT
-AUTH_HEADER_FILE=$(fmx_auth_header_file) || { emit_error_once "invalid token"; exit 0; }
+trap 'rm -f "$BODY_FILE"' EXIT
+CURL_CONFIG=$(fmx_curl_config "$FMX_RELAY/connector/poll") || { emit_error_once "invalid token"; exit 0; }
 
 # Short, bounded poll: a failure or timeout simply means "no wake this cycle";
 # the next check cycle retries. -m 5 keeps this well inside the watcher's
 # per-check timeout so the supervision loop is never starved.
-code=$(curl -m 5 -s -o "$BODY_FILE" -w '%{http_code}' \
-  -H "@$AUTH_HEADER_FILE" \
-  -H 'Accept: application/json' \
-  "$FMX_RELAY/connector/poll" 2>/dev/null) || exit 0
+#
+# URL and bearer header go in on stdin (see fmx_curl_config) so the token is
+# never visible in curl's argv.
+code=$(printf '%s\n' "$CURL_CONFIG" | curl -K - -m 5 -s -o "$BODY_FILE" -w '%{http_code}' \
+  -H 'Accept: application/json' 2>/dev/null) || exit 0
 
 # 204 (nothing pending) is the common path; only 200 can carry a mention.
 case "$code" in

@@ -89,18 +89,17 @@ if [ -z "$FMX_TOKEN" ]; then
   exit 1
 fi
 command -v curl >/dev/null 2>&1 || { echo "fm-x-dismiss: curl not found" >&2; exit 1; }
-AUTH_HEADER_FILE=$(fmx_auth_header_file) || {
+CURL_CONFIG=$(fmx_curl_config "$FMX_RELAY/connector/dismiss") || {
   echo "fm-x-dismiss: invalid FMX_PAIRING_TOKEN" >&2
   exit 1
 }
-trap 'rm -f "$AUTH_HEADER_FILE"' EXIT
 
-code=$(curl -m 10 -s -o /dev/null -w '%{http_code}' \
+# URL and bearer header go in on stdin (see fmx_curl_config) so the token is
+# never visible in curl's argv.
+code=$(printf '%s\n' "$CURL_CONFIG" | curl -K - -m 10 -s -o /dev/null -w '%{http_code}' \
   -X POST \
-  -H "@$AUTH_HEADER_FILE" \
   -H 'Content-Type: application/json' \
-  --data "$PAYLOAD" \
-  "$FMX_RELAY/connector/dismiss" 2>/dev/null) || {
+  --data "$PAYLOAD" 2>/dev/null) || {
   echo "fm-x-dismiss: request to relay failed" >&2
   exit 1
 }

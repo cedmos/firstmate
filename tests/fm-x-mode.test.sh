@@ -33,8 +33,36 @@ make_fake_curl() {
 #!/usr/bin/env bash
 ofile="" method=GET data="" url="" auth=""
 argv=$*
+
+# Undo curl's quoted-value escaping (\\ and \") from a -K config directive.
+unesc() {
+  local s=$1 out= c
+  while [ -n "$s" ]; do
+    c=${s:0:1}
+    if [ "$c" = '\' ]; then out=$out${s:1:1}; s=${s:2}; else out=$out$c; s=${s:1}; fi
+  done
+  printf '%s' "$out"
+}
+
+# Parse the url/header directives the client feeds to `curl -K -` on stdin.
+read_config() {
+  local line v
+  while IFS= read -r line; do
+    case "$line" in
+      'url = "'*)
+        v=${line#'url = "'}; v=${v%'"'}; url=$(unesc "$v") ;;
+      'header = "'*)
+        v=${line#'header = "'}; v=${v%'"'}; v=$(unesc "$v")
+        case "$v" in Authorization:*) auth=$v ;; esac ;;
+    esac
+  done
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
+    -K)
+      if [ "$2" = "-" ]; then read_config; else read_config < "$2"; fi
+      shift 2 ;;
     -o) ofile=$2; shift 2 ;;
     -X) method=$2; shift 2 ;;
     --data) data=$2; shift 2 ;;
@@ -60,7 +88,11 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ -n "${FAKE_CURL_LOG:-}" ]; then
-  { echo "argv=$argv"; echo "method=$method"; echo "url=$url"; echo "auth=$auth"; echo "data=$data"; } >> "$FAKE_CURL_LOG"
+  # psargv is what ANY other local user's process would see via ps for this
+  # call - the actual exposure the bearer-in-argv defect is about. It is read
+  # from the OS, not reconstructed from "$@", so it cannot be faked by the stub.
+  psargv=$(ps -o args= -p $$ 2>/dev/null | tr '\n' ' ')
+  { echo "argv=$argv"; echo "psargv=$psargv"; echo "method=$method"; echo "url=$url"; echo "auth=$auth"; echo "data=$data"; } >> "$FAKE_CURL_LOG"
 fi
 case "$url" in
   */connector/poll)
@@ -602,40 +634,31 @@ test_reply_non_2xx_fails() {
   pass "fm-x-reply exits non-zero on a non-2xx relay response"
 }
 
-test_reply_auth_header_tempfile_cleans_up_on_interrupted_post() {
-  local home fakebin log out rc auth_file
+# A post killed mid-flight is the case a cleanup trap can lose: the credential
+# now rides stdin, so there is no auth file to leak in the first place. Assert
+# the absence directly against a private TMPDIR rather than trusting a trap.
+test_reply_interrupted_post_writes_no_credential_file() {
+  local home fakebin tmpdir out rc leaked
   home="$TMP_ROOT/reply-auth-interrupt"; mkdir -p "$home"
   fakebin=$(fm_fakebin "$home")
-  log="$home/auth-file.txt"
+  tmpdir="$home/tmp"; mkdir -p "$tmpdir"
   cat > "$fakebin/curl" <<'SH'
 #!/usr/bin/env bash
-auth_file=
-while [ $# -gt 0 ]; do
-  case "$1" in
-    -H)
-      case "$2" in @*) auth_file=${2#@} ;; esac
-      shift 2
-      ;;
-    -o|-w|-X|-m|--data|--data-binary) shift 2 ;;
-    -s) shift ;;
-    *) shift ;;
-  esac
-done
-printf '%s\n' "$auth_file" > "$FAKE_AUTH_FILE_LOG"
+# Die mid-post, exactly where a trap-based cleanup would have to run.
 kill -TERM "$PPID"
 exit 143
 SH
   chmod +x "$fakebin/curl"
   printf 'FMX_PAIRING_TOKEN=tok-clean\n' > "$home/.env"
   out=$(PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
-    FAKE_AUTH_FILE_LOG="$log" \
+    TMPDIR="$tmpdir" \
     "$ROOT/bin/fm-x-reply.sh" "req-clean" "Hello." 2>"$home/err"); rc=$?
   [ "$rc" -ne 0 ] || fail "interrupted relay post must fail"
   [ -z "$out" ] || fail "interrupted relay post must not echo the request_id (got: $out)"
-  auth_file=$(cat "$log")
-  [ -n "$auth_file" ] || fail "fake curl must record the auth header temp file"
-  [ ! -e "$auth_file" ] || fail "auth header temp file must be removed after an interrupted post"
-  pass "fm-x-reply cleans up auth header temp files on interrupted posts"
+  leaked=$(grep -rl "tok-clean" "$tmpdir" 2>/dev/null || true)
+  [ -z "$leaked" ] \
+    || fail "interrupted post left the token in a temp file: $leaked"
+  pass "fm-x-reply writes no credential temp file, even on an interrupted post"
 }
 
 test_reply_usage_error() {
@@ -2863,6 +2886,94 @@ test_followup_usage_errors() {
   pass "fm-x-followup rejects malformed invocations"
 }
 
+# --- the bearer must never reach curl's argv --------------------------------
+#
+# Process arguments are world readable: any local process can read them from ps
+# for the life of the call, so a bearer passed as `-H "Authorization: Bearer
+# $tok"` leaks the credential. Every fm-x-* request must hand curl its URL and
+# auth header on stdin (`curl -K -`) instead.
+#
+# This asserts against psargv - the command line read back from the OS by the
+# fake curl itself - so it measures the real exposure rather than restating what
+# the source says. Each case also asserts the token DID arrive in the auth
+# header, so a client that simply stopped authenticating could not pass.
+assert_token_off_argv() {
+  local log=$1 token=$2 label=$3 psargv
+  # Exact string compare, not a pattern: a token may contain regex metacharacters.
+  [ "$(grep '^auth=' "$log" | tail -1)" = "auth=Authorization: Bearer $token" ] \
+    || fail "$label must still send the bearer token (else this check is vacuous)"
+  psargv=$(grep '^psargv=' "$log" | tail -1)
+  [ -n "$psargv" ] || fail "$label: fake curl recorded no OS-visible command line"
+  if printf '%s' "$psargv" | grep -Fq "$token"; then
+    fail "$label leaked the bearer token into curl argv (visible via ps): $psargv"
+  fi
+  if grep '^argv=' "$log" | grep -Fq "$token"; then
+    fail "$label leaked the bearer token into curl argv"
+  fi
+}
+
+test_poll_keeps_bearer_off_curl_argv() {
+  local home fakebin log
+  home="$TMP_ROOT/argv-poll"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  printf 'FMX_PAIRING_TOKEN=tok-argv-poll\n' > "$home/.env"
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FAKE_CURL_LOG="$log" FAKE_POLL_CODE=204 \
+    "$ROOT/bin/fm-x-poll.sh" >/dev/null 2>&1
+  assert_grep "url=https://relay.test/connector/poll" "$log" "poll must still reach the relay"
+  assert_token_off_argv "$log" "tok-argv-poll" "poll"
+  pass "fm-x-poll keeps the bearer token out of curl argv"
+}
+
+test_reply_keeps_bearer_off_curl_argv() {
+  local home fakebin log
+  home="$TMP_ROOT/argv-reply"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  printf 'FMX_PAIRING_TOKEN=tok-argv-reply\n' > "$home/.env"
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FAKE_CURL_LOG="$log" FAKE_ANSWER_CODE=200 \
+    "$ROOT/bin/fm-x-reply.sh" "req-argv" "Aye." >/dev/null 2>&1
+  assert_grep "url=https://relay.test/connector/answer" "$log" "reply must still reach the relay"
+  assert_token_off_argv "$log" "tok-argv-reply" "reply"
+  pass "fm-x-reply keeps the bearer token out of curl argv"
+}
+
+test_dismiss_keeps_bearer_off_curl_argv() {
+  local home fakebin log
+  home="$TMP_ROOT/argv-dismiss"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  printf 'FMX_PAIRING_TOKEN=tok-argv-dismiss\n' > "$home/.env"
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FAKE_CURL_LOG="$log" FAKE_DISMISS_CODE=200 \
+    "$ROOT/bin/fm-x-dismiss.sh" "req-argv" >/dev/null 2>&1
+  assert_grep "url=https://relay.test/connector/dismiss" "$log" "dismiss must still reach the relay"
+  assert_token_off_argv "$log" "tok-argv-dismiss" "dismiss"
+  pass "fm-x-dismiss keeps the bearer token out of curl argv"
+}
+
+# A token carrying curl config metacharacters must survive the stdin config
+# round trip intact, or the escaping could silently corrupt or truncate auth.
+test_curl_config_escapes_awkward_token() {
+  local home fakebin log token
+  home="$TMP_ROOT/argv-escape"; mkdir -p "$home"
+  fakebin=$(make_fake_curl "$home")
+  log="$home/curl.log"
+  token='tok "quoted" \and\ slashed'
+  printf 'FMX_PAIRING_TOKEN=%s\n' "$token" > "$home/.env"
+  PATH="$fakebin:$BASE_PATH" FM_HOME="$home" FMX_RELAY_URL="https://relay.test" \
+    FAKE_CURL_LOG="$log" FAKE_POLL_CODE=204 \
+    "$ROOT/bin/fm-x-poll.sh" >/dev/null 2>&1
+  assert_token_off_argv "$log" "$token" "poll (awkward token)"
+  pass "the curl stdin config escapes quotes and backslashes in a token"
+}
+
+test_poll_keeps_bearer_off_curl_argv
+test_reply_keeps_bearer_off_curl_argv
+test_dismiss_keeps_bearer_off_curl_argv
+test_curl_config_escapes_awkward_token
 test_poll_no_token_is_hard_noop
 test_poll_empty_env_token_overrides_env_file
 test_poll_204_is_silent
@@ -2880,7 +2991,7 @@ test_poll_rejects_unsafe_request_id
 test_reply_success_posts_request_bound_only
 test_reply_text_file_and_stdin
 test_reply_non_2xx_fails
-test_reply_auth_header_tempfile_cleans_up_on_interrupted_post
+test_reply_interrupted_post_writes_no_credential_file
 test_reply_usage_error
 test_reply_help_mentions_image
 test_reply_whitespace_text_rejected

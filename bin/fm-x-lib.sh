@@ -10,7 +10,8 @@
 #   fmx_env_get <key> <file>   - read one KEY=VALUE from a .env-style file
 #   fmx_load_config            - resolve FMX_TOKEN, FMX_RELAY, FMX_DRY, FMX_MAX,
 #                                and FMX_THREAD_MAX (env wins over .env)
-#   fmx_auth_header_file       - write the bearer header to a 0600 temp file
+#   fmx_curl_config <url>      - emit a `curl -K -` config carrying the request
+#                                URL and the bearer header, for feeding on stdin
 #   fmx_extract_reply_context <json-file> - the single owner of reply-context
 #                                extraction: infer {platform, reply_max_chars}
 #                                from any mention/relay payload file
@@ -730,15 +731,34 @@ fmx_split_thread() {
   '
 }
 
-fmx_auth_header_file() {
-  local file
-  case "$FMX_TOKEN" in
+# Emit a curl config carrying the request URL and the bearer header, to be fed
+# to `curl -K -` on stdin. This is the single owner of how the token reaches
+# curl, and every fm-x-* request must go through it.
+#
+# The token must never appear in curl's argv: process arguments are world
+# readable (ps) for the life of the call, so `-H "Authorization: Bearer $tok"`
+# would leak the credential to any local process. stdin is private to the pipe,
+# and unlike the 0600 temp file this replaces it leaves nothing on disk that can
+# outlive the call - a SIGKILL cannot skip a cleanup trap that no longer exists.
+#
+# Callers must build the config with a shell BUILTIN printf (as below) and pipe
+# it in; passing it as an argument to any external command would reintroduce the
+# exact argv exposure this exists to prevent.
+#
+# Values are emitted in curl's quoted-value syntax, so a literal backslash or
+# double quote is escaped. A token containing a newline is rejected outright:
+# the config is line oriented, so no escaping could keep it one directive.
+fmx_curl_config() {
+  local url=$1 token=${FMX_TOKEN-}
+  case "$token" in
     *$'\n'*|*$'\r'*) return 1 ;;
   esac
-  file=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-x-auth.XXXXXX") || return 1
-  chmod 600 "$file" 2>/dev/null || { rm -f "$file"; return 1; }
-  printf 'Authorization: Bearer %s\n' "$FMX_TOKEN" > "$file" || { rm -f "$file"; return 1; }
-  printf '%s\n' "$file"
+  token=${token//\\/\\\\}
+  token=${token//\"/\\\"}
+  url=${url//\\/\\\\}
+  url=${url//\"/\\\"}
+  printf 'url = "%s"\n' "$url"
+  printf 'header = "Authorization: Bearer %s"\n' "$token"
 }
 
 fmx_image_media_type_from_path() {
@@ -875,21 +895,18 @@ fmx_reply_outbox_json() {
 }
 
 fmx_post_json() (
-  local endpoint=$1 payload_file=$2 body_file=${3:-/dev/null} auth_header_file code rc
+  local endpoint=$1 payload_file=$2 body_file=${3:-/dev/null} config code rc
   command -v curl >/dev/null 2>&1 || return 127
   [ -r "$payload_file" ] || return 2
-  auth_header_file=$(fmx_auth_header_file) || return 3
-  trap 'rm -f "$auth_header_file"' EXIT
-  trap 'rm -f "$auth_header_file"; exit 143' HUP INT TERM
-  code=$(curl -m 10 -s -o "$body_file" -w '%{http_code}' \
+  config=$(fmx_curl_config "$FMX_RELAY/connector/$endpoint") || return 3
+  # The URL and bearer header arrive on stdin; the payload is read from its own
+  # file, so nothing here contends for stdin. printf is a builtin, so the token
+  # never becomes another process's argv.
+  code=$(printf '%s\n' "$config" | curl -K - -m 10 -s -o "$body_file" -w '%{http_code}' \
     -X POST \
-    -H "@$auth_header_file" \
     -H 'Content-Type: application/json' \
-    --data-binary "@$payload_file" \
-    "$FMX_RELAY/connector/$endpoint" 2>/dev/null)
+    --data-binary "@$payload_file" 2>/dev/null)
   rc=$?
-  rm -f "$auth_header_file"
-  trap - EXIT HUP INT TERM
   [ "$rc" = 0 ] || return 4
   printf '%s\n' "$code"
 )
