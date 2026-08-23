@@ -115,6 +115,9 @@ test_outcome_append_is_idempotent_per_wake_sequence() {
   local home first second
   home="$TMP_ROOT/outcome-idempotency-home"
   mkdir -p "$home/state"
+  FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append \
+    --task decoy --verdict routine --summary '{"wake_seq":5, deceptive summary content' >/dev/null \
+    || fail "deceptive summary outcome append failed"
   first=$(FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append \
     --task task-5 --verdict captain --summary original --wake-seq 5) \
     || fail "first wake outcome append failed"
@@ -122,8 +125,8 @@ test_outcome_append_is_idempotent_per_wake_sequence() {
     --task task-5 --verdict routine --summary duplicate --wake-seq 5) \
     || fail "duplicate wake outcome append failed"
   [ "$first" = "$second" ] || fail "duplicate wake sequence returned a different outcome"
-  [ "$(wc -l < "$home/state/branch-outcomes.jsonl" | tr -d ' ')" = 1 ] \
-    || fail "duplicate wake sequence appended another durable outcome"
+  [ "$(wc -l < "$home/state/branch-outcomes.jsonl" | tr -d ' ')" = 2 ] \
+    || fail "wake-sequence identity matched summary content or appended a duplicate"
   assert_contains "$(cat "$home/state/branch-outcomes.jsonl")" '"summary":"original"' \
     "duplicate wake sequence replaced the original outcome"
   pass "outcome append is durable-idempotent for positive wake sequences"
@@ -169,6 +172,9 @@ test_branch_ack_requires_every_presented_outcome() {
   generation=$(sed -n 's/^WAKE_ACK_REQUIRED:.*--ack-through [0-9][0-9]* --recovery-generation \([A-Za-z0-9._-][A-Za-z0-9._-]*\)$/\1/p' "$drain_err")
   first_seq=$(awk -F '\t' 'NR == 1 { print $2 }' "$drain_out")
   second_seq=$(awk -F '\t' 'NR == 2 { print $2 }' "$drain_out")
+  FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append --task decoy --verdict routine \
+    --summary '{"wake_seq":'"$second_seq"', deceptive summary content' >/dev/null \
+    || fail "deceptive acknowledgement summary append failed"
   FM_HOME="$home" "$ROOT/bin/fm-branch-outcome.sh" append --task task-a --verdict routine \
     --summary handled --wake-seq "$first_seq" >/dev/null || fail "first covered outcome append failed"
   out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=branch "$ROOT/bin/fm-wake-drain.sh" \

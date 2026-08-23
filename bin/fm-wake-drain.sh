@@ -295,7 +295,7 @@ if [ -n "$ACK_THROUGH" ]; then
       END { for (i = 1; i <= count; i++) print seq[order[i]] }
     ' "$FM_WAKE_QUEUE") || exit 1
     for PRESENTED_SEQUENCE in $PRESENTED_SEQUENCES; do
-      if ! grep -F '"wake_seq":'"$PRESENTED_SEQUENCE"',' "$STATE/branch-outcomes.jsonl" >/dev/null 2>&1; then
+      if ! grep -E '^\{"seq":[0-9]+,"wake_seq":'"$PRESENTED_SEQUENCE"',' "$STATE/branch-outcomes.jsonl" >/dev/null 2>&1; then
         echo "wake drain: branch acknowledgement refused - wake sequence $PRESENTED_SEQUENCE has no durable outcome" >&2
         exit 1
       fi

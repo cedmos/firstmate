@@ -161,7 +161,7 @@ case "$CMD" in
     fm_lock_acquire_wait "$LOCK"
     EXISTING_LINE=
     if [ "$WAKE_SEQ" -gt 0 ] && [ -s "$STORE" ]; then
-      EXISTING_LINE=$(grep -m 1 '"wake_seq":'"$WAKE_SEQ"',' "$STORE" 2>/dev/null || true)
+      EXISTING_LINE=$(grep -E -m 1 '^\{"seq":[0-9]+,"wake_seq":'"$WAKE_SEQ"',' "$STORE" 2>/dev/null || true)
     fi
     if [ -n "$EXISTING_LINE" ]; then
       SEQ=$(record_seq "$EXISTING_LINE")
