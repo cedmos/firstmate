@@ -1,0 +1,54 @@
+Real curl, real local HTTP relay, real ps. Token used: s3cr3t-relay-bearer-DO-NOT-LEAK
+
+=== 1. SHIPPED CLIENT: bin/fm-x-poll.sh against http://127.0.0.1 (a real listener) ===
+curl processes sampled from the OS (ps -A -o comm=,args=) for the life of the call,
+exactly what any other local process could read:
+
+    curl -K - -m 5 -s -o /Users/cedmo/.no-mistakes/worktrees/263c604673df/01M0R1DSK5XVBR6DAMZ1Y3EGDY/tmp/fmx-e2e/tmp/fm-x-poll.BD4hjY -w %{http_code} -H Accept: application/json
+
+    grep -c "s3cr3t-relay-bearer-DO-NOT-LEAK" <ps sample>  ->  0
+    => the bearer is NOT in curl argv.
+
+=== 2. ...and the request still authenticated (relay-side view) ===
+    GET /connector/poll
+    authorization: Bearer s3cr3t-relay-bearer-DO-NOT-LEAK
+    GET /connector/poll
+    authorization: Bearer s3cr3t-relay-bearer-DO-NOT-LEAK
+    (two GETs: the shipped client, then the control below)
+
+=== 3. CONTROL: the briefed defective shape, same listener, same sampler ===
+    curl -m 5 ... -H "Authorization: Bearer $TOKEN" http://127.0.0.1:PORT/connector/poll
+
+    curl -m 5 -s -o /dev/null -w control http_code=%{http_code}\n -H Authorization: Bearer s3cr3t-relay-bearer-DO-NOT-LEAK -H Accept: application/json http://127.0.0.1:60222/connector/poll
+    => ps DOES expose the credential for that shape. The measurement is real;
+       the shipped client simply does not produce such a line.
+
+=== 4. Nothing on disk: private TMPDIR polled every 100ms for the whole call ===
+    files containing the token: (none)
+    TMPDIR after the run:
+    total 0
+    drwxr-xr-x@  2 cedmo  staff   64 Aug 23 21:36 .
+    drwxr-xr-x@ 11 cedmo  staff  352 Aug 23 21:37 ..
+
+=== 5. CONTRAST at base commit 822a990 (same harness, base bin/fm-x-{lib,poll}.sh) ===
+    -rw-------@  /Users/cedmo/.no-mistakes/worktrees/263c604673df/01M0R1DSK5XVBR6DAMZ1Y3EGDY/tmp/fmx-e2e/tmp-base/fm-x-auth.al9NLA
+    => the base client wrote a mode-0600 credential file to disk for the call.
+       The target commit writes none at all.
+
+=== 6. THE POST PATH: bin/fm-x-reply.sh -> POST /connector/answer (real socket) ===
+    $ fm-x-reply.sh req-e2e-001 "Aye captain - relay reply over a real socket."
+    req-e2e-001            (exit 0)
+
+    curl process as ps sees it:
+      curl -K - -m 10 -s -o /Users/cedmo/.no-mistakes/worktrees/263c604673df/01M0R1DSK5XVBR6DAMZ1Y3EGDY/tmp/fmx-e2e/tmp-r/fm-x-reply.CMTOcO -w %{http_code} -X POST -H Content-Type: application/json --data-binary @/Users/cedmo/.no-mistakes/worktrees/263c604673df/01M0R1DSK5XVBR6DAMZ1Y3EGDY/tmp/fmx-e2e/tmp-r/fm-x-reply.FnBaiI
+      token occurrences in that ps sample: 0
+
+    relay-side:
+      POST /connector/answer
+      authorization: Bearer s3cr3t-relay-bearer-DO-NOT-LEAK
+      body: {"request_id":"req-e2e-001","text":"Aye captain - relay reply over a real socket."}
+      
+
+    => bearer absent from argv, bearer present in the header, and the JSON body
+       arrived intact - so 'curl -K -' reading stdin does not contend with
+       --data-binary @file. No credential file appeared under the private TMPDIR.

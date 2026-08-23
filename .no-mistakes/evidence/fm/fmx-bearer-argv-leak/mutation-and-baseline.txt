@@ -1,0 +1,41 @@
+MUTATION CHECK - do the new tests actually catch the leak?
+
+Reintroduced the briefed defective shape in bin/fm-x-poll.sh:
+    code=$(curl -m 5 -s -o "$BODY_FILE" -w %{http_code} \
+      -H "Authorization: Bearer $FMX_TOKEN" \
+      -H "Accept: application/json" "$FMX_RELAY/connector/poll" ...)
+
+then re-ran bash tests/fm-x-mode.test.sh:
+
+    not ok - poll leaked the bearer token into curl argv (visible via ps): psargv=bash
+    /var/.../argv-poll/fakebin/curl -m 5 -s -o /var/.../fm-x-poll.fGk3d4 -w %{http_code}
+    -H Authorization: Bearer tok-argv-poll -H Accept: application/json
+    https://relay.test/connector/poll
+
+The failure message carries the REAL leaked command line read back from the OS,
+not a source-text assertion. Mutation reverted; worktree restored to the target commit.
+
+==================================================================
+TARGETED SUITE AT THE TARGET COMMIT: bash tests/fm-x-mode.test.sh
+  110 ok, 0 not ok. The cases that pin this change:
+
+    ok - fm-x-poll keeps the bearer token out of curl argv
+    ok - fm-x-reply keeps the bearer token out of curl argv
+    ok - fm-x-dismiss keeps the bearer token out of curl argv
+    ok - the curl stdin config escapes quotes and backslashes in a token
+    ok - fm-x-reply writes no credential temp file, even on an interrupted post
+    ok - fm-x-reply streams large image payloads outside curl argv
+
+==================================================================
+PRE-EXISTING FAILURES, VERIFIED NOT CAUSED BY THIS CHANGE
+(bin/fm-x-{lib,poll,dismiss}.sh + tests/fm-x-mode.test.sh reverted to 822a990,
+ same two files re-run -> identical failures)
+
+    tests/fm-gotmp.test.sh
+      target: not ok - teardown did not remove the tasktmp dir
+      base:   not ok - teardown did not remove the tasktmp dir
+    tests/fm-public-followup.test.sh
+      target: bin/fm-public-followup.sh: line 142: PF_REGISTRY_LOCK_IDS[@]: unbound variable
+              not ok - could not register the public commitment
+      base:   bin/fm-public-followup.sh: line 142: PF_REGISTRY_LOCK_IDS[@]: unbound variable
+              not ok - could not register the public commitment
