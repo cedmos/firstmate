@@ -30,6 +30,10 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # shellcheck source=bin/fm-crew-worktree-instructions-lib.sh
 . "$ROOT/bin/fm-crew-worktree-instructions-lib.sh"
+# For fm_task_id_creation_valid, so the awkward-ref-name case is pinned to an id
+# firstmate itself accepts rather than one invented by this test.
+# shellcheck source=bin/fm-pr-lib.sh
+. "$ROOT/bin/fm-pr-lib.sh"
 
 SPAWN="$ROOT/bin/fm-spawn.sh"
 SESSION_START="$ROOT/bin/fm-session-start.sh"
@@ -41,6 +45,9 @@ fm_git_identity fmtest fmtest@example.invalid
 IDENTITY_LINE='You are the first mate.'
 OVERLAY_MARKER='<!-- firstmate-crew-worktree-instructions -->'
 GUIDELINES_REL='.agents/skills/firstmate-coding-guidelines/SKILL.md'
+# Accepted by fm_task_id_creation_valid, refused by git as a ref component: it
+# both contains `..` and ends in `.lock`.
+AWKWARD_TASK_ID='probe..v2.lock'
 
 autoload_corpus() {  # <worktree>
   local wt=$1
@@ -88,6 +95,21 @@ wip_ref_count() {  # <worktree> <owner>
 
 saved_agents_md() {  # <worktree> <owner> <n>
   git -C "$1" show "refs/fm-crew/$2/instruction-wip/$3:AGENTS.md" 2>&1
+}
+
+# The restore command a report advertised for <rel>, taken from the report the
+# way a worker reads it, so running it proves the advice actually works.
+advertised_restore() {  # <report> <rel>
+  local report=$1 rel=$2 line
+  while IFS= read -r line; do
+    case $line in
+      *"$rel: git checkout "*) printf '%s\n' "${line#*"$rel": }"; return 0 ;;
+      *"restore it with: git checkout "*"-- $rel"*) printf '%s\n' "${line#*restore it with: }"; return 0 ;;
+    esac
+  done <<EOF
+$report
+EOF
+  return 1
 }
 
 commit_all() {  # <worktree> <message>
@@ -262,7 +284,7 @@ test_saved_edits_stay_with_the_task_that_saved_them() {
 }
 
 test_recover_restores_this_task_s_own_saved_edit() {
-  local repo wt out status
+  local repo wt out status advertised
   repo="$TMP_ROOT/recover-repo"
   wt="$TMP_ROOT/recover-wt"
   overlaid_worktree "$repo" "$wt" 'recover-task-c3'
@@ -273,12 +295,127 @@ test_recover_restores_this_task_s_own_saved_edit() {
   expect_code 0 "$status" "saved must list this task's own entries: $out"
   assert_contains "$out" 'refs/fm-crew/recover-task-c3/instruction-wip/1' \
     "saved did not name the entry this task owns"
+  advertised=$(advertised_restore "$out" AGENTS.md)
+  [ -n "$advertised" ] || fail "saved advertised no restore command for AGENTS.md: $out"
   out=$("$CREW_INSTRUCTIONS" recover "$wt" 2>&1); status=$?
   expect_code 0 "$status" "recovering this task's own saved edit must succeed: $out"
   assert_contains "$(cat "$wt/AGENTS.md")" 'THE EDIT THE WORKER WANTS BACK' \
     "recover did not restore the saved edit into the working tree"
   assert_status_contains "$wt" " M AGENTS.md" "the recovered edit was left staged rather than uncommitted"
-  pass "recover restores this task's own saved instruction edit as an ordinary uncommitted change"
+  # The advertised command must land the worker in the same state recover does.
+  # `git checkout <ref> -- <path>` alone writes the index too, so following the
+  # advice would otherwise leave the edit staged and the next plain commit would
+  # land work-in-progress the worker never chose to commit.
+  git -C "$wt" checkout HEAD -- AGENTS.md || fail "could not reset the fixture between the two paths"
+  ( cd "$wt" && eval "$advertised" ) || fail "the advertised restore command failed: $advertised"
+  assert_contains "$(cat "$wt/AGENTS.md")" 'THE EDIT THE WORKER WANTS BACK' \
+    "the advertised restore command did not restore the saved edit"
+  assert_status_contains "$wt" " M AGENTS.md" \
+    "the advertised restore command left the edit staged, unlike recover itself"
+  pass "recover and the command it advertises both restore the edit as an ordinary uncommitted change"
+}
+
+# A worker who staged one version and then edited further holds two distinct
+# versions of their own work. The save restores the committed file, which
+# rewrites the index as well as the file, so recording only what is on disk
+# dropped the staged version with no error and still reported success.
+test_a_staged_and_a_working_tree_version_both_survive_a_relaunch() {
+  local repo wt staged_ref worktree_ref out status
+  repo="$TMP_ROOT/staged-repo"
+  wt="$TMP_ROOT/staged-wt"
+  overlaid_worktree "$repo" "$wt" 'staged-task-s9'
+  git -C "$wt" checkout HEAD -- AGENTS.md
+  # S and W must genuinely diverge, not nest: a worker who stages one version
+  # and then rewrites rather than appends holds work that exists in the staged
+  # version and nowhere else, which is exactly what a worktree-only save drops.
+  printf '%s\n' 'VERSION S the worker staged' >> "$wt/AGENTS.md"
+  git -C "$wt" add AGENTS.md || fail "could not stage version S"
+  # Rewrite the file only, so the index keeps S while the worktree moves to W.
+  git -C "$wt" show HEAD:AGENTS.md > "$wt/AGENTS.md" \
+    || fail "could not rewrite the working tree without touching the index"
+  printf '%s\n' 'VERSION W the worker edited afterwards' >> "$wt/AGENTS.md"
+  fm_install_crew_worktree_instructions "$wt" 'staged-task-s9' 2>/dev/null \
+    || fail "relaunch over a staged plus a working-tree version failed"
+  expect_code 2 "$(wip_ref_count "$wt" 'staged-task-s9')" \
+    "the staged version and the working-tree version did not both survive as entries"
+  staged_ref='refs/fm-crew/staged-task-s9/instruction-wip/1'
+  worktree_ref='refs/fm-crew/staged-task-s9/instruction-wip/2'
+  assert_contains "$(git -C "$wt" show "$staged_ref:AGENTS.md")" 'VERSION S the worker staged' \
+    "the staged version was dropped"
+  assert_not_contains "$(git -C "$wt" show "$staged_ref:AGENTS.md")" 'VERSION W the worker edited afterwards' \
+    "the staged entry holds the working-tree version instead of the staged one"
+  assert_contains "$(git -C "$wt" show "$worktree_ref:AGENTS.md")" 'VERSION W the worker edited afterwards' \
+    "the working-tree version was dropped"
+  assert_not_contains "$(git -C "$wt" show "$worktree_ref:AGENTS.md")" 'VERSION S the worker staged' \
+    "the fixture did not diverge the two versions, so nothing here would be lost either way"
+  [ -z "$(git -C "$wt" diff --cached --name-only)" ] \
+    || fail "the save left the staged version in the index: $(git -C "$wt" diff --cached --name-only)"
+  out=$("$CREW_INSTRUCTIONS" saved "$wt" 2>&1); status=$?
+  expect_code 0 "$status" "saved must list both entries: $out"
+  assert_contains "$out" "$staged_ref" "saved omitted the staged entry"
+  assert_contains "$out" "$worktree_ref" "saved omitted the working-tree entry"
+  assert_contains "$out" 'staged instruction edits' "saved did not name the staged entry as staged"
+  assert_contains "$out" 'working-tree instruction edits' \
+    "saved did not name the working-tree entry as the working-tree one"
+  # Both must be independently restorable through the commands saved prints.
+  ( cd "$wt" && eval "$(fm_crew_restore_command "$staged_ref" AGENTS.md)" ) \
+    || fail "the staged entry's advertised restore command failed"
+  assert_contains "$(cat "$wt/AGENTS.md")" 'VERSION S the worker staged' \
+    "the staged entry did not restore the version that was staged"
+  assert_not_contains "$(cat "$wt/AGENTS.md")" 'VERSION W the worker edited afterwards' \
+    "restoring the staged entry produced the working-tree version"
+  ( cd "$wt" && eval "$(fm_crew_restore_command "$worktree_ref" AGENTS.md)" ) \
+    || fail "the working-tree entry's advertised restore command failed"
+  assert_contains "$(cat "$wt/AGENTS.md")" 'VERSION W the worker edited afterwards' \
+    "the working-tree entry did not restore the version that was on disk"
+  pass "a staged version and a working-tree version both survive a relaunch as separate entries"
+}
+
+# A task id firstmate itself issues must never block a launch. git's ref grammar
+# rejects a component containing `..` or ending in `.lock`, and the task-id
+# charset accepts both, so the namespace has to fold them out rather than let
+# check-ref-format refuse and abort the spawn.
+test_a_task_id_git_refuses_as_a_ref_component_still_launches() {
+  local repo wt out status refs newest
+  repo="$TMP_ROOT/refname-repo"
+  wt="$TMP_ROOT/refname-wt"
+  make_firstmate_repo "$repo"
+  make_linked_worktree "$repo" "$wt"
+  fm_task_id_creation_valid "$AWKWARD_TASK_ID" \
+    || fail "the fixture id is not one firstmate itself accepts, so this case proves nothing"
+  if git -C "$wt" check-ref-format "refs/fm-crew/$AWKWARD_TASK_ID/instruction-wip/1" 2>/dev/null; then
+    fail "the fixture id is already a legal ref component, so this case proves nothing"
+  fi
+  printf '%s\n' 'AN EDIT UNDER AN AWKWARD TASK ID' >> "$wt/AGENTS.md"
+  out=$(fm_install_crew_worktree_instructions "$wt" "$AWKWARD_TASK_ID" 2>&1); status=$?
+  expect_code 0 "$status" "a task id firstmate accepts must not block the spawn: $out"
+  refs=$(fm_crew_list_wip_refs "$wt" "$AWKWARD_TASK_ID")
+  newest=$(printf '%s\n' "$refs" | tail -n 1)
+  [ -n "$newest" ] || fail "the awkward task id yielded no saved-edit entry"
+  assert_contains "$(git -C "$wt" show "$newest:AGENTS.md")" 'AN EDIT UNDER AN AWKWARD TASK ID' \
+    "the edit was not saved under the awkward task id"
+  assert_corpus_is_crew "$wt" "after installing under an awkward task id"
+  pass "a task id git refuses as a ref component still launches and still saves its edits"
+}
+
+# The readable slug cannot always be repaired into a legal component, so the
+# namespace falls back to one derived from the owner's content. It must stay
+# legal and stay the same base every time it is derived for that owner.
+test_an_unrepairable_owner_still_yields_a_stable_legal_namespace() {
+  local repo wt base again
+  repo="$TMP_ROOT/digest-repo"
+  wt="$TMP_ROOT/digest-wt"
+  make_firstmate_repo "$repo"
+  make_linked_worktree "$repo" "$wt"
+  base=$(fm_crew_wip_ref_base "$wt" '...') || fail "an unrepairable owner yielded no namespace at all"
+  git -C "$wt" check-ref-format "$base/1" 2>/dev/null \
+    || fail "the fallback namespace is still not a legal ref name: $base"
+  again=$(fm_crew_wip_ref_base "$wt" '...') || fail "the fallback namespace could not be re-derived"
+  [ "$base" = "$again" ] \
+    || fail "the fallback namespace is not stable for one owner ($base vs $again)"
+  [ "$base" != "$(fm_crew_wip_ref_base "$wt" '..')" ] \
+    || fail "two different owners collapsed onto one fallback namespace"
+  pass "an owner git refuses outright still yields a stable legal ref namespace"
 }
 
 test_recover_refuses_loudly_when_this_task_saved_nothing() {
@@ -642,6 +779,37 @@ test_a_worktree_left_by_the_superseded_mechanism_is_healed() {
   pass "a worktree left by the superseded mechanism is healed without losing its sidelined edit"
 }
 
+# A legacy slot carries no owner marker, so the rescue records the entry under a
+# derived owner and the next install replaces that marker with the real task id.
+# Withholding the previous occupant's work from the new task is correct; the
+# recovery instruction printed for it must still work for whoever runs it, or
+# the edit is reachable only by scrolling spawn output for a ref name.
+test_a_rescued_legacy_sidecar_stays_recoverable_after_the_slot_is_reused() {
+  local repo wt out status advertised
+  repo="$TMP_ROOT/legacy-reuse-repo"
+  wt="$TMP_ROOT/legacy-reuse-wt"
+  make_firstmate_repo "$repo"
+  make_linked_worktree "$repo" "$wt"
+  printf '%s\n' 'SIDELINED EDIT FROM THE PREVIOUS OCCUPANT' > "$wt/.fm-agents-md-edit"
+  out=$(fm_remove_crew_worktree_instructions "$wt" 2>&1) || fail "healing removal failed: $out"
+  advertised=$(advertised_restore "$out" AGENTS.md) \
+    || fail "the rescue advertised no restore command for AGENTS.md: $out"
+  # The pooled slot is taken by a different task, which rewrites the owner.
+  fm_install_crew_worktree_instructions "$wt" 'legacy-reuse-task-n8' \
+    || fail "the next occupant's install failed"
+  out=$("$CREW_INSTRUCTIONS" saved "$wt" 2>&1); status=$?
+  expect_code 1 "$status" "the next occupant must not own the previous occupant's sidecar: $out"
+  assert_not_contains "$(cat "$wt/AGENTS.md")" 'SIDELINED EDIT FROM THE PREVIOUS OCCUPANT' \
+    "the next occupant was handed the previous occupant's sidelined edit"
+  ( cd "$wt" && eval "$advertised" ) \
+    || fail "the advertised restore command failed: $advertised"
+  assert_contains "$(cat "$wt/AGENTS.md")" 'SIDELINED EDIT FROM THE PREVIOUS OCCUPANT' \
+    "the advertised restore command did not recover the sidelined edit"
+  assert_status_contains "$wt" " M AGENTS.md" \
+    "the advertised restore command left the recovered edit staged"
+  pass "a rescued legacy sidecar stays recoverable by the advertised command after the slot is reused"
+}
+
 # The sidecar rescue used to `cp` the sidecar over the instruction file with no
 # check on what that file held, so a worker's own live uncommitted edit was
 # overwritten and lost with exit 0 - the exact "an edit disappears with no
@@ -793,6 +961,9 @@ test_two_relaunches_keep_both_saved_edits
 test_saved_edits_stay_with_the_task_that_saved_them
 test_recover_restores_this_task_s_own_saved_edit
 test_recover_refuses_loudly_when_this_task_saved_nothing
+test_a_staged_and_a_working_tree_version_both_survive_a_relaunch
+test_a_task_id_git_refuses_as_a_ref_component_still_launches
+test_an_unrepairable_owner_still_yields_a_stable_legal_namespace
 test_branch_move_is_escapable_by_the_worker
 test_crew_instructions_status_tracks_a_real_overlay
 test_crew_instructions_cli_clears_a_branch_move
@@ -813,6 +984,7 @@ test_ensure_agents_md_stays_a_no_op_after_overlay
 test_commit_keeps_the_overlay_out_of_the_commit
 test_a_worktree_left_by_the_superseded_mechanism_is_healed
 test_a_live_edit_and_a_legacy_sidecar_both_survive_healing
+test_a_rescued_legacy_sidecar_stays_recoverable_after_the_slot_is_reused
 test_removal_lets_a_pooled_worktree_reset_onto_a_new_base
 test_an_installed_overlay_does_not_wedge_a_pooled_reset
 test_spawn_overlays_firstmate_shaped_pool

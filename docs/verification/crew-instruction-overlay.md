@@ -187,6 +187,77 @@ Two properties here are asserted rather than shown by this script.
 Refusing loudly when a task owns no entry is a decision in `bin/fm-crew-instructions.sh`, not a git behavior, and it is covered by the colocated tests instead.
 Nothing prunes these refs, so a task's saved edits persist until someone deletes them deliberately; that is the intended trade, because the failure this replaces was work disappearing.
 
+## A save has two sides, because the index carries a version of its own
+
+This check ran on 2026-08-23 with git 2.50.1 (Apple Git-155) in a disposable scratch repository.
+It exists because the per-task carrier hashes a path's blob rather than calling `git stash`, and that swap silently narrowed what a save captures.
+A worker who stages one version and then edits further holds two distinct versions of their own work, and the restore that follows a save rewrites the index as well as the file.
+
+The exact script run from this repository root was:
+
+```bash
+set -eu
+git --version
+PROBE="$PWD/.crew-index-probe"
+rm -rf "$PROBE"; mkdir -p "$PROBE"; cd "$PROBE"
+git init -q -b main .
+git config user.email probe@example.invalid; git config user.name probe
+printf 'committed\n' > AGENTS.md; git add -A; git commit -qm base
+printf 'VERSION S\n' > AGENTS.md; git add AGENTS.md
+printf 'VERSION W\n' > AGENTS.md
+printf 'index holds:    %s\n' "$(git cat-file blob "$(git ls-files -s -- AGENTS.md | awk '{print $2}')")"
+printf 'worktree holds: %s\n' "$(cat AGENTS.md)"
+
+printf '\n### the superseded stash carrier kept both sides\n'
+git stash push -q -- AGENTS.md
+printf 'stash^2 (the index tree):  %s\n' "$(git show 'stash@{0}^2:AGENTS.md')"
+printf 'stash    (the worktree):   %s\n' "$(git show 'stash@{0}:AGENTS.md')"
+git stash pop -q --index
+
+printf '\n### a worktree-only blob capture keeps one side and drops the other\n'
+disk=$(git hash-object -w --no-filters -- AGENTS.md)
+printf 'captured:                  %s\n' "$(git cat-file blob "$disk")"
+git checkout HEAD -- AGENTS.md
+printf 'index after the restore:    %s\n' "$(git cat-file blob "$(git ls-files -s -- AGENTS.md | awk '{print $2}')")"
+printf 'VERSION S reachable from any captured object: %s\n' \
+  "$(git cat-file blob "$disk" | grep -c 'VERSION S' || true)"
+
+printf '\n### capturing the index blob as well keeps both recoverable\n'
+printf 'VERSION S\n' > AGENTS.md; git add AGENTS.md
+printf 'VERSION W\n' > AGENTS.md
+staged=$(git ls-files -s -- AGENTS.md | awk '{print $2}')
+disk=$(git hash-object -w --no-filters -- AGENTS.md)
+git checkout HEAD -- AGENTS.md
+printf 'staged entry restores:     %s\n' "$(git cat-file blob "$staged")"
+printf 'worktree entry restores:   %s\n' "$(git cat-file blob "$disk")"
+cd ..; rm -rf "$PROBE"
+```
+
+Its exact output was:
+
+```
+git version 2.50.1 (Apple Git-155)
+index holds:    VERSION S
+worktree holds: VERSION W
+
+### the superseded stash carrier kept both sides
+stash^2 (the index tree):  VERSION S
+stash    (the worktree):   VERSION W
+
+### a worktree-only blob capture keeps one side and drops the other
+captured:                  VERSION W
+index after the restore:    committed
+VERSION S reachable from any captured object: 0
+
+### capturing the index blob as well keeps both recoverable
+staged entry restores:     VERSION S
+worktree entry restores:   VERSION W
+```
+
+`git stash push` records the index as a second parent, so the superseded carrier kept both sides without being asked.
+A per-path blob capture has no such second side: `git checkout HEAD --` then reset the index to the committed content, and the staged version was reachable from nothing.
+That is the same "an edit disappears with no error" failure this whole mechanism exists to remove, so the index blob is captured explicitly, as its own entry, whenever it differs from both the committed blob and the file on disk.
+
 ## Refreshing these facts
 
 [`tests/fm-crew-worktree-instructions.test.sh`](../../tests/fm-crew-worktree-instructions.test.sh) enforces the resulting behavior on every CI run through the real library and real git.

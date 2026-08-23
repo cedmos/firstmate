@@ -47,6 +47,10 @@
 # The owning task id is recorded in the worktree's own git dir, so
 # bin/fm-crew-instructions.sh restores only what this worktree's task saved and
 # refuses loudly, naming the ref namespace it looked in, when there is nothing.
+# A staged version and a working-tree version of the same file are two distinct
+# versions of the worker's work, so each becomes its own entry: the restore that
+# follows the save rewrites the index as well as the file, and recording only
+# what is on disk would drop the staged one with no error.
 #
 # The install also writes a pre-commit guard refusing a commit that would land
 # the overlay over firstmate's own committed file. The guard lives in this
@@ -126,6 +130,7 @@ Every remedy git names works here: `git stash`, or `git checkout HEAD -- AGENTS.
 `bin/fm-crew-instructions.sh remove` does both files and the guard in one step.
 
 In-progress edits to these files found when this overlay was installed were saved as commits under this task's own `refs/fm-crew/<task-id>/instruction-wip/` refs, never on the shared `git stash` stack.
+A version you had staged and a version you had only on disk are saved as separate entries, so neither is lost to the other.
 Run `bin/fm-crew-instructions.sh saved` to list the entries this worktree's task owns, and `bin/fm-crew-instructions.sh recover` to restore the newest one.
 
 ## Maintaining this file
@@ -318,13 +323,43 @@ fm_crew_resolve_owner() {  # <worktree> [task-id]
   printf '%s\n' "$owner"
 }
 
+# A ref path component derived from <owner> by content rather than by shape.
+# Used when the readable slug cannot be made legal, so an owner git's ref
+# grammar rejects still gets a stable namespace instead of blocking the launch.
+fm_crew_owner_digest() {  # <worktree> <owner>
+  local wt=$1 owner=$2 hash
+  hash=$(printf '%s' "$owner" | git -C "$wt" hash-object --stdin) || return 1
+  [ -n "$hash" ] || return 1
+  printf 'owner-%s\n' "${hash:0:12}"
+}
+
 # The ref namespace <owner>'s saved instruction edits live under.
 # The owner is folded into a single legal ref path component, and git itself
 # rules on the result rather than this function guessing at git's ref grammar.
+# Mapping out-of-charset bytes is not enough on its own: a task id firstmate
+# accepts may still contain `..` or end in `.lock`, which git's ref grammar
+# rejects, and a refused ref name would abort the spawn over a name firstmate
+# itself issued. Those two sequences are folded out, and anything git still
+# refuses falls back to a digest of the owner, so the namespace stays derivable
+# from the owner alone in every case.
 fm_crew_wip_ref_base() {  # <worktree> <owner>
   local wt=$1 owner=$2 slug base
   [ -n "$owner" ] || return 1
   slug=${owner//[^A-Za-z0-9._-]/-}
+  while [ "$slug" != "${slug//../.}" ]; do
+    slug=${slug//../.}
+  done
+  while [ "$slug" != "${slug%.lock}" ]; do
+    slug=${slug%.lock}
+  done
+  slug=${slug#.}
+  slug=${slug%.}
+  base="$FM_CREW_WIP_REF_NAMESPACE/$slug/$FM_CREW_WIP_REF_LEAF"
+  if [ -n "$slug" ] && git -C "$wt" check-ref-format "$base/1" 2>/dev/null; then
+    printf '%s\n' "$base"
+    return 0
+  fi
+  slug=$(fm_crew_owner_digest "$wt" "$owner") || return 1
   base="$FM_CREW_WIP_REF_NAMESPACE/$slug/$FM_CREW_WIP_REF_LEAF"
   git -C "$wt" check-ref-format "$base/1" 2>/dev/null || return 1
   printf '%s\n' "$base"
@@ -355,6 +390,15 @@ fm_crew_ref_holds_edit() {  # <worktree> <ref> <rel>
   [ -n "$saved" ] || return 1
   base=$(git -C "$wt" rev-parse --verify --quiet "$ref^:$rel" 2>/dev/null) || base=
   [ "$saved" != "$base" ]
+}
+
+# The command that restores <rel> from <ref> the way recovery itself leaves it.
+# `git checkout <commit> -- <path>` writes the index as well as the working
+# tree, so on its own it would leave the recovered edit staged and the next
+# plain `git commit` would land work-in-progress the worker never chose to
+# commit. The index reset is part of the advertised command for that reason.
+fm_crew_restore_command() {  # <ref> <rel>
+  printf 'git checkout %s -- %s && git reset -q HEAD -- %s\n' "$1" "$2" "$2"
 }
 
 # Record <rel>=<blob> pairs as a commit whose tree is HEAD's with exactly those
@@ -421,37 +465,92 @@ fm_crew_store_wip_entry() {  # <worktree> <owner> <subject> <rel>=<blob>...
   printf '%s\n' "$ref"
 }
 
+fm_crew_staged_blob() {  # <worktree> <rel>
+  local wt=$1 rel=$2
+  git -C "$wt" ls-files -s -- "$rel" 2>/dev/null | awk '{print $2}'
+}
+
 # Save a worker's in-progress instruction edits before the overlay replaces
 # them, restoring the committed files in the same step.
 # A private sidecar was overwritten by the next relaunch and lost with no error,
 # and the shared stash stack hands one task's entry to the next occupant of a
 # pooled slot; a fresh ref under this task's own namespace does neither.
+# The index is saved separately from the working tree. A worker who staged one
+# version and then edited further holds two distinct versions of their own work,
+# and the restore below rewrites the index as well as the file, so recording
+# only what is on disk would drop the staged one with no error - the exact
+# failure this carrier exists to remove. Each version becomes its own entry,
+# named in its subject, so the two stay tellable apart on the way back out.
 fm_crew_save_instruction_wip() {  # <worktree> <owner>
-  local wt=$1 owner=$2 rel blob paths='' pairs='' ref
+  local wt=$1 owner=$2 rel head_blob disk_blob staged_blob
+  local disk_paths='' disk_pairs='' staged_paths='' staged_pairs='' ref
   for rel in $FM_CREW_INSTRUCTION_FILES; do
-    fm_crew_instruction_has_wip "$wt" "$rel" || continue
-    blob=$(git -C "$wt" hash-object -w --no-filters -- "$wt/$rel") || blob=
-    [ -n "$blob" ] || {
-      echo "error: could not record the in-progress $rel in $wt; refusing to overwrite uncommitted work" >&2
+    [ -f "$wt/$rel" ] || continue
+    head_blob=$(git -C "$wt" rev-parse --verify --quiet "HEAD:$rel" 2>/dev/null) || head_blob=
+    disk_blob=$(git -C "$wt" hash-object --no-filters -- "$wt/$rel" 2>/dev/null) || disk_blob=
+    if fm_crew_instruction_has_wip "$wt" "$rel"; then
+      disk_blob=$(git -C "$wt" hash-object -w --no-filters -- "$wt/$rel") || disk_blob=
+      [ -n "$disk_blob" ] || {
+        echo "error: could not record the in-progress $rel in $wt; refusing to overwrite uncommitted work" >&2
+        return 1
+      }
+      disk_paths="${disk_paths:+$disk_paths }$rel"
+      disk_pairs="${disk_pairs:+$disk_pairs }$rel=$disk_blob"
+    fi
+    staged_blob=$(fm_crew_staged_blob "$wt" "$rel")
+    if [ -n "$staged_blob" ] && [ "$staged_blob" != "$head_blob" ] &&
+      [ "$staged_blob" != "$disk_blob" ]; then
+      staged_paths="${staged_paths:+$staged_paths }$rel"
+      staged_pairs="${staged_pairs:+$staged_pairs }$rel=$staged_blob"
+    fi
+  done
+  if [ -n "$staged_pairs" ]; then
+    # shellcheck disable=SC2086
+    ref=$(fm_crew_store_wip_entry "$wt" "$owner" \
+      "staged instruction edits saved for $owner before the crew overlay" $staged_pairs) || {
+      echo "error: could not save the staged $staged_paths in $wt; refusing to overwrite uncommitted work" >&2
       return 1
     }
-    paths="${paths:+$paths }$rel"
-    pairs="${pairs:+$pairs }$rel=$blob"
-  done
-  [ -n "$pairs" ] || return 0
-  # shellcheck disable=SC2086
-  ref=$(fm_crew_store_wip_entry "$wt" "$owner" \
-    "in-progress instruction edits saved for $owner before the crew overlay" $pairs) || {
-    echo "error: could not save in-progress $paths in $wt; refusing to overwrite uncommitted work" >&2
-    return 1
-  }
-  for rel in $paths; do
+    fm_crew_report_saved_entry "$wt" "$ref" "staged $staged_paths" || return 1
+  fi
+  if [ -n "$disk_pairs" ]; then
+    # shellcheck disable=SC2086
+    ref=$(fm_crew_store_wip_entry "$wt" "$owner" \
+      "working-tree instruction edits saved for $owner before the crew overlay" $disk_pairs) || {
+      echo "error: could not save in-progress $disk_paths in $wt; refusing to overwrite uncommitted work" >&2
+      return 1
+    }
+    fm_crew_report_saved_entry "$wt" "$ref" "in-progress $disk_paths" || return 1
+  fi
+  for rel in $disk_paths; do
     git -C "$wt" checkout HEAD -- "$rel" || {
-      echo "error: could not restore the committed $rel in $wt after saving its edits to $ref" >&2
+      echo "error: could not restore the committed $rel in $wt after saving its edits" >&2
       return 1
     }
   done
-  echo "warning: saved in-progress $paths to $ref; restore them with 'bin/fm-crew-instructions.sh recover'" >&2
+  for rel in $staged_paths; do
+    case " $disk_paths " in
+      *" $rel "*) continue ;;
+    esac
+    git -C "$wt" reset -q HEAD -- "$rel" || {
+      echo "error: could not reset the staged $rel in $wt after saving it" >&2
+      return 1
+    }
+  done
+}
+
+# Announce a saved entry with a command that works for whoever reads it.
+# `bin/fm-crew-instructions.sh recover` only reaches entries owned by the task
+# the worktree currently records, and a pooled slot's owner marker is rewritten
+# by the next install, so the ref-addressed command is the one that still works
+# after that happens.
+fm_crew_report_saved_entry() {  # <worktree> <ref> <what>
+  local wt=$1 ref=$2 what=$3 rel restore=''
+  for rel in $FM_CREW_INSTRUCTION_FILES; do
+    fm_crew_ref_holds_edit "$wt" "$ref" "$rel" || continue
+    restore="${restore:+$restore; }$(fm_crew_restore_command "$ref" "$rel")"
+  done
+  echo "warning: saved $what to $ref; restore it with: $restore" >&2
 }
 
 # Print <worktree>'s porcelain status lines with the crew overlay's own
@@ -655,6 +754,11 @@ fm_remove_crew_worktree_instructions() {  # <worktree>
 # instruction file on disk is never written here. A worker's live uncommitted
 # edit to the same path is therefore a separate, separately recoverable entry
 # instead of being overwritten by the sidecar on its way out.
+# A legacy slot carries no owner marker, so this rescue records the entry under
+# a derived owner that the next install then replaces with the real task id.
+# Withholding a previous occupant's work from the new task is the point, so the
+# entry stays where it is and the announcement names the ref instead of the CLI,
+# which would look under the new owner and correctly find nothing.
 fm_crew_rescue_legacy_sidecars() {  # <worktree>
   local wt=$1 rel dest blob ref owner='' failed=0
   for rel in $FM_CREW_INSTRUCTION_FILES; do
@@ -670,7 +774,7 @@ fm_crew_rescue_legacy_sidecars() {  # <worktree>
     blob=$(git -C "$wt" hash-object -w --no-filters -- "$wt/$dest") || blob=
     if [ -n "$blob" ] && ref=$(fm_crew_store_wip_entry "$wt" "$owner" \
       "$rel edits recovered for $owner from the superseded $dest sidecar" "$rel=$blob"); then
-      echo "warning: recovered $dest into $ref; list it with 'bin/fm-crew-instructions.sh saved'" >&2
+      echo "warning: recovered $dest into $ref; restore it with: $(fm_crew_restore_command "$ref" "$rel")" >&2
     else
       echo "error: could not recover the saved $dest in $wt into this task's saved instruction edits" >&2
       failed=1

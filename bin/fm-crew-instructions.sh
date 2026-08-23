@@ -8,7 +8,8 @@
 # restores the committed instruction files and drops the commit guard.
 # It never discards a worker's own edits. Only a file still holding the overlay
 # byte for byte is restored, and any in-progress edit the install saved stays
-# reachable through `saved` and `recover`.
+# reachable through `saved` and `recover`, including a version that was staged
+# rather than only on disk, which is saved as its own separate entry.
 # Those two commands read only the refs under this worktree's own task, whose id
 # the install recorded in the worktree's git dir. They never fall back to
 # another task's entry, and refuse loudly naming the ref namespace they searched
@@ -30,7 +31,9 @@ Commands:
   remove   Restore the committed AGENTS.md and CLAUDE.md and drop the commit
            guard, so branch-moving git commands stop refusing.
   saved    List the in-progress instruction edits saved for this worktree's own
-           task, with the command that restores each one.
+           task, with the command that restores each one. A version that was
+           staged when it was saved is listed as its own entry, separate from
+           the version that was on disk.
   recover  Restore the newest of this task's saved instruction edits into the
            working tree.
 
@@ -99,11 +102,13 @@ require_owned_entries() {
 }
 
 report_entry() {  # <ref>
-  local ref=$1 rel
+  local ref=$1 rel subject
+  subject=$(git -C "$WT" log -1 --format='%s' "$ref" 2>/dev/null || true)
   printf '  %s\n' "$ref"
+  [ -z "$subject" ] || printf '    %s\n' "$subject"
   for rel in $FM_CREW_INSTRUCTION_FILES; do
     fm_crew_ref_holds_edit "$WT" "$ref" "$rel" || continue
-    printf '    %s: git checkout %s -- %s\n' "$rel" "$ref" "$rel"
+    printf '    %s: %s\n' "$rel" "$(fm_crew_restore_command "$ref" "$rel")"
   done
 }
 
@@ -146,7 +151,11 @@ EOF
       exit 1
     }
     echo "restored $RESTORED from $NEWEST as an uncommitted modification in $WT."
-    echo "the entry is kept, not consumed; restore it again with 'git checkout $NEWEST -- $RESTORED'."
+    echo "the entry is kept, not consumed; restore it again with:"
+    for rel in $RESTORED; do
+      printf '  %s\n' "$(fm_crew_restore_command "$NEWEST" "$rel")"
+    done
+    echo "run 'bin/fm-crew-instructions.sh saved' to see this task's other entries."
     exit 0
     ;;
 esac
