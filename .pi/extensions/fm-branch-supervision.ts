@@ -536,8 +536,10 @@ export default function (pi: ExtensionAPI) {
           .split(/\s+/)
           .filter(Boolean)
           .map(Number);
+        const receiptSequences = new Set(sequences);
         if (
           sequences.length > 0 &&
+          receiptSequences.size === mergedWakeSequences.size &&
           sequences.every((sequence) => Number.isInteger(sequence) && mergedWakeSequences.has(sequence))
         ) {
           matched = true;
@@ -668,9 +670,9 @@ export default function (pi: ExtensionAPI) {
     const startedGeneration = sessionGeneration;
     void branchCleanup.then(() => {
       if (startedGeneration !== sessionGeneration) return;
-      if (!releaseBranchLeases()) return;
+      const leasesReleased = releaseBranchLeases();
       replayAcceptedWakes();
-      shuttingDown = false;
+      if (leasesReleased) shuttingDown = false;
     });
     // A replacement main session (/new, /resume) restarts dialog mirroring
     // from the new session file; collectMainDialog re-anchors the cursor.

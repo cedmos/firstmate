@@ -527,6 +527,47 @@ EOF
   pass "a completed branch wake without acknowledgement falls back to main"
 }
 
+test_partial_ack_preserves_wake_fallback() {
+  local repo home out status
+  repo="$TMP_ROOT/partial-ack-root"
+  home="$TMP_ROOT/partial-ack-home"
+  mkdir -p "$home/state" "$home/config"
+  install_pi_branch_extension_fixture "$repo"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { dispatch, settle, mainUserMessages, home }; })()`);
+const { dispatch, settle, mainUserMessages, home } = globalThis.__t;
+import { mkdirSync, writeFileSync } from "node:fs";
+globalThis.__fmBlockPrompt = true;
+if (!dispatch("signal: partial acknowledgement").accepted) throw new Error("wake was not accepted");
+await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "partial-ack prompt");
+const session = globalThis.__fmSessions[0];
+const report = session.options.customTools.find((tool) => tool.name === "fm_branch_report");
+for (const wakeSequence of [1, 2, 3]) {
+  const result = await report.execute(`report-${wakeSequence}`, {
+    task: `task-${wakeSequence}`,
+    verdict: "routine",
+    summary: "handled",
+    wakeSequence,
+  });
+  if (result.isError) throw new Error(`report ${wakeSequence} failed`);
+}
+mkdirSync(`${home}/state/branch-ack-receipts`, { recursive: true });
+writeFileSync(`${home}/state/branch-ack-receipts/receipt-partial`, "1\n2\n");
+session.resolvePrompt();
+await settle(() => mainUserMessages.length === 1, "partial-ack fallback");
+if (!mainUserMessages[0].content.includes("without acknowledging its reported wake batch")) {
+  throw new Error("partial acknowledgement cleared the accepted wake marker");
+}
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "a partial acknowledgement must preserve fallback: $out"
+  pass "a partial acknowledgement cannot clear the accepted wake marker"
+}
+
 test_failed_merge_preserves_wake_fallback() {
   local repo home out status
   repo="$TMP_ROOT/merge-failure-root"
@@ -627,6 +668,45 @@ EOF
   status=$?
   expect_code 0 "$status" "accepted wakes must fall back during session shutdown: $out"
   pass "accepted active and queued wakes fall back to main during session shutdown"
+}
+
+test_cleanup_failure_still_replays_accepted_wakes() {
+  local repo home broken out status
+  repo="$TMP_ROOT/cleanup-failure-plugin"
+  home="$TMP_ROOT/cleanup-failure-home"
+  broken="$TMP_ROOT/cleanup-failure-root"
+  mkdir -p "$home/state" "$home/config" "$broken"
+  install_pi_branch_extension_fixture "$repo"
+  cp -R "$ROOT/bin" "$broken/bin"
+  cp -R "$ROOT/.agents" "$broken/.agents"
+  cat > "$broken/bin/fm-lease.sh" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+  chmod +x "$broken/bin/fm-lease.sh"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$broken" \
+    DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, mainUserMessages }; })()`);
+const { fire, dispatch, settle, mainUserMessages } = globalThis.__t;
+globalThis.__fmBlockPrompt = true;
+if (!dispatch("signal: cleanup failure wake").accepted) throw new Error("wake was not accepted");
+await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "cleanup-failure prompt");
+fire("session_shutdown");
+fire("session_start");
+await settle(() => mainUserMessages.length === 1, "cleanup-failure fallback");
+if (!mainUserMessages[0].content.includes("signal: cleanup failure wake")) {
+  throw new Error("lease cleanup failure stranded the accepted wake");
+}
+if (dispatch("signal: branch must remain disabled").accepted) {
+  throw new Error("branch dispatch resumed after lease cleanup failure");
+}
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "lease cleanup failure must still replay accepted wakes: $out"
+  pass "lease cleanup failure replays accepted wakes while branch dispatch stays disabled"
 }
 
 test_branch_mirror_filters_order_and_cursor() {
@@ -753,7 +833,9 @@ test_branch_cache_key_is_per_home_stable
 test_branch_gating_config_afk_and_fallback
 test_completed_wake_without_report_falls_back
 test_completed_wake_without_ack_falls_back
+test_partial_ack_preserves_wake_fallback
 test_failed_merge_preserves_wake_fallback
 test_accepted_wakes_fall_back_during_shutdown
+test_cleanup_failure_still_replays_accepted_wakes
 test_branch_mirror_filters_order_and_cursor
 test_branch_session_persists_across_process_restarts
