@@ -47,7 +47,7 @@ ln -s "$PI_PACKAGE_DIR/node_modules/typebox" "$repo/node_modules/typebox"
 
 out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
   PI_CODING_AGENT_DIR="$agentdir" node --input-type=module 2>&1 <<'EOF'
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -63,9 +63,12 @@ const bus = {
   },
 };
 const mainUserMessages = [];
+const piHandlers = new Map();
 const pi = {
   events: bus,
-  on() {},
+  on(event, handler) {
+    piHandlers.set(event, [...(piHandlers.get(event) ?? []), handler]);
+  },
   registerTool() {},
   registerCommand() {},
   registerMessageRenderer() {},
@@ -76,6 +79,14 @@ const pi = {
 };
 const mod = await import(pathToFileURL(process.env.PLUGIN).href);
 mod.default(pi);
+const sessionCtx = {
+  sessionManager: { getSessionFile: () => `${home}/main.jsonl`, getEntries: () => [] },
+};
+for (const handler of piHandlers.get("session_start") ?? []) await handler({}, sessionCtx);
+if (existsSync(`${home}/state/.pi-branch-extension-loaded`)) {
+  throw new Error("branch activated before the primary session acquired its lock");
+}
+writeFileSync(`${home}/state/.lock`, `${process.pid}\n`);
 
 const offer = {
   message: "signal: live-sdk probe",

@@ -229,7 +229,7 @@ export default function (pi: ExtensionAPI) {
   let branchBroken = "";
   let mainStreaming = false;
   let shuttingDown = false;
-  let runtimeOwnsLock = lockOwnership() === "owned";
+  let ownershipActivated = false;
   let generationToken = randomUUID();
   let pendingWakeCounter = 0;
   let activeWake: { mergedWakeSequences: Set<number> } | null = null;
@@ -242,7 +242,7 @@ export default function (pi: ExtensionAPI) {
   const pendingMirror: MirrorItem[] = [];
 
   function markLoaded(): boolean {
-    if (!runtimeOwnsLock || lockOwnership() !== "owned") return false;
+    if (lockOwnership() !== "owned") return false;
     try {
       const lockPid = readFileSync(`${state}/.lock`, "utf8").trim();
       mkdirSync(state, { recursive: true });
@@ -273,6 +273,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function releaseBranchLeases(): boolean {
+    if (lockOwnership() !== "owned") return false;
     try {
       const result = spawnSync("bash", [leaseScript, "release-actor", "--actor", "branch"], {
         cwd: fmRoot,
@@ -606,6 +607,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function replayAcceptedWakes(): void {
+    if (lockOwnership() !== "owned") return;
     let names: string[];
     try {
       names = readdirSync(pendingWakesDir).filter((name) => name.endsWith(".json")).sort();
@@ -623,10 +625,25 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  function activateOwnership(): boolean {
+    if (shuttingDown || lockOwnership() !== "owned") return false;
+    if (ownershipActivated) return markLoaded();
+    if (!markLoaded()) return false;
+    const leasesReleased = releaseBranchLeases();
+    replayAcceptedWakes();
+    ownershipActivated = leasesReleased;
+    return ownershipActivated;
+  }
+
   function enqueueWake(message: string, pendingPath: string, acceptedGeneration: string): void {
     branchChain = branchChain
       .then(async () => {
-        if (shuttingDown || acceptedGeneration !== generationToken || !runtimeOwnsLock) {
+        if (
+          shuttingDown ||
+          acceptedGeneration !== generationToken ||
+          !ownershipActivated ||
+          lockOwnership() !== "owned"
+        ) {
           throw new Error("supervision session shut down before handling the accepted wake");
         }
         const session = await ensureBranch();
@@ -650,7 +667,12 @@ export default function (pi: ExtensionAPI) {
         }
       })
       .catch((error: unknown) => {
-        if (shuttingDown || acceptedGeneration !== generationToken || !runtimeOwnsLock) return;
+        if (
+          shuttingDown ||
+          acceptedGeneration !== generationToken ||
+          !ownershipActivated ||
+          lockOwnership() !== "owned"
+        ) return;
         try {
           fallbackToMain(message, error instanceof Error ? error.message : String(error));
           clearAcceptedWake(pendingPath);
@@ -662,7 +684,7 @@ export default function (pi: ExtensionAPI) {
     if (!branch || pendingMirror.length === 0) return;
     branchChain = branchChain
       .then(async () => {
-        if (shuttingDown || !branch) return;
+        if (shuttingDown || !branch || !ownershipActivated || lockOwnership() !== "owned") return;
         await flushMirror(branch);
       })
       .catch(() => {
@@ -674,7 +696,7 @@ export default function (pi: ExtensionAPI) {
   pi.events?.on?.(FM_BRANCH_DISPATCH_EVENT, (data) => {
     const offer = data as BranchDispatchOffer;
     if (!offer || typeof offer.accept !== "function") return;
-    if (shuttingDown || !runtimeOwnsLock || lockOwnership() !== "owned") return;
+    if (!activateOwnership()) return;
     if (!branchEnabled()) return;
     if (afkActive()) return; // the away daemon owns supervision while afk
     if (branchBroken) return; // fail back to today's wake-to-main path
@@ -703,7 +725,7 @@ export default function (pi: ExtensionAPI) {
   // durably (cursor-advanced) right away, deliver it into the branch through
   // the serialized chain so it lands before any later wake.
   pi.on?.("turn_end", (_event, ctx) => {
-    if (!runtimeOwnsLock || lockOwnership() !== "owned" || !branchEnabled()) return;
+    if (!activateOwnership() || !branchEnabled()) return;
     try {
       markDeliveredOutcomes(ctx.sessionManager);
       pendingMirror.push(...collectMainDialog(ctx.sessionManager));
@@ -720,19 +742,15 @@ export default function (pi: ExtensionAPI) {
   // reopens the persistent branch from its recorded pointer. Terminal quit
   // simply never fires another session_start.
   pi.on?.("session_start", (_event, ctx) => {
-    shuttingDown = true;
+    shuttingDown = false;
     branchBroken = "";
-    runtimeOwnsLock = lockOwnership() === "owned";
+    ownershipActivated = false;
     generationToken = randomUUID();
-    if (!markLoaded()) return;
+    if (!activateOwnership()) return;
     markDeliveredOutcomes(ctx.sessionManager);
-    const leasesReleased = releaseBranchLeases();
-    replayAcceptedWakes();
-    if (leasesReleased) shuttingDown = false;
   });
 
   pi.on?.("session_shutdown", async (_event, ctx) => {
-    if (!runtimeOwnsLock) return;
     shuttingDown = true;
     const stillOwnsLock = lockOwnership() === "owned";
     if (stillOwnsLock) markDeliveredOutcomes(ctx.sessionManager);
@@ -748,7 +766,7 @@ export default function (pi: ExtensionAPI) {
     }
     await waitForBranchTools();
     if (stillOwnsLock) releaseBranchLeases();
-    runtimeOwnsLock = false;
+    ownershipActivated = false;
   });
 
   pi.registerTool?.({

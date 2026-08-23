@@ -169,7 +169,9 @@ const home = process.env.FM_HOME;
 const realRoot = process.env.FM_ROOT_OVERRIDE;
 mkdirSync(`${home}/state`, { recursive: true });
 mkdirSync(`${home}/config`, { recursive: true });
-writeFileSync(`${home}/state/.lock`, `${process.env.FM_TEST_LOCK_PID || process.pid}\n`);
+if (process.env.FM_TEST_NO_INITIAL_LOCK !== "1") {
+  writeFileSync(`${home}/state/.lock`, `${process.env.FM_TEST_LOCK_PID || process.pid}\n`);
+}
 
 const busHandlers = new Map();
 const bus = {
@@ -422,6 +424,7 @@ test_branch_gating_config_afk_and_fallback() {
   home="$TMP_ROOT/gating-home"
   mkdir -p "$home/state" "$home/config" "$broken/bin"
   install_pi_branch_extension_fixture "$repo"
+  cp "$ROOT/bin/fm-lease.sh" "$ROOT/bin/fm-lease-lib.sh" "$ROOT/bin/fm-wake-lib.sh" "$broken/bin/"
   cat > "$broken/bin/fm-branch-prompt.sh" <<'SH'
 #!/usr/bin/env bash
 echo "synthetic generator failure" >&2
@@ -693,22 +696,28 @@ test_cleanup_failure_still_replays_accepted_wakes() {
   install_pi_branch_extension_fixture "$repo"
   cp -R "$ROOT/bin" "$broken/bin"
   cp -R "$ROOT/.agents" "$broken/.agents"
+  mv "$broken/bin/fm-lease.sh" "$broken/bin/fm-lease-real.sh"
   cat > "$broken/bin/fm-lease.sh" <<'SH'
 #!/usr/bin/env bash
-exit 1
+if [ -e "${FM_STATE_OVERRIDE:?}/.fail-lease-cleanup" ]; then
+  exit 1
+fi
+exec "$(dirname "$0")/fm-lease-real.sh" "$@"
 SH
   chmod +x "$broken/bin/fm-lease.sh"
   out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$broken" \
     DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
 const prelude = process.env.DRIVER_PRELUDE;
-await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, mainUserMessages }; })()`);
-const { fire, dispatch, settle, mainUserMessages } = globalThis.__t;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, mainUserMessages, home }; })()`);
+const { fire, dispatch, settle, mainUserMessages, home } = globalThis.__t;
 globalThis.__fmBlockPrompt = true;
 if (!dispatch("signal: cleanup failure wake").accepted) throw new Error("wake was not accepted");
 await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "cleanup-failure prompt");
 const sessionCtx = {
   sessionManager: { getSessionFile: () => "main.jsonl", getEntries: () => [] },
 };
+const { writeFileSync } = await import("node:fs");
+writeFileSync(`${home}/state/.fail-lease-cleanup`, "");
 await fire("session_shutdown", {}, sessionCtx);
 await fire("session_start", {}, sessionCtx);
 await settle(() => mainUserMessages.length === 1, "cleanup-failure fallback");
@@ -724,6 +733,41 @@ EOF
   status=$?
   expect_code 0 "$status" "lease cleanup failure must still replay accepted wakes: $out"
   pass "lease cleanup failure replays accepted wakes while branch dispatch stays disabled"
+}
+
+test_cold_start_activates_after_lock_acquisition() {
+  local repo home out status
+  repo="$TMP_ROOT/cold-start-root"
+  home="$TMP_ROOT/cold-start-home"
+  mkdir -p "$home/state" "$home/config"
+  install_pi_branch_extension_fixture "$repo"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_TEST_NO_INITIAL_LOCK=1 DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { fire, dispatch, settle, home }; })()`);
+const { fire, dispatch, settle, home } = globalThis.__t;
+import { existsSync, writeFileSync } from "node:fs";
+const ctx = { sessionManager: { getSessionFile: () => "cold.jsonl", getEntries: () => [] } };
+await fire("session_start", {}, ctx);
+if (existsSync(`${home}/state/.pi-branch-extension-loaded`)) {
+  throw new Error("a no-lock session activated branch supervision");
+}
+if (dispatch("signal: no-lock offer").accepted) throw new Error("a no-lock session accepted a branch wake");
+writeFileSync(`${home}/state/.lock`, `${process.pid}\n`);
+globalThis.__fmBlockPrompt = true;
+if (!dispatch("signal: post-lock offer").accepted) {
+  throw new Error("cold-start branch did not activate after lock acquisition");
+}
+await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "post-lock branch prompt");
+if (!existsSync(`${home}/state/.pi-branch-extension-loaded`)) {
+  throw new Error("post-lock activation did not publish the branch marker");
+}
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "cold-start branch must activate lazily after lock acquisition: $out"
+  pass "cold-start branch activates after lock acquisition while no-lock sessions stay inactive"
 }
 
 test_secondary_session_cannot_mutate_primary_branch_state() {
@@ -890,6 +934,7 @@ test_partial_ack_preserves_wake_fallback
 test_failed_merge_preserves_wake_fallback
 test_accepted_wakes_fall_back_during_shutdown
 test_cleanup_failure_still_replays_accepted_wakes
+test_cold_start_activates_after_lock_acquisition
 test_secondary_session_cannot_mutate_primary_branch_state
 test_branch_mirror_filters_order_and_cursor
 test_branch_session_persists_across_process_restarts
