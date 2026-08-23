@@ -25,6 +25,46 @@ setup_homes() {
     "$id" "$sub_abs" > "$home/data/secondmates.md"
 }
 
+# A live local receiver must get the same marked endpoint wake that direct routed
+# requests use. This test drives the real handoff and fm-send path through the
+# fake tmux adapter, then asserts the adapter received a submission.
+test_handoff_wakes_live_local_receiver() {
+  local home="$TMP_ROOT/live-wake-main" sub="$TMP_ROOT/live-wake-sub" fakebin out
+  setup_homes "$home" "$sub"
+  mkdir -p "$sub/state" "$sub/data"
+  cat > "$home/state/design.meta" <<EOF
+window=firstmate:fm-design
+kind=secondmate
+harness=claude
+backend=tmux
+home=$sub
+worktree=$sub
+EOF
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] wake-item - routed to a live receiver (repo: alpha)
+
+## Done
+EOF
+  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  fakebin=$(make_fake_tmux "$TMP_ROOT/live-wake-fake")
+  out="$TMP_ROOT/live-wake.out"
+  FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" PATH="$fakebin:$PATH" \
+    FM_FAKE_TMUX_WINDOW='firstmate:fm-design' \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/live-wake-tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/live-wake-fake/pane.txt" \
+    FM_SEND_SETTLE=0 FM_SEND_SLEEP=0 FM_SEND_RETRIES=1 \
+    "$ROOT/bin/fm-backlog-handoff.sh" design wake-item > "$out" 2>&1 \
+    || fail "handoff to a live receiver failed: $(cat "$out")"
+  grep -F 'wake-item' "$sub/data/backlog.md" >/dev/null \
+    || fail "live receiver did not receive the routed backlog item"
+  grep -F 'send-keys' "$TMP_ROOT/live-wake-tmux.log" >/dev/null \
+    || fail "handoff did not wake the live receiver endpoint"
+  grep -F 'New routed work is in your backlog.' "$TMP_ROOT/live-wake-tmux.log" >/dev/null \
+    || fail "receiver wake did not carry the routed-work instruction"
+  pass "a routed handoff wakes the live local receiver through its verified endpoint"
+}
+
 # Exact multi-line block extract: header matching key plus following body lines
 # (indented lines and blank separators between paragraphs), stopping at the next
 # item header or unindented section heading (column-0 ##).
@@ -632,6 +672,7 @@ EOF
   pass "registry entry without (home: ...) fails cleanly with has no home"
 }
 
+test_handoff_wakes_live_local_receiver
 test_body_moves_when_followed_by_another_item
 test_body_moves_when_followed_by_section_heading
 test_multi_paragraph_body_with_internal_blanks_moves_whole

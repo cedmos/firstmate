@@ -235,6 +235,88 @@ test_drain_dedupes_obvious_duplicates() {
 # plain drain-and-handle turn that runs no other supervision script. It must warn
 # when work is in flight with no live watcher, and stay silent right after a
 # normal fire from a live watcher with a fresh beacon, so it never false-alarms.
+test_secondmate_foreign_queue_stall_is_one_shot_and_read_only() {
+  local dir state sub fakebin out row_before row_after stall_count
+  dir=$(make_case secondmate-foreign-stall)
+  state="$dir/state"
+  sub="$dir/secondmate"
+  mkdir -p "$sub/state" "$sub/data" "$sub/bin"
+  printf '# Firstmate\n' > "$sub/AGENTS.md"
+  printf 'mate\n' > "$sub/.fm-secondmate-home"
+  printf 'window=firstmate:fm-mate\nkind=secondmate\nharness=claude\nbackend=tmux\nhome=%s\n' \
+    "$sub" > "$state/mate.meta"
+  printf '%s\t7\tcheck\trouted\tcheck: routed row\n' "$(( $(date +%s) - 10 ))" > "$sub/state/.wake-queue"
+  row_before="$dir/foreign-before"
+  row_after="$dir/foreign-after"
+  cp "$sub/state/.wake-queue" "$row_before"
+  fakebin="$dir/fakebin"
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-windows) printf '%s\n' "${FM_FAKE_TMUX_WINDOW:-}" ;;
+  capture-pane) cat "${FM_FAKE_TMUX_CAPTURE:-/dev/null}" ;;
+  display-message) printf '0\n' ;;
+  *) exit 0 ;;
+esac
+SH
+  chmod +x "$fakebin/tmux"
+  out="$dir/watch.out"
+
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_FAKE_TMUX_WINDOW='firstmate:fm-mate' \
+    FM_FAKE_TMUX_LOG="$dir/tmux.log" FM_FAKE_TMUX_CAPTURE="$dir/fake-tmux/pane.txt" \
+    FM_SECONDMATE_WAKE_STALL_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=0 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 3 > "$out" 2> "$dir/watch.err" || true
+  grep -F 'check: secondmate wake-loop stalled: mate=mate row=7' "$out" >/dev/null \
+    || fail "an aged foreign row did not wake the parent checkpoint: $(cat "$out"); err=$(cat "$dir/watch.err"); meta=$(cat "$state/mate.meta"); foreign=$(cat "$sub/state/.wake-queue")"
+  [ -s "$state/.wake-queue" ] || fail "the parent notification was not durable"
+  stall_count=$(grep -c 'secondmate-wake-loop-mate-' "$state/.wake-queue" || true)
+  [ "$stall_count" -eq 1 ] || fail "the first parent checkpoint did not publish exactly one stall notification"
+
+  cmp -s "$row_before" "$sub/state/.wake-queue" \
+    || fail "foreign queue row changed during read-only stall detection"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$dir/drain.out" 2> "$dir/drain.err" \
+    || fail "parent drain failed after the stall notification"
+  ack_drain_err "$state" "$dir/drain.err" \
+    || fail "parent stall notification could not be acknowledged"
+
+  sleep 1
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_FAKE_TMUX_WINDOW='firstmate:fm-mate' \
+    FM_FAKE_TMUX_LOG="$dir/tmux.log" FM_FAKE_TMUX_CAPTURE="$dir/fake-tmux/pane.txt" \
+    FM_SECONDMATE_WAKE_STALL_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=0 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 2 > "$dir/watch-second.out" 2> "$dir/watch-second.err" || true
+  [ ! -s "$state/.wake-queue" ] || {
+    stall_count=$(grep -c 'secondmate-wake-loop-mate-' "$state/.wake-queue" || true)
+    [ "$stall_count" -eq 0 ] || fail "repeated checkpoint re-published the same stall notification"
+  }
+  cp "$sub/state/.wake-queue" "$row_after"
+  cmp -s "$row_before" "$row_after" || fail "foreign queue changed after idempotent re-check"
+
+  : > "$sub/state/.wake-queue"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_FAKE_TMUX_WINDOW='firstmate:fm-mate' \
+    FM_FAKE_TMUX_LOG="$dir/tmux.log" FM_FAKE_TMUX_CAPTURE="$dir/fake-tmux/pane.txt" \
+    FM_SECONDMATE_WAKE_STALL_SECS=1 FM_POLL=1 FM_SIGNAL_GRACE=0 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 2 > "$dir/watch-empty.out" 2> "$dir/watch-empty.err" || true
+  ! grep -F 'secondmate wake-loop stalled' "$dir/watch-empty.out" >/dev/null \
+    || fail "an empty foreign queue produced a stall notification"
+
+  printf '%s\t8\tcheck\thealthy\tcheck: healthy row\n' "$(date +%s)" > "$sub/state/.wake-queue"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_STATE_OVERRIDE="$state" FM_FAKE_TMUX_WINDOW='firstmate:fm-mate' \
+    FM_FAKE_TMUX_LOG="$dir/tmux.log" FM_FAKE_TMUX_CAPTURE="$dir/fake-tmux/pane.txt" \
+    FM_SECONDMATE_WAKE_STALL_SECS=60 FM_POLL=1 FM_SIGNAL_GRACE=0 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
+    "$ROOT/bin/fm-watch-checkpoint.sh" --seconds 2 > "$dir/watch-healthy.out" 2> "$dir/watch-healthy.err" || true
+  ! grep -F 'secondmate wake-loop stalled' "$dir/watch-healthy.out" >/dev/null \
+    || fail "a healthy foreign queue produced a stall notification"
+  pass "foreign secondmate queue stalls notify once, remain byte-stable, and stay quiet when empty or healthy"
+}
+
 test_drain_asserts_watcher_liveness() {
   local dir state err identity
   dir=$(make_case drain-liveness)
@@ -793,6 +875,7 @@ test_historical_annotation_skips_announced_status() {
 }
 
 test_self_held_lock_reclaims_instead_of_deadlocking
+test_secondmate_foreign_queue_stall_is_one_shot_and_read_only
 test_self_announced_append_guards
 test_historical_annotation_skips_announced_status
 test_concurrent_append_and_drain

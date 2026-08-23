@@ -51,6 +51,9 @@
 # selected set from the dispatchable backlog into data/handoff/<id>.outbox.md,
 # then an idempotent confined transfer and fm-backlog-receive.sh deliver it.
 # A present outbox is the whole recovery record. No two-phase journal exists.
+# Every successful delivery also sends one marked wake to the receiving endpoint.
+# A missing endpoint is reported as an observable warning, while a live endpoint
+# that rejects the wake makes the handoff fail with the delivered backlog intact.
 # Usage: fm-backlog-handoff.sh <secondmate-id> <item-key>...
 #        fm-backlog-handoff.sh --resume-pending
 set -eu
@@ -300,6 +303,32 @@ warn_stale_public_commitments() { # <secondmate-id> <moved-key>...
   return 0
 }
 
+# Wake a live receiver after its backlog has become durable. The marked message
+# uses the normal endpoint route, so local and remote secondmates share the same
+# verified submit and failure semantics. A seeded but not-yet-spawned home is a
+# valid handoff destination, but its missing endpoint is reported rather than
+# pretending the task was started.
+wake_secondmate_receiver() { # <secondmate-id>
+  local id=$1 meta="$STATE/$1.meta" out rc=0
+  if [ ! -f "$meta" ] || [ -L "$meta" ]; then
+    printf 'warning: handed off work to secondmate %s, but no live receiver endpoint is recorded; the destination backlog is durable and needs a later wake\n' "$id" >&2
+    return 0
+  fi
+  [ "$(grep '^kind=' "$meta" | cut -d= -f2-)" = secondmate ] || {
+    printf 'error: secondmate %s has non-secondmate endpoint metadata; backlog is durable but the receiver was not woken\n' "$id" >&2
+    return 1
+  }
+  out=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_ROOT_OVERRIDE="$FM_ROOT" \
+    "$SCRIPT_DIR/fm-send.sh" "$id" \
+    'New routed work is in your backlog. Run bin/fm-session-start.sh now, then act on the routed task.' 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    [ -z "$out" ] || printf '%s\n' "$out" >&2
+    printf 'error: backlog delivery to secondmate %s succeeded, but its receiver wake failed; rerun this handoff to retry the wake\n' "$id" >&2
+    return 1
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out"
+}
+
 outbox_item_count() { # <path>
   awk '/^- \[[ x]\] / { count++ } END { print count + 0 }' "$1"
 }
@@ -348,8 +377,12 @@ remote_deliver_outbox() { # <secondmate-id> <outbox-path>
     echo "error: handoff receipt by $id was unavailable or completion is unknown; outbox preserved at $outbox" >&2
     return 1
   fi
+  if ! wake_secondmate_receiver "$id"; then
+    echo "error: remote backlog is durable at $id; outbox preserved at $outbox for wake retry" >&2
+    return 1
+  fi
   rm -f -- "$outbox" || {
-    echo "error: remote receipt was confirmed but local outbox cleanup failed: $outbox" >&2
+    echo "error: receiver wake was confirmed but local outbox cleanup failed: $outbox" >&2
     return 1
   }
   printf '%s\n' "$receive_out"
@@ -608,6 +641,7 @@ fi
 
 echo "handed off ${#TO_MOVE[@]} item(s) to $ID: ${TO_MOVE[*]}"
 echo "  into $SUB_BACKLOG"
+wake_secondmate_receiver "$ID" || exit 1
 if [ "${#ALREADY[@]}" -gt 0 ]; then
   echo "  already present (skipped): ${ALREADY[*]}"
 fi
