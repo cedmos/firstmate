@@ -174,6 +174,56 @@ SH
   pass "a post-move crash preserves wake intent for an idempotent retry"
 }
 
+test_delivery_confirmation_crash_does_not_resend() {
+  local home="$TMP_ROOT/confirm-crash-main" sub="$TMP_ROOT/confirm-crash-sub"
+  local fakebin="$TMP_ROOT/confirm-crash-fakebin" real_sleep rc=0 wake_count
+  setup_homes "$home" "$sub"
+  mkdir -p "$sub/data" "$fakebin"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] confirm-crash - preserve confirmed delivery (repo: alpha)
+
+## Done
+EOF
+  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  real_sleep=$(command -v sleep)
+  cat > "$fakebin/sleep" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = 1 ] && mkdir "$FM_CONFIRM_CRASH_ONCE" 2>/dev/null; then
+  handoff_pid=$(ps -o ppid= -p "$PPID" | tr -d '[:space:]')
+  kill -KILL "$handoff_pid"
+  exit 0
+fi
+exec "$FM_REAL_SLEEP" "$@"
+SH
+  chmod +x "$fakebin/sleep"
+  : > "$TMP_ROOT/default-tmux.log"
+
+  set +e
+  PATH="$fakebin:$PATH" FM_REAL_SLEEP="$real_sleep" \
+    FM_CONFIRM_CRASH_ONCE="$TMP_ROOT/confirm-crash.once" FM_SEND_SETTLE=1 \
+    FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design confirm-crash \
+    > "$TMP_ROOT/confirm-crash.out" 2>&1
+  rc=$?
+  set +e
+  [ "$rc" -ne 0 ] || fail "post-confirmation crash fixture unexpectedly reported success"
+  wake_count=$(grep -cF 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log")
+  [ "$wake_count" -eq 1 ] || fail "post-confirmation crash did not deliver exactly one receiver wake"
+  case "$(cat "$home/state/.backlog-handoff-design.wake-pending")" in
+    pending:*) ;;
+    *) fail "post-confirmation crash lost its stable delivery correlation" ;;
+  esac
+
+  FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design confirm-crash \
+    > "$TMP_ROOT/confirm-crash-retry.out" 2>&1 \
+    || fail "post-confirmation crash recovery failed: $(cat "$TMP_ROOT/confirm-crash-retry.out")"
+  [ "$(grep -cF 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log")" -eq "$wake_count" ] \
+    || fail "post-confirmation crash recovery duplicated the receiver wake"
+  assert_absent "$home/state/.backlog-handoff-design.wake-pending" \
+    "post-confirmation crash recovery left wake state pending"
+  pass "a post-confirmation crash reconciles delivery without resending"
+}
+
 test_concurrent_local_handoffs_serialize_move_and_wake() {
   local home="$TMP_ROOT/concurrent-main" sub="$TMP_ROOT/concurrent-sub"
   local basebin blockbin="$TMP_ROOT/concurrent-blockbin" first second i wake_count
@@ -913,6 +963,7 @@ EOF
 test_handoff_wakes_live_local_receiver
 test_failed_wake_retries_when_the_item_is_already_present
 test_move_crash_keeps_wake_pending_for_recovery
+test_delivery_confirmation_crash_does_not_resend
 test_concurrent_local_handoffs_serialize_move_and_wake
 test_local_teardown_waits_for_handoff_wake
 test_body_moves_when_followed_by_another_item

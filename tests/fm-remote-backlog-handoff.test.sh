@@ -379,8 +379,10 @@ set -e
 [ "$rc" -ne 0 ] || fail "remote handoff ignored local outbox cleanup failure"
 assert_present "$PARENT/data/handoff/ios.outbox.md" \
   "remote cleanup failure did not preserve the outbox"
-[ "$(cat "$PARENT/state/.backlog-handoff-ios.wake-pending")" = confirmed ] \
-  || fail "remote cleanup failure did not preserve confirmed wake state"
+case "$(cat "$PARENT/state/.backlog-handoff-ios.wake-pending")" in
+  confirmed:*) ;;
+  *) fail "remote cleanup failure did not preserve confirmed wake state" ;;
+esac
 wakes_after=$(grep -cF fm-remote-secondmate-control.sh "$WAKE_LOG")
 [ "$wakes_after" -eq $((wakes_before + 1)) ] \
   || fail "remote cleanup failure did not perform exactly one receiver wake"
