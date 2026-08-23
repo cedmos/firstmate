@@ -1,0 +1,41 @@
+tests/fm-spawn-empty-brief.test.sh - checked in both directions
+=================================================================
+
+WITH the guard present (target commit c9a922d)
+-----------------------------------------------
+$ FM_TEST_EVIDENCE=1 bash tests/fm-spawn-empty-brief.test.sh
+# observed refusal: error: the brief at <tmp>/empty-brief/home/data/empty-brief-refused-e1/brief.md is empty; a worker launched on it would have no instructions to read - restore its contents before spawning
+ok - a zero-byte brief refuses the spawn before any task endpoint exists
+ok - empty and missing briefs refuse under separate, non-interchangeable messages
+ok - a zero-byte secondmate charter refuses the spawn without misnaming its repair
+# observed launch: spawned normal-brief-launches-e4 harness=codex kind=ship mode=no-mistakes yolo=off window=firstmate:fm-normal-brief-launches-e4 worktree=<tmp>/normal-brief/pool
+ok - an ordinary brief still launches a worker through the same gate
+EXIT=0
+
+
+WITH the `[ -s "$BRIEF" ]` guard deleted from bin/fm-spawn.sh (defect restored)
+-------------------------------------------------------------------------------
+$ bash tests/fm-spawn-empty-brief.test.sh
+not ok - refusal did not name the empty brief (missing: 'the brief at <tmp>/empty-brief/home/data/empty-brief-refused-e1/brief.md is empty')
+--- output ---
+warning: <tmp>/empty-brief/home/data/empty-brief-refused-e1/brief.md records no delivery contract line (scaffolded before ship briefs recorded one); launching on the explicit --mode no-mistakes - confirm its definition of done matches
+error: treehouse get did not enter a worktree within 60s; inspect window firstmate:fm-empty-brief-refused-e1
+
+The failing direction stays hermetic: the unguarded spawn reaches only the
+fixture's no-op treehouse, so no real worktree pool is allocated.
+
+bin/fm-spawn.sh was restored to the committed version immediately after; the
+working tree is clean.
+
+
+Runner registration
+-------------------
+$ bin/fm-test-run.sh --check-coverage
+FM_TEST_COVERAGE ok total=155 parallel=24 serial=119 serial_shards=4 herdr=12
+
+$ bin/fm-test-run.sh --list --family backend-dispatch | grep spawn
+tests/fm-spawn-batch.test.sh
+tests/fm-spawn-dispatch-profile.test.sh
+tests/fm-spawn-empty-brief.test.sh
+tests/fm-spawn-worktree-settle.test.sh
+tests/fm-trace-context-spawn.test.sh
