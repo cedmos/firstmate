@@ -756,8 +756,14 @@ fi
 
 WAKE_PENDING_BEFORE=0
 WAKE_PENDING_MARKER="$STATE/.backlog-handoff-$ID.wake-pending"
+# A surviving marker belongs to an earlier invocation. Resolve its delivery
+# before creating the correlation for this new move; otherwise a confirmed old
+# correlation could make the new routed work appear woken without any submit.
 if [ -e "$WAKE_PENDING_MARKER" ] || [ -L "$WAKE_PENDING_MARKER" ]; then
-  WAKE_PENDING_BEFORE=1
+  wake_pending_secondmate_receiver "$ID" || {
+    echo "error: previous receiver wake for secondmate $ID is unresolved; nothing new was moved" >&2
+    exit 1
+  }
 fi
 receiver_wake_mark_pending "$ID" || {
   echo "error: receiver wake state for secondmate $ID could not be recorded; nothing was moved" >&2

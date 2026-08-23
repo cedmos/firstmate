@@ -171,7 +171,9 @@ phase_handoff() {
 - [x] old-task - shipped thing - local main (merged 2026-06-19)
 EOF
   local out before
-  out=$(FM_HOME="$HOME_DIR" "$ROOT/bin/fm-backlog-handoff.sh" design feat-x feat-y) \
+  out=$(PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_LOG="$LOG" \
+    FM_FAKE_TMUX_CAPTURE="$PANE" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design feat-x feat-y) \
     || fail "handoff failed for in-scope items"
   assert_contains "$out" "handed off 2 item(s) to design" "handoff did not report the moved items"
 
@@ -187,7 +189,9 @@ EOF
 
   # Idempotent: a second handoff neither errors nor duplicates, and leaves main alone.
   before=$(cat "$HOME_DIR/data/backlog.md")
-  FM_HOME="$HOME_DIR" "$ROOT/bin/fm-backlog-handoff.sh" design feat-x feat-y >/dev/null 2>&1 \
+  PATH="$FAKEBIN:$PATH" FM_HOME="$HOME_DIR" FM_FAKE_TMUX_LOG="$LOG" \
+    FM_FAKE_TMUX_CAPTURE="$PANE" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design feat-x feat-y >/dev/null 2>&1 \
     || fail "idempotent re-run failed"
   [ "$(grep -cF -- '- [ ] feat-x - add feature x (repo: alpha)' "$SUB/data/backlog.md")" -eq 1 ] \
     || fail "idempotent re-run duplicated feat-x in the subhome backlog"

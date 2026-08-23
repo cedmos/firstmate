@@ -331,14 +331,31 @@ SH
     *) fail "post-confirmation crash lost its stable delivery correlation" ;;
   esac
 
+  # Route different work before explicitly retrying the crashed invocation. The
+  # completed old correlation must be reconciled, but must not stand in as the
+  # delivery proof for this new durable move.
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] after-crash - requires its own receiver wake (repo: alpha)
+
+## Done
+EOF
+  FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design after-crash \
+    > "$TMP_ROOT/after-confirm-crash.out" 2>&1 \
+    || fail "new handoff after a confirmation crash failed: $(cat "$TMP_ROOT/after-confirm-crash.out")"
+  [ "$(grep -cF 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log")" -eq "$((wake_count + 1))" ] \
+    || fail "completed stale correlation suppressed or duplicated the new handoff wake"
+  assert_grep 'after-crash' "$sub/data/backlog.md" \
+    "new item after a confirmation crash was not durably handed off"
+
   FM_HOME="$home" "$ROOT/bin/fm-backlog-handoff.sh" design confirm-crash \
     > "$TMP_ROOT/confirm-crash-retry.out" 2>&1 \
     || fail "post-confirmation crash recovery failed: $(cat "$TMP_ROOT/confirm-crash-retry.out")"
-  [ "$(grep -cF 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log")" -eq "$wake_count" ] \
+  [ "$(grep -cF 'New routed work is in your backlog.' "$TMP_ROOT/default-tmux.log")" -eq "$((wake_count + 1))" ] \
     || fail "post-confirmation crash recovery duplicated the receiver wake"
   assert_absent "$home/state/.backlog-handoff-design.wake-pending" \
     "post-confirmation crash recovery left wake state pending"
-  pass "a post-confirmation crash reconciles delivery without resending"
+  pass "a post-confirmation crash reconciles once without suppressing a later handoff wake"
 }
 
 test_unresolved_delivery_attempt_refuses_immediate_resend() {
