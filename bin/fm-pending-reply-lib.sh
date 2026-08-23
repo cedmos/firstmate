@@ -449,6 +449,10 @@ fm_pending_reply_delivery_attempt_unresolved() {  # <state-dir> <corr_id>
   return 1
 }
 
+# A definitive backend rejection makes the existing correlation retryable again.
+# Reconciliation may have aged the same attempted sidecar to delivery_unknown
+# while the backend call was in flight, so both undelivered phases converge here
+# under the per-correlation lock; a confirmed delivery can never be reset.
 fm_pending_reply_reset_known_undelivered() {  # <state-dir> <corr_id>
   local state=$1 corr=$2 lock rc=0
   local STATE FM_WAKE_QUEUE FM_WAKE_QUEUE_LOCK

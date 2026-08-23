@@ -50,8 +50,12 @@
 # is the approved discard path that prevalidates child removal targets, locks each
 # descendant home's task set before enumeration, and holds those locks through
 # child cleanup. Contention refuses the complete forced teardown before child
-# mutation. It then discards child work, kills child runtime endpoints, and removes
-# the retired home. Removing a leased home releases its durable treehouse lease so the pool slot is freed,
+# mutation. Local and remote retirement serialize their destructive phase with
+# that mate's backlog-handoff lock under the registry lock. Pending handoff wake
+# state is retired with the home, and local removal failure restores that state
+# before preserving the route for retry. Teardown then discards child work, kills
+# child runtime endpoints, and removes the retired home. Removing a leased home
+# releases its durable treehouse lease so the pool slot is freed,
 # never left leased forever. If the treehouse return fails, teardown leaves the
 # leased home and state in place instead of hiding a still-held lease.
 # Usage: fm-teardown.sh <task-id> [--force]

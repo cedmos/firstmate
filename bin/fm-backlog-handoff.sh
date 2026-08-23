@@ -55,12 +55,11 @@
 # crash recovery reconcile an attempted or confirmed wake instead of blindly
 # resending it. A prepared local wake is bound to the exact sorted
 # requested-key batch; an unrelated handoff to that mate refuses until the
-# original batch is retried,
-# so it cannot discard wake intent for work that already moved. No two-phase
-# journal exists.
-# Every successful backlog delivery also sends one marked wake to the receiving
-# endpoint. A missing endpoint or a live endpoint that rejects the wake makes the
-# handoff fail with the delivered backlog intact.
+# original batch is retried, so it cannot discard wake intent for work that
+# already moved. No two-phase journal exists.
+# Every newly durable backlog delivery also sends one marked wake to the
+# receiving endpoint. A missing endpoint or a live endpoint that rejects the
+# wake makes the handoff fail with the delivered backlog intact.
 # Usage: fm-backlog-handoff.sh <secondmate-id> <item-key>...
 #        fm-backlog-handoff.sh --resume-pending
 set -eu
