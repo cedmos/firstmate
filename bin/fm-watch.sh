@@ -68,6 +68,11 @@
 #   check: inactive-outcome bounded poll-loop reconciliation found a suspicious
 #                          inactive terminal outcome that still lacks its durable
 #                          upstream receipt
+#   check: secondmate wake-loop stalled: mate=<id> row=<seq> age=<seconds>s
+#                          the oldest valid row in an endpoint-recorded local
+#                          secondmate home's durable wake queue exceeded
+#                          FM_SECONDMATE_WAKE_STALL_SECS; observation is read-only
+#                          and one parent receipt suppresses repeats for that row
 # For normal supervision, resume the session-start primary-harness protocol
 # after each printed reason. Direct duplicate invocations of this script still
 # no-op through the watcher singleton lock.

@@ -50,10 +50,13 @@
 # Remote routes use an outbox handoff: one atomic local tasks-axi mv removes the
 # selected set from the dispatchable backlog into data/handoff/<id>.outbox.md,
 # then an idempotent confined transfer and fm-backlog-receive.sh deliver it.
-# A present outbox is the whole recovery record. No two-phase journal exists.
-# Every successful delivery also sends one marked wake to the receiving endpoint.
-# A missing endpoint or a live endpoint that rejects the wake makes the handoff
-# fail with the delivered backlog intact.
+# A present outbox remains the remote retry trigger until backlog receipt and
+# receiver wake are both confirmed; a companion pending-reply correlation makes
+# crash recovery reconcile an attempted or confirmed wake instead of blindly
+# resending it. No two-phase journal exists.
+# Every successful backlog delivery also sends one marked wake to the receiving
+# endpoint. A missing endpoint or a live endpoint that rejects the wake makes the
+# handoff fail with the delivered backlog intact.
 # Usage: fm-backlog-handoff.sh <secondmate-id> <item-key>...
 #        fm-backlog-handoff.sh --resume-pending
 set -eu
