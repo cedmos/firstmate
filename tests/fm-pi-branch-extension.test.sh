@@ -247,9 +247,10 @@ test_branch_dispatch_two_stage_filter_and_prefix_contract() {
 const prelude = process.env.DRIVER_PRELUDE;
 await eval(`(async () => { ${prelude}; globalThis.__t = { pi, fire, dispatch, settle, outcomeScript, sentToMain, mainUserMessages, mainTools, renderers, home, realRoot }; })()`);
 const { fire, dispatch, settle, outcomeScript, sentToMain, mainUserMessages, mainTools, renderers, home, realRoot } = globalThis.__t;
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 
 // 1. An accepted wake reaches the branch session, never main.
+globalThis.__fmBlockPrompt = true;
 const offer = dispatch("signal: task-9 done: PR https://example.com/pr/9 checks green");
 if (!offer.accepted) throw new Error("branch did not accept the wake offer");
 await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "branch wake prompt");
@@ -340,6 +341,12 @@ if (listedText.split("\n").length !== 2 || !listedText.includes("checks green"))
 if (!renderers.has("fm-branch-merge")) throw new Error("merge-note renderer missing");
 const rendered = renderers.get("fm-branch-merge")({ content: "note body" }, { expanded: false }, { fg: (_c, text) => text });
 if (rendered.text !== "note body") throw new Error("merge-note renderer dropped the note");
+session.resolvePrompt();
+await settle(
+  () => !readdirSync(`${home}/state/branch-pending-wakes`).some((name) => name.endsWith(".json")),
+  "reported wake completion",
+);
+if (mainUserMessages.length !== 0) throw new Error("durably reported wake fell back to main");
 process.exit(0);
 EOF
   )
@@ -448,6 +455,37 @@ EOF
   pass "branch gating (config, afk) binds and a broken branch falls back to main"
 }
 
+test_completed_wake_without_report_falls_back() {
+  local repo home out status
+  repo="$TMP_ROOT/missing-report-root"
+  home="$TMP_ROOT/missing-report-home"
+  mkdir -p "$home/state" "$home/config"
+  install_pi_branch_extension_fixture "$repo"
+  out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'
+const prelude = process.env.DRIVER_PRELUDE;
+await eval(`(async () => { ${prelude}; globalThis.__t = { dispatch, settle, mainUserMessages, home }; })()`);
+const { dispatch, settle, mainUserMessages, home } = globalThis.__t;
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+if (!dispatch("signal: branch omitted its report").accepted) throw new Error("wake was not accepted");
+await settle(() => mainUserMessages.length === 1, "missing-report fallback");
+if (!mainUserMessages[0].content.includes("completed without a durable outcome report")) {
+  throw new Error("fallback did not identify the missing durable report");
+}
+if (existsSync(`${home}/state/branch-outcomes.jsonl`) && readFileSync(`${home}/state/branch-outcomes.jsonl`, "utf8").trim()) {
+  throw new Error("missing report unexpectedly produced a durable outcome");
+}
+if (readdirSync(`${home}/state/branch-pending-wakes`).some((name) => name.endsWith(".json"))) {
+  throw new Error("successful fallback left the accepted wake marker pending");
+}
+process.exit(0);
+EOF
+  )
+  status=$?
+  expect_code 0 "$status" "a completed wake without a report must fall back: $out"
+  pass "a completed branch wake without a durable report falls back to main"
+}
+
 test_accepted_wakes_fall_back_during_shutdown() {
   local repo home out status
   repo="$TMP_ROOT/shutdown-root"
@@ -463,6 +501,14 @@ globalThis.__fmBlockPrompt = true;
 if (!dispatch("signal: active during shutdown").accepted) throw new Error("active wake was not accepted");
 if (!dispatch("signal: queued during shutdown").accepted) throw new Error("queued wake was not accepted");
 await settle(() => (globalThis.__fmPrompts ?? []).length === 1, "active branch prompt");
+const { readFileSync } = await import("node:fs");
+const { spawnSync } = await import("node:child_process");
+const generation = readFileSync(`${home}/state/.pi-branch-generation`, "utf8").trim();
+const claim = spawnSync("bash", [`${process.env.FM_ROOT_OVERRIDE}/bin/fm-lease.sh`, "claim", "shutdown-task", "--actor", "branch"], {
+  encoding: "utf8",
+  env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: `${home}/state`, FM_LEASE_HOLDER_PID: String(process.pid), FM_LEASE_GENERATION: generation },
+});
+if (claim.status !== 0) throw new Error(`branch fixture lease claim failed: ${claim.stderr}`);
 globalThis.__fmRejectMainDelivery = true;
 fire("session_shutdown");
 await new Promise((resolve) => setTimeout(resolve, 30));
@@ -476,7 +522,11 @@ if (!delivered.includes("signal: queued during shutdown")) throw new Error("queu
 if (mainUserMessages.some((item) => item.options.deliverAs !== "followUp")) {
   throw new Error("shutdown fallback must deliver as a follow-up");
 }
-const { readdirSync } = await import("node:fs");
+if (readFileSync(`${home}/state/.pi-branch-generation`, "utf8").trim() === generation) {
+  throw new Error("shutdown did not invalidate the disposed branch generation");
+}
+const { existsSync, readdirSync } = await import("node:fs");
+if (existsSync(`${home}/state/.lease-shutdown-task`)) throw new Error("shutdown left a live branch lease wedged");
 if (readdirSync(`${home}/state/branch-pending-wakes`).some((name) => name.endsWith(".json"))) {
   throw new Error("replacement-session fallback left accepted wake markers unread");
 }
@@ -610,6 +660,7 @@ EOF
 test_branch_dispatch_two_stage_filter_and_prefix_contract
 test_branch_cache_key_is_per_home_stable
 test_branch_gating_config_afk_and_fallback
+test_completed_wake_without_report_falls_back
 test_accepted_wakes_fall_back_during_shutdown
 test_branch_mirror_filters_order_and_cursor
 test_branch_session_persists_across_process_restarts

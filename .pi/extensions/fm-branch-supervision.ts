@@ -67,7 +67,9 @@ const sessionPointer = join(state, ".branch-session");
 const mirrorCursorFile = join(state, ".branch-mirror-cursor");
 const promptScript = join(fmRoot, "bin", "fm-branch-prompt.sh");
 const outcomeScript = join(fmRoot, "bin", "fm-branch-outcome.sh");
+const leaseScript = join(fmRoot, "bin", "fm-lease.sh");
 const loadedMarker = join(state, ".pi-branch-extension-loaded");
+const branchGenerationFile = join(state, ".pi-branch-generation");
 const pendingWakesDir = join(state, "branch-pending-wakes");
 
 // Same tool set in the same order on every request (part of the cached
@@ -195,6 +197,7 @@ export default function (pi: ExtensionAPI) {
   let shuttingDown = false;
   let sessionGeneration = 0;
   let pendingWakeCounter = 0;
+  let activeWake: { reported: boolean } | null = null;
   // Serializes branch work: mirror appends and wake turns run strictly in
   // dispatch order, one at a time (the branch runs drain -> handle -> ack
   // serially by design).
@@ -205,8 +208,22 @@ export default function (pi: ExtensionAPI) {
     try {
       mkdirSync(state, { recursive: true });
       writeFileSync(loadedMarker, `${process.pid}\n`);
+      writeFileSync(branchGenerationFile, `${process.pid}:${sessionGeneration}\n`);
     } catch {
       // Diagnostic marker only; never block loading on it.
+    }
+  }
+
+  function releaseBranchLeases(): boolean {
+    try {
+      const result = spawnSync("bash", [leaseScript, "release-actor", "--actor", "branch"], {
+        cwd: fmRoot,
+        encoding: "utf8",
+        env: scriptEnv,
+      });
+      return result.status === 0;
+    } catch {
+      return false;
     }
   }
 
@@ -289,6 +306,7 @@ export default function (pi: ExtensionAPI) {
           isError: true,
         };
       }
+      if (activeWake) activeWake.reported = true;
       mergeIntoMain(appended.stdout, task, verdict, summary);
       return {
         content: [{ type: "text", text: `recorded seq ${appended.stdout} and merged [${verdict}] into main` }],
@@ -361,6 +379,7 @@ export default function (pi: ExtensionAPI) {
           ...scriptEnv,
           FM_SUPERVISION_ACTOR: "branch",
           FM_LEASE_HOLDER_PID: String(process.pid),
+          FM_LEASE_GENERATION: `${process.pid}:${sessionGeneration}`,
         },
       }),
     });
@@ -463,10 +482,17 @@ export default function (pi: ExtensionAPI) {
         }
         const session = await ensureBranch();
         await flushMirror(session);
-        await session.prompt(
-          `FIRSTMATE SUPERVISION WAKE: ${message}\n\nHandle this per your operating procedure and finish with fm_branch_report.`,
-        );
-        clearAcceptedWake(pendingPath);
+        const wakeState = { reported: false };
+        activeWake = wakeState;
+        try {
+          await session.prompt(
+            `FIRSTMATE SUPERVISION WAKE: ${message}\n\nHandle this per your operating procedure and finish with fm_branch_report.`,
+          );
+          if (!wakeState.reported) throw new Error("supervision branch completed without a durable outcome report");
+          clearAcceptedWake(pendingPath);
+        } finally {
+          if (activeWake === wakeState) activeWake = null;
+        }
       })
       .catch((error: unknown) => {
         if (shuttingDown || acceptedGeneration !== sessionGeneration) return;
@@ -541,7 +567,7 @@ export default function (pi: ExtensionAPI) {
     shuttingDown = false;
     branchBroken = "";
     markLoaded();
-    replayAcceptedWakes();
+    if (releaseBranchLeases()) replayAcceptedWakes();
     // A replacement main session (/new, /resume) restarts dialog mirroring
     // from the new session file; collectMainDialog re-anchors the cursor.
   });
@@ -549,6 +575,7 @@ export default function (pi: ExtensionAPI) {
   pi.on?.("session_shutdown", () => {
     shuttingDown = true;
     sessionGeneration += 1;
+    markLoaded();
     if (branch) {
       try {
         branch.dispose();
@@ -557,6 +584,7 @@ export default function (pi: ExtensionAPI) {
       }
       branch = null;
     }
+    releaseBranchLeases();
   });
 
   pi.registerTool?.({

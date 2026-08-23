@@ -21,6 +21,8 @@
 #   fm-lease.sh check <task>
 #       Print "<actor> <pid> <epoch> <live|stale>" for a held lease, or
 #       nothing (exit 1) when the task is unleased.
+#   fm-lease.sh release-actor --actor main|branch
+#       Drop every lease held by one actor during session-generation cleanup.
 #   fm-lease.sh sweep
 #       Remove every provably stale lease in this home. Run at session start
 #       (a lease held by a dead actor is cleared at session start); safe to
@@ -45,7 +47,7 @@ fm_lock_acquire_wait "$LEASE_COMMAND_LOCK"
 trap 'fm_lock_release "$LEASE_COMMAND_LOCK"' EXIT
 
 usage() {
-  echo "usage: fm-lease.sh claim|release <task> [--actor main|branch] | check <task> | sweep" >&2
+  echo "usage: fm-lease.sh claim|release <task> [--actor main|branch] | release-actor --actor main|branch | check <task> | sweep" >&2
   exit 2
 }
 
@@ -77,6 +79,19 @@ case "$CMD" in
     [ "$#" -le 1 ] || usage
     fm_lease_valid_id "$TASK" || usage
     ;;
+  release-actor)
+    ACTOR=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --actor)
+          ACTOR=${2:-}
+          shift 2 || usage
+          ;;
+        *) usage ;;
+      esac
+    done
+    case "$ACTOR" in main|branch) ;; *) usage ;; esac
+    ;;
   sweep)
     [ "$#" -eq 0 ] || usage
     ;;
@@ -86,6 +101,13 @@ esac
 case "$CMD" in
   claim)
     LEASE=$(fm_lease_path "$TASK")
+    if [ "$ACTOR" = branch ] && [ -n "${FM_LEASE_GENERATION:-}" ]; then
+      ACTIVE_GENERATION=$(cat "$STATE/.pi-branch-generation" 2>/dev/null || true)
+      if [ "$ACTIVE_GENERATION" != "$FM_LEASE_GENERATION" ]; then
+        echo "error: claim refused - the branch session generation is no longer active" >&2
+        exit "$FM_LEASE_REFUSE_EXIT"
+      fi
+    fi
     if fm_lease_live "$TASK" && [ "$FM_LEASE_ACTOR" != "$ACTOR" ]; then
       echo "error: claim refused - task '$TASK' is leased to the $FM_LEASE_ACTOR supervision actor (state/.lease-$TASK)" >&2
       exit "$FM_LEASE_REFUSE_EXIT"
@@ -135,6 +157,16 @@ case "$CMD" in
     fm_lease_read "$TASK" || exit 1
     if fm_lease_live "$TASK"; then LIVENESS=live; else LIVENESS=stale; fi
     printf '%s %s %s %s\n' "${FM_LEASE_ACTOR:-unreadable}" "${FM_LEASE_PID:-0}" "${FM_LEASE_EPOCH:-0}" "$LIVENESS"
+    ;;
+  release-actor)
+    for LEASE in "$STATE"/.lease-*; do
+      [ -e "$LEASE" ] || continue
+      TASK=${LEASE##*/.lease-}
+      fm_lease_valid_id "$TASK" || continue
+      if fm_lease_read "$TASK" && [ "$FM_LEASE_ACTOR" = "$ACTOR" ]; then
+        rm -f -- "$LEASE"
+      fi
+    done
     ;;
   sweep)
     for LEASE in "$STATE"/.lease-*; do
