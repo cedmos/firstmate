@@ -600,6 +600,14 @@ Each account, model and voice file above is read as its first line that is not b
 The two read files are parsed differently: `config/voice-read-scope` must hold the bare word and nothing but blank space around it, so a comment header there refuses instead of being skipped, while every line of `config/voice-read-deny` that is not blank and not a `#` comment is one more substring.
 `FM_VOICE_RELAY` and `FM_VOICE_PYTHON` belong to the laptop rather than to a home, so they have no config file: `bin/fm-voice-client.py` requires the relay path as a flag or that variable and carries no default path.
 
+## Flowy completion delivery (config/grok-flowy-webhook)
+
+`bin/fm-completion-outbox.sh` delivers captain-visible crew results (`done:`, `failed:`, `blocked:`, and `needs-decision:` status lines) to the captain's Flowy intake, and `bin/fm-watch.sh` is its only production caller.
+The endpoint is the single line in gitignored `config/grok-flowy-webhook`, and the Bearer key is a login-Keychain generic password for service `firstmate-flowy-webhook`, account `flowy`; no environment variable configures either, and neither ever reaches an argv a local `ps` could read.
+Delivery is a durable outbox rather than one best-effort POST: every result is recorded immutably before any network call, and only an HTTP 2xx retires that record into its own receipt, so a failed or unsent POST is retried by a later watcher pass and delivery state survives a restart.
+`state/flowy-last.md` remains an aggregate display snapshot and is never delivery authority.
+The script's header owns the exact record, drain, receipt, and snapshot mechanics, and the `FM_FLOWY_*` bounds below are the only tuning.
+
 ## Environment variables
 
 Runtime tuning via environment variables (defaults shown):
@@ -684,6 +692,9 @@ FM_WORKTREE_WRITE_PRUNE='.git node_modules .venv venv __pycache__ .mypy_cache .p
 FM_WORKTREE_WRITE_MAXDEPTH=6       # depth that same probe walks below the recorded worktree; it runs only at the moment a wedge escalation would otherwise fire, never on every poll; no probe knob applies to a secondmate, whose recorded worktree is a provisioned home the probe skips entirely
 FM_WORKTREE_WRITE_TIMEOUT=10       # wall-clock seconds that one walk may take, so a worktree on a hung mount cannot stall the watcher poll that started it; hitting the bound reads as no write evidence, which leaves the escalation schedule exactly as it was; a value that is not a positive integer falls back to the default
 FM_WATCH_TRIAGE_LOG_MAX_BYTES=262144   # size cap for the watcher's absorbed-wake debug log
+FM_FLOWY_DRAIN_SECONDS=   # total wall-clock seconds for the watcher's per-pass Flowy outbox drain; unset derives two thirds of FM_POLL's whole-second part, minimum 1, so a blackholed endpoint cannot delay the next signal scan
+FM_FLOWY_EXIT_DRAIN_SECONDS=5   # same total bound for the detached drain the watcher starts after a signal records a result; 0 skips only that promptness drain, never delivery itself
+FM_FLOWY_HTTP_TIMEOUT=20   # seconds allowed per Flowy POST; the watcher caps it at the drain bound so one request can never outlive the whole drain
 FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT=     # optional seconds allowed for bootstrap's best-effort clone refresh; unset/blank defaults to max(20, 5 + 3 * origin-backed-project-count)
 FM_FLEET_PRUNE=1        # set to 0 to skip pruning local branches whose upstream is gone
 FM_STALE_WORKTREE_LOCK_AGE_SECS=30       # min mtime age before fm-teardown.sh treats a leftover worktree git index.lock as provably stale
