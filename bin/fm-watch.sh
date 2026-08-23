@@ -1188,6 +1188,10 @@ EOF
     # never lost to one bad POST either. Recording here arms the DETACHED bounded
     # drain started right after this loop, which restores same-pass promptness
     # while leaving the wake exactly as prompt as it is with no drain at all.
+    # Its stdout goes to /dev/null for the same reason the two drain call sites
+    # do it: this process's stdout IS the wake channel, and a byte written there
+    # would be read back as part of the wake reason. Its stderr is kept, because
+    # that is where a recording diagnostic belongs.
     flowy_result_files=""
     while IFS=$(printf '\t') read -r sf sig f; do
       [ -n "$sf" ] || continue
@@ -1197,7 +1201,7 @@ EOF
         done:*|failed:*|blocked:*|needs-decision:*)
           flowy_result_files="$flowy_result_files $f"
           if [ -x "$FLOWY_COMPLETION_OUTBOX" ]; then
-            if FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$FLOWY_COMPLETION_OUTBOX" --status "$f" --no-drain; then
+            if FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" "$FLOWY_COMPLETION_OUTBOX" --status "$f" --no-drain >/dev/null; then
               FLOWY_DETACHED_DRAIN_ARMED=1
             else
               triage_log "Flowy completion outbox could not record the result for $(basename "$f")"

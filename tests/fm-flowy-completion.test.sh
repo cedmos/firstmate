@@ -437,14 +437,17 @@ test_same_result_text_from_a_new_event_is_delivered_again() {
 
 # Every watcher case drives the real bin/fm-watch.sh. The two drain ceilings are
 # shortened so a hung endpoint does not make the suite wait out the production
-# defaults; a later assignment in "$@" overrides either of them.
+# defaults; a later assignment in "$@" overrides either of them. They stay well
+# above the time a stubbed drain needs to fork, source its libraries, take the
+# lock and POST, because a ceiling that cuts off a HEALTHY stubbed drain would
+# fail the delivery cases under concurrent suite load rather than bound anything.
 start_watcher() {  # <home> [extra env assignments...]
   local home=$1
   shift
   env -u FLOWY_WEBHOOK_URL PATH="$home/fakebin:$PATH" \
     FLOWY_TEST_CODE="$home/http-code" FLOWY_TEST_CALLS="$home/curl.calls" \
     FM_HOME="$home" FM_POLL=1 FM_SIGNAL_GRACE=0 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 \
-    FM_FLOWY_EXIT_DRAIN_SECONDS=2 FM_FLOWY_DRAIN_SECONDS=3 "$@" \
+    FM_FLOWY_EXIT_DRAIN_SECONDS=6 FM_FLOWY_DRAIN_SECONDS=6 "$@" \
     "$ROOT/bin/fm-watch.sh" >>"$home/watch.out" 2>>"$home/watch.err" &
 }
 
@@ -475,6 +478,33 @@ await_call_count_above() {  # <home> <count> <deciseconds>
   return 1
 }
 
+# state/flowy-outbox/.drain.lock is the outbox's own one-drain-at-a-time lock,
+# taken for the whole pass and released at the end of it. Its absence is the
+# observable "no drain is running for this home right now".
+await_drain_lock_clear() {  # <home> <deciseconds>
+  local lock="$1/state/flowy-outbox/.drain.lock" limit=$2 i=0
+  while [ "$i" -lt "$limit" ]; do
+    if [ ! -e "$lock" ] && [ ! -L "$lock" ]; then
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# The signal path detaches its drain on purpose, so it routinely outlives the
+# watcher process that started it. A test that reads a call count or starts a
+# NEW generation before that child is done would otherwise attribute one
+# generation's POST to another, or make the next generation's drain fail on the
+# lock rather than on the response the case is actually exercising. Settled
+# means the POST has landed AND the drain that made it has released the lock.
+await_detached_drain_settled() {  # <home> <floor> <deciseconds>
+  local home=$1 floor=$2 limit=$3
+  await_call_count_above "$home" "$floor" "$limit" || return 1
+  await_drain_lock_clear "$home" "$limit"
+}
+
 # The acceptance path the incident actually needed: the watcher advances its seen
 # markers after one attempt, so the retry can only come from a later pass.
 test_watcher_retries_a_failed_delivery_on_a_later_pass() {
@@ -483,19 +513,22 @@ test_watcher_retries_a_failed_delivery_on_a_later_pass() {
   http_code "$home" 503
   status_line "$home" demo 'done: watcher result'
 
-  # First generation: the signal path records, the wake fires, and the bounded
-  # exit drain makes a REAL POST that the endpoint rejects with 503.
+  # First generation: the signal path records, the wake fires, and the drain it
+  # detached makes a REAL POST that the endpoint rejects with 503. That child is
+  # built to outlive the watcher, so settle it before reading any count.
   start_watcher "$home"
   pid=$!
   await_watcher_exit "$pid" 200 "watcher did not surface the terminal result"
-  after_first=$(call_count "$home")
-  [ -n "$after_first" ] && [ "$after_first" -gt 0 ] || \
+  await_detached_drain_settled "$home" 0 300 || \
     fail "the first watcher generation never attempted a delivery, so nothing failed to retry"
+  after_first=$(call_count "$home")
   [ "$(pending_count "$home")" = 1 ] || fail "the watcher's failed delivery left nothing to retry"
   [ -z "$(sole_receipt "$home")" ] || fail "the watcher wrote a receipt without a 2xx"
 
-  # Second generation: the status signal is already seen, so this is the per-pass
-  # drain retrying on its own - and it fails against 503 exactly as the first did.
+  # Second generation: the status signal is already seen, so nothing records and
+  # nothing detaches. The only POST that can raise the count past the settled
+  # floor above is the per-pass drain retrying on its own - and it fails against
+  # 503 exactly as the first did.
   start_watcher "$home"
   pid=$!
   await_call_count_above "$home" "$after_first" 200 || \
@@ -504,6 +537,8 @@ test_watcher_retries_a_failed_delivery_on_a_later_pass() {
   wait "$pid" 2>/dev/null || true
   [ "$(pending_count "$home")" = 1 ] || fail "a failed per-pass drain discarded the result"
   [ -z "$(sole_receipt "$home")" ] || fail "a failed per-pass drain wrote a receipt without a 2xx"
+  await_drain_lock_clear "$home" 300 || \
+    fail "the second generation's drain never released the outbox lock"
 
   # Third generation: the endpoint recovers and the per-pass drain delivers.
   http_code "$home" 200
@@ -525,7 +560,7 @@ test_watcher_retries_a_failed_delivery_on_a_later_pass() {
 }
 
 test_watcher_delivers_the_result_it_recorded_without_a_second_generation() {
-  local home pid i=0 receipt
+  local home pid receipt
   home=$(make_home detached-prompt)
   status_line "$home" demo 'done: prompt result'
 
@@ -534,13 +569,11 @@ test_watcher_delivers_the_result_it_recorded_without_a_second_generation() {
   await_watcher_exit "$pid" 200 "watcher did not surface the terminal result"
 
   # No second generation ever runs, so only the drain the recording pass detached
-  # can deliver this. It outlives the watcher by design, hence the short wait.
-  while [ "$i" -lt 100 ]; do
-    receipt=$(sole_receipt "$home")
-    [ -z "$receipt" ] || break
-    sleep 0.1
-    i=$((i + 1))
-  done
+  # can deliver this. It outlives the watcher by design, and it retires the record
+  # after writing the receipt, so settle it before reading either.
+  await_detached_drain_settled "$home" 0 300 || \
+    fail "the detached drain never reached the endpoint"
+  receipt=$(sole_receipt "$home")
   [ -n "$receipt" ] || fail "the detached drain never delivered the recorded result"
   assert_contains "$(cat "$receipt")" "status: demo: done: prompt result" \
     "the detached drain delivered the wrong result"
