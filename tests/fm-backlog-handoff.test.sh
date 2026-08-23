@@ -245,6 +245,64 @@ EOF
   pass "concurrent local handoffs serialize each durable move with its wake"
 }
 
+test_local_teardown_waits_for_handoff_wake() {
+  local home="$TMP_ROOT/teardown-race-main" sub="$TMP_ROOT/teardown-race-sub"
+  local basebin blockbin="$TMP_ROOT/teardown-race-blockbin" handoff teardown i
+  setup_homes "$home" "$sub"
+  printf 'project=%s\n' "$ROOT" >> "$home/state/design.meta"
+  mkdir -p "$sub/data" "$blockbin"
+  printf '## Queued\n\n## Done\n' > "$sub/data/backlog.md"
+  cat > "$home/data/backlog.md" <<'EOF'
+## Queued
+- [ ] teardown-race - routed while teardown starts (repo: alpha)
+
+## Done
+EOF
+  basebin=$(make_fake_tmux "$TMP_ROOT/teardown-race-fake")
+  cat > "$blockbin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *"New routed work is in your backlog."*)
+    touch "$FM_BLOCK_WAKE_ENTERED"
+    while [ ! -f "$FM_BLOCK_WAKE_RELEASE" ]; do sleep 0.02; done
+    ;;
+esac
+exec "$FM_BASE_TMUX" "$@"
+SH
+  chmod +x "$blockbin/tmux"
+  PATH="$blockbin:$basebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_BASE_TMUX="$basebin/tmux" FM_BLOCK_WAKE_ENTERED="$TMP_ROOT/teardown-race.entered" \
+    FM_BLOCK_WAKE_RELEASE="$TMP_ROOT/teardown-race.release" \
+    FM_FAKE_TMUX_WINDOW='firstmate:fm-design' \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/teardown-race-tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/teardown-race-fake/pane.txt" \
+    "$ROOT/bin/fm-backlog-handoff.sh" design teardown-race > "$TMP_ROOT/teardown-race-handoff.out" 2>&1 &
+  handoff=$!
+  i=0
+  while [ ! -f "$TMP_ROOT/teardown-race.entered" ]; do
+    kill -0 "$handoff" 2>/dev/null || fail "teardown-race handoff exited before its blocked wake"
+    i=$((i + 1))
+    [ "$i" -le 250 ] || fail "teardown-race handoff never reached its receiver wake"
+    sleep 0.02
+  done
+  PATH="$basebin:$PATH" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
+    FM_FAKE_TMUX_WINDOW='firstmate:fm-design' \
+    FM_FAKE_TMUX_LOG="$TMP_ROOT/teardown-race-tmux.log" \
+    FM_FAKE_TMUX_CAPTURE="$TMP_ROOT/teardown-race-fake/pane.txt" \
+    "$ROOT/bin/fm-teardown.sh" design --force > "$TMP_ROOT/teardown-race-teardown.out" 2>&1 &
+  teardown=$!
+  sleep 0.3
+  kill -0 "$teardown" 2>/dev/null \
+    || fail "local teardown bypassed the in-flight handoff lock: $(cat "$TMP_ROOT/teardown-race-teardown.out")"
+  [ -d "$sub" ] || fail "local teardown removed the receiver home before handoff wake completed"
+  assert_grep 'teardown-race' "$sub/data/backlog.md" \
+    "local teardown removed routed work before handoff wake completed"
+  touch "$TMP_ROOT/teardown-race.release"
+  wait "$handoff" || fail "teardown-race handoff failed after releasing its wake"
+  wait "$teardown" 2>/dev/null || true
+  pass "local teardown waits for the routed move and receiver wake"
+}
+
 # Exact multi-line block extract: header matching key plus following body lines
 # (indented lines and blank separators between paragraphs), stopping at the next
 # item header or unindented section heading (column-0 ##).
@@ -856,6 +914,7 @@ test_handoff_wakes_live_local_receiver
 test_failed_wake_retries_when_the_item_is_already_present
 test_move_crash_keeps_wake_pending_for_recovery
 test_concurrent_local_handoffs_serialize_move_and_wake
+test_local_teardown_waits_for_handoff_wake
 test_body_moves_when_followed_by_another_item
 test_body_moves_when_followed_by_section_heading
 test_multi_paragraph_body_with_internal_blanks_moves_whole

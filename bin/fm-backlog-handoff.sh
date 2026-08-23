@@ -309,9 +309,19 @@ warn_stale_public_commitments() { # <secondmate-id> <moved-key>...
 # verified submit and failure semantics. A seeded but not-yet-spawned home is a
 # valid handoff destination, but its missing endpoint is reported rather than
 # pretending the task was started.
-receiver_wake_mark_pending() { # <secondmate-id>
-  local id=$1 marker="$STATE/.backlog-handoff-$1.wake-pending" tmp
+receiver_wake_state_write() { # <secondmate-id> <state>
+  local id=$1 value=$2 marker="$STATE/.backlog-handoff-$1.wake-pending" tmp
   case "$id" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "$value" in pending|confirmed) ;; *) return 1 ;; esac
+  tmp=$(umask 077; mktemp "$STATE/.backlog-handoff-wake.XXXXXX") || return 1
+  if ! printf '%s\n' "$value" > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$marker"; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
+receiver_wake_mark_pending() { # <secondmate-id>
+  local id=$1 marker="$STATE/.backlog-handoff-$1.wake-pending"
   if [ -e "$marker" ] || [ -L "$marker" ]; then
     if [ -f "$marker" ] && [ ! -L "$marker" ] \
       && [ "$(cat "$marker" 2>/dev/null || true)" = pending ]; then
@@ -319,11 +329,19 @@ receiver_wake_mark_pending() { # <secondmate-id>
     fi
     return 1
   fi
-  tmp=$(umask 077; mktemp "$STATE/.backlog-handoff-wake.XXXXXX") || return 1
-  if ! printf 'pending\n' > "$tmp" || ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$marker"; then
-    rm -f -- "$tmp"
-    return 1
-  fi
+  receiver_wake_state_write "$id" pending
+}
+
+receiver_wake_clear_confirmed() { # <secondmate-id>
+  local id=$1 marker="$STATE/.backlog-handoff-$1.wake-pending" value
+  [ -e "$marker" ] || [ -L "$marker" ] || return 0
+  [ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+  value=$(cat "$marker" 2>/dev/null || true)
+  case "$value" in
+    pending) return 0 ;;
+    confirmed) rm -f -- "$marker" ;;
+    *) return 1 ;;
+  esac
 }
 
 wake_secondmate_receiver() { # <secondmate-id>
@@ -347,19 +365,31 @@ wake_secondmate_receiver() { # <secondmate-id>
   [ -z "$out" ] || printf '%s\n' "$out"
 }
 
-wake_pending_secondmate_receiver() { # <secondmate-id>
-  local id=$1 marker="$STATE/.backlog-handoff-$1.wake-pending"
+wake_pending_secondmate_receiver() { # <secondmate-id> [retain-confirmed]
+  local id=$1 retain=${2:-0} marker="$STATE/.backlog-handoff-$1.wake-pending" value
   [ -e "$marker" ] || [ -L "$marker" ] || return 0
-  if [ ! -f "$marker" ] || [ -L "$marker" ] \
-    || [ "$(cat "$marker" 2>/dev/null || true)" != pending ]; then
+  if [ ! -f "$marker" ] || [ -L "$marker" ]; then
+    printf 'error: receiver wake state for secondmate %s is unsafe or invalid\n' "$id" >&2
+    return 1
+  fi
+  value=$(cat "$marker" 2>/dev/null || true)
+  [ "$value" != confirmed ] || return 0
+  if [ "$value" != pending ]; then
     printf 'error: receiver wake state for secondmate %s is unsafe or invalid\n' "$id" >&2
     return 1
   fi
   wake_secondmate_receiver "$id" || return 1
-  rm -f -- "$marker" || {
-    printf 'error: receiver wake for secondmate %s was confirmed, but pending state could not be cleared\n' "$id" >&2
-    return 1
-  }
+  if [ "$retain" = 1 ]; then
+    receiver_wake_state_write "$id" confirmed || {
+      printf 'error: receiver wake for secondmate %s was confirmed, but confirmed state could not be recorded\n' "$id" >&2
+      return 1
+    }
+  else
+    rm -f -- "$marker" || {
+      printf 'error: receiver wake for secondmate %s was confirmed, but pending state could not be cleared\n' "$id" >&2
+      return 1
+    }
+  fi
 }
 
 outbox_item_count() { # <path>
@@ -367,7 +397,7 @@ outbox_item_count() { # <path>
 }
 
 remote_deliver_outbox() { # <secondmate-id> <outbox-path>
-  local id=$1 outbox=$2 remote_rel receive_out snapshot bytes hash generation counter counter_tmp current
+  local id=$1 outbox=$2 remote_rel receive_out snapshot bytes hash generation counter counter_tmp current marker
   [ -f "$outbox" ] && [ ! -L "$outbox" ] || {
     echo "error: pending outbox is unavailable or unsafe: $outbox" >&2
     return 1
@@ -410,16 +440,23 @@ remote_deliver_outbox() { # <secondmate-id> <outbox-path>
     echo "error: handoff receipt by $id was unavailable or completion is unknown; outbox preserved at $outbox" >&2
     return 1
   fi
-  receiver_wake_mark_pending "$id" || {
-    echo "error: remote backlog is durable at $id, but receiver wake state could not be recorded; outbox preserved at $outbox" >&2
-    return 1
-  }
-  if ! wake_pending_secondmate_receiver "$id"; then
+  marker="$STATE/.backlog-handoff-$id.wake-pending"
+  if [ "$(cat "$marker" 2>/dev/null || true)" != confirmed ]; then
+    receiver_wake_mark_pending "$id" || {
+      echo "error: remote backlog is durable at $id, but receiver wake state could not be recorded; outbox preserved at $outbox" >&2
+      return 1
+    }
+  fi
+  if ! wake_pending_secondmate_receiver "$id" 1; then
     echo "error: remote backlog is durable at $id; outbox preserved at $outbox for wake retry" >&2
     return 1
   fi
   rm -f -- "$outbox" || {
     echo "error: receiver wake was confirmed but local outbox cleanup failed: $outbox" >&2
+    return 1
+  }
+  rm -f -- "$marker" || {
+    echo "error: remote outbox cleanup succeeded but confirmed receiver wake state could not be cleared: $marker" >&2
     return 1
   }
   printf '%s\n' "$receive_out"
@@ -458,6 +495,12 @@ remote_handoff() { # <secondmate-id> <keys...>
   outbox="$DATA/handoff/$id.outbox.md"
   validate_backlog_file "main backlog" "$MAIN_BACKLOG" || return 1
   validate_backlog_file "remote handoff outbox" "$outbox" || return 1
+  if [ ! -e "$outbox" ] && [ ! -L "$outbox" ]; then
+    receiver_wake_clear_confirmed "$id" || {
+      echo "error: stale receiver wake state for secondmate $id could not be cleared" >&2
+      return 1
+    }
+  fi
   fm_tasks_axi_compatible || {
     echo "error: a compatible tasks-axi with atomic multi-ID mv support is required to stage remote handoffs; run bin/fm-bootstrap.sh for the required version" >&2
     return 1

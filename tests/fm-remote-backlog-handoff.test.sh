@@ -355,6 +355,43 @@ assert_absent "$PARENT/data/handoff/ios.outbox.md" \
   "remote receiver wake recovery left its outbox pending"
 pass "remote handoff wakes its supported endpoint or remains loudly recoverable"
 
+RM_FAKEBIN="$TMP_ROOT/rm-fakebin"
+mkdir -p "$RM_FAKEBIN"
+REAL_RM=$(command -v rm)
+cat > "$RM_FAKEBIN/rm" <<'SH'
+#!/usr/bin/env bash
+last=${!#}
+if [ "$last" = "$FM_FAIL_RM_PATH" ]; then
+  exit 1
+fi
+exec "$FM_REAL_RM" "$@"
+SH
+chmod +x "$RM_FAKEBIN/rm"
+write_backlog '- [ ] cleanup-retry - confirmed wake survives cleanup retry (repo: alpha)'
+wakes_before=$(grep -cF fm-remote-secondmate-control.sh "$WAKE_LOG")
+set +e
+PATH="$RM_FAKEBIN:$PATH" FM_REAL_RM="$REAL_RM" \
+  FM_FAIL_RM_PATH="$PARENT/data/handoff/ios.outbox.md" \
+  handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios cleanup-retry \
+  > "$TMP_ROOT/cleanup-retry.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "remote handoff ignored local outbox cleanup failure"
+assert_present "$PARENT/data/handoff/ios.outbox.md" \
+  "remote cleanup failure did not preserve the outbox"
+[ "$(cat "$PARENT/state/.backlog-handoff-ios.wake-pending")" = confirmed ] \
+  || fail "remote cleanup failure did not preserve confirmed wake state"
+wakes_after=$(grep -cF fm-remote-secondmate-control.sh "$WAKE_LOG")
+[ "$wakes_after" -eq $((wakes_before + 1)) ] \
+  || fail "remote cleanup failure did not perform exactly one receiver wake"
+handoff_env "$ROOT/bin/fm-backlog-handoff.sh" --resume-pending >/dev/null \
+  || fail "remote cleanup retry did not converge"
+[ "$(grep -cF fm-remote-secondmate-control.sh "$WAKE_LOG")" -eq "$wakes_after" ] \
+  || fail "remote cleanup retry duplicated a confirmed receiver wake"
+assert_absent "$PARENT/state/.backlog-handoff-ios.wake-pending" \
+  "remote cleanup retry left confirmed wake state behind"
+pass "remote cleanup recovery does not duplicate a confirmed receiver wake"
+
 write_backlog '- [ ] route-race - remains dispatchable through retirement (repo: alpha)'
 registry_lock="$PARENT/state/.secondmate-registry.lock"
 handoff_lock="$PARENT/state/.backlog-handoff-ios.lock"

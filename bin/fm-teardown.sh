@@ -194,6 +194,14 @@ teardown_release_locks() {
     fm_lock_release "${DESCENDANT_LOCK_PATHS[$i]}" || true
   done
   DESCENDANT_LOCK_PATHS=()
+  if [ -n "${LOCAL_HANDOFF_LOCK:-}" ]; then
+    fm_lock_release "$LOCAL_HANDOFF_LOCK" || true
+    LOCAL_HANDOFF_LOCK=
+  fi
+  if [ -n "${LOCAL_REGISTRY_LOCK:-}" ]; then
+    fm_lock_release "$LOCAL_REGISTRY_LOCK" || true
+    LOCAL_REGISTRY_LOCK=
+  fi
   if [ "$META_LOCK_HELD" = 1 ]; then
     fm_lock_release "$META_LOCK" || true
     META_LOCK_HELD=0
@@ -230,6 +238,8 @@ REMOTE_PENDING_DIR_REAL=
 REMOTE_HANDOFF_LOCK=
 REMOTE_REGISTRY_LOCK=
 REMOTE_REPLY_LIFECYCLE_LOCK=
+LOCAL_HANDOFF_LOCK=
+LOCAL_REGISTRY_LOCK=
 
 remote_teardown_locks_release() {
   if [ -n "$REMOTE_REPLY_LIFECYCLE_LOCK" ]; then
@@ -2267,20 +2277,27 @@ cleanup_firstmate_home_children() {
 }
 
 remove_secondmate_registry_entry() {
-  local id=$1 tmp lock rc=0
+  local id=$1 tmp lock rc=0 acquired=0
   [ -f "$SECONDMATE_REG" ] || return 0
   lock=$(secondmate_registry_lock_path "$STATE")
-  fm_lock_acquire_wait "$lock" || return 1
+  if [ "$LOCAL_REGISTRY_LOCK" != "$lock" ]; then
+    fm_lock_acquire_wait "$lock" || return 1
+    acquired=1
+  fi
   tmp="$SECONDMATE_REG.tmp.$$"
   grep -vE "^- $id( |$)" "$SECONDMATE_REG" > "$tmp" || true
   mv "$tmp" "$SECONDMATE_REG" || rc=$?
-  fm_lock_release "$lock"
+  [ "$acquired" -eq 0 ] || fm_lock_release "$lock"
   return "$rc"
 }
 
 validate_pr_poll_cleanup "$STATE" "$ID" || exit 1
 
 if [ "$KIND" = secondmate ]; then
+  LOCAL_REGISTRY_LOCK=$(secondmate_registry_lock_path "$STATE")
+  fm_lock_acquire_wait "$LOCAL_REGISTRY_LOCK" || exit 1
+  LOCAL_HANDOFF_LOCK="$STATE/.backlog-handoff-$ID.lock"
+  fm_lock_acquire_wait "$LOCAL_HANDOFF_LOCK" || exit 1
   [ -n "$HOME_PATH" ] || HOME_PATH=$WT
   validate_firstmate_home_for_removal "$HOME_PATH" "secondmate home" "$ID" >/dev/null || exit 1
   if [ "$FORCE" = "--force" ]; then
