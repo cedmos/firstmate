@@ -57,11 +57,18 @@
 # An instruction file with unmerged index stages has no single version to record
 # and no restore that would not silently collapse the conflict, so the save
 # refuses it loudly rather than guessing which stage the worker meant.
+# An instruction file HEAD still tracks but the worker deleted has no content to
+# record either, and writing the overlay over that path would recreate the file
+# and destroy the deletion, so the install refuses that one too rather than
+# quietly choosing for the worker.
 #
 # The install also writes a pre-commit guard refusing a commit that would land
 # the overlay over firstmate's own committed file. The guard lives in this
 # worktree's own git dir and is selected through per-worktree `core.hooksPath`,
 # so the primary checkout's hooks are never touched.
+# core.hooksPath names the whole hook set rather than one entry in it, so the
+# guard remembers the path it displaced, chains to its pre-commit, forwards its
+# other hooks, and puts a displaced worktree-scoped value back on removal.
 # fm_remove_crew_worktree_instructions undoes all of it, and bin/fm-crew-instructions.sh
 # makes it reachable by the worker, so a worker who wants a clean tree for a
 # branch move has a one-command escape. It also heals a worktree still carrying
@@ -90,6 +97,12 @@ FM_CREW_GUIDELINES_REL='.agents/skills/firstmate-coding-guidelines/SKILL.md'
 FM_CREW_AGENTS_WIP='.fm-agents-md-edit'
 FM_CREW_CLAUDE_WIP='.fm-claude-md-edit'
 FM_CREW_HOOKS_DIRNAME='fm-crew-hooks'
+# The guard takes this worktree's core.hooksPath, which disables every hook the
+# path it displaced defined. These two records name what it displaced so the
+# guard can chain to it and removal can put it back. They live inside the guard
+# directory so they are removed with it and never outlive the guard.
+FM_CREW_PREVIOUS_HOOKS_RECORD='previous-hooks-path'
+FM_CREW_PREVIOUS_WORKTREE_HOOKS_RECORD='previous-worktree-hooks-path'
 FM_CREW_INSTRUCTION_FILES='AGENTS.md CLAUDE.md'
 # Saved in-progress instruction edits live at
 # refs/fm-crew/<task-id>-<digest>/instruction-wip/<n>, where <digest> is
@@ -261,6 +274,42 @@ fm_crew_instruction_has_wip() {  # <worktree> <rel>
   [ -f "$wt/$rel" ] || return 1
   fm_crew_file_is_installed_overlay "$wt" "$rel" && return 1
   fm_crew_file_differs_from_head "$wt" "$rel"
+}
+
+# Return 0 when the worker deleted <rel> from the working tree while HEAD still
+# tracks it. That is uncommitted work with no content to record, so it is
+# neither saved nor overlaid, and it must not be passed over in silence.
+fm_crew_instruction_is_deleted() {  # <worktree> <rel>
+  local wt=$1 rel=$2
+  [ -f "$wt/$rel" ] && return 1
+  [ -n "$(git -C "$wt" rev-parse --verify --quiet "HEAD:$rel" 2>/dev/null)" ]
+}
+
+# Refuse a launch into a firstmate worktree where an instruction file HEAD still
+# tracks is deleted from disk.
+# Neither of the two things this library could do is safe to do quietly. Writing
+# the overlay over the path recreates the file and destroys the deletion, and
+# skipping the file leaves the launch without the crew instructions it exists to
+# install - which is what a deleted AGENTS.md produced, because the shape test
+# below reads a firstmate worktree missing AGENTS.md as some other project and
+# returns success having installed nothing.
+# The deletion is the worker's own uncommitted work, so it is left exactly where
+# it is and the worker is told which of the two committed states to reach.
+# Scope is taken from the two fleet scripts rather than from AGENTS.md, because
+# a deleted AGENTS.md is precisely the case an on-disk shape test cannot see.
+fm_crew_refuse_deleted_instructions() {  # <worktree>
+  local wt=$1 rel deleted=''
+  [ -f "$wt/bin/fm-session-start.sh" ] && [ -f "$wt/bin/fm-spawn.sh" ] || return 0
+  fm_checkout_is_linked_worktree "$wt" || return 0
+  for rel in $FM_CREW_INSTRUCTION_FILES; do
+    fm_crew_instruction_is_deleted "$wt" "$rel" && deleted="${deleted:+$deleted }$rel"
+  done
+  [ -n "$deleted" ] || return 0
+  echo "error: $deleted is deleted in $wt while HEAD still tracks it" >&2
+  echo "the crew instruction overlay replaces the harness-loaded AGENTS.md and CLAUDE.md, and a deleted one has no content to save and nothing to overlay." >&2
+  echo "installing anyway would either recreate the file over your deletion or leave this worktree with no crew instructions at all, so this refuses instead." >&2
+  echo "keep the deletion by committing it, or undo it with 'git checkout HEAD -- $deleted', then run this again." >&2
+  return 1
 }
 
 # Clear any hiding bit the superseded mechanism left on <rel>.
@@ -544,6 +593,11 @@ fm_crew_save_instruction_wip() {  # <worktree> <owner>
   local disk_paths='' staged_paths='' restore_paths='' reset_paths='' ref
   local -a disk_pairs=() staged_pairs=()
   for rel in $FM_CREW_INSTRUCTION_FILES; do
+    # A path with no file has no version to hash, so there is nothing for this
+    # function to record. A deletion HEAD still tracks is not passed over
+    # silently, though: fm_crew_refuse_deleted_instructions stops the install
+    # ahead of this loop, so what reaches here is a path this repository simply
+    # does not carry.
     [ -f "$wt/$rel" ] || continue
     if fm_crew_instruction_is_unmerged "$wt" "$rel"; then
       echo "error: $rel in $wt has unresolved merge conflicts in the index" >&2
@@ -678,8 +732,80 @@ fm_crew_commit_guard_dir() {  # <worktree>
   printf '%s\n' "$git_dir/$FM_CREW_HOOKS_DIRNAME"
 }
 
-fm_crew_write_commit_guard() {  # <dest> <agents-blob-hash> <claude-blob-hash>
-  local dest=$1 agents_hash=$2 claude_hash=$3
+# The hooks directory git ran hooks from before this guard took over, resolved
+# once and then remembered. Remembering it is what keeps a reinstall from
+# chaining the guard to itself: by then core.hooksPath already names the guard.
+# An unset core.hooksPath still means a real directory - the common git dir's
+# own `hooks/` - so the default case has hooks to preserve too.
+fm_crew_previous_hooks_dir() {  # <worktree> <guard-dir>
+  local wt=$1 dir=$2 record="$2/$FM_CREW_PREVIOUS_HOOKS_RECORD" configured
+  if [ -f "$record" ]; then
+    IFS= read -r configured < "$record" || configured=
+    printf '%s\n' "$configured"
+    return 0
+  fi
+  configured=$(git -C "$wt" config --get core.hooksPath 2>/dev/null || true)
+  if [ -z "$configured" ] || [ "$configured" = "$dir" ]; then
+    configured=$(git -C "$wt" rev-parse --git-common-dir 2>/dev/null) || return 1
+    [ -n "$configured" ] || return 1
+    configured="$configured/hooks"
+  fi
+  # git resolves a relative core.hooksPath against the directory it runs hooks
+  # in, which is the worktree root. The guard runs from a different path, so the
+  # remembered form has to be absolute.
+  case $configured in
+    /*) ;;
+    *) configured="$wt/$configured" ;;
+  esac
+  printf '%s\n' "$configured"
+}
+
+# Forward every hook the displaced path defined, except pre-commit, which the
+# guard itself chains to. Without this the guard's directory is the whole hook
+# set for this worktree and the project's own formatting and validation hooks
+# stop running the moment the overlay is installed.
+# The set is a snapshot taken at install: git only runs a hook that exists in
+# the active hooks path, so a name that appears in the displaced directory later
+# needs the next install to pick it up.
+fm_crew_forward_previous_hooks() {  # <guard-dir> <previous-hooks-dir>
+  local dir=$1 prev=$2 hook name
+  [ -n "$prev" ] && [ -d "$prev" ] || return 0
+  for hook in "$prev"/*; do
+    [ -f "$hook" ] && [ -x "$hook" ] || continue
+    name=${hook##*/}
+    case $name in
+      *.sample | pre-commit) continue ;;
+    esac
+    {
+      printf '%s\n' '#!/usr/bin/env bash' \
+        '# Installed by bin/fm-crew-worktree-instructions-lib.sh.' \
+        '# The crew commit guard owns this worktree'"'"'s core.hooksPath, so this' \
+        '# forwards the hook the displaced hooks path defined.' \
+        'set -u'
+      printf 'exec %s "$@"\n' "$(printf '%q' "$hook")"
+    } > "$dir/$name" || return 1
+    chmod +x "$dir/$name" || return 1
+  done
+}
+
+# Drop stubs a previous install left, so a hook the displaced path no longer
+# defines does not keep being forwarded to a script that is gone.
+fm_crew_clear_forwarded_hooks() {  # <guard-dir>
+  local dir=$1 entry name
+  [ -d "$dir" ] || return 0
+  for entry in "$dir"/*; do
+    [ -f "$entry" ] || continue
+    name=${entry##*/}
+    case $name in
+      "$FM_CREW_PREVIOUS_HOOKS_RECORD" | "$FM_CREW_PREVIOUS_WORKTREE_HOOKS_RECORD") continue ;;
+    esac
+    rm -f "$entry" || return 1
+  done
+}
+
+fm_crew_write_commit_guard() {  # <dest> <agents-blob-hash> <claude-blob-hash> <previous-hooks-dir>
+  local dest=$1 agents_hash=$2 claude_hash=$3 previous=''
+  [ -z "${4:-}" ] || previous=$(printf '%q' "$4/pre-commit")
   cat > "$dest" <<EOF
 #!/usr/bin/env bash
 # Installed by bin/fm-crew-worktree-instructions-lib.sh for this worktree only.
@@ -692,8 +818,12 @@ fm_crew_write_commit_guard() {  # <dest> <agents-blob-hash> <claude-blob-hash>
 # A staged instruction file that carries the overlay marker but is NOT the
 # overlay byte for byte is scaffolding mixed into source. Neither dropping nor
 # keeping it is safe to decide here, so that one is refused loudly.
+# Taking over core.hooksPath would otherwise disable the pre-commit hook this
+# worktree already had, so that one runs after the overlay is unstaged and its
+# verdict is this guard's verdict.
 set -u
 marker='$FM_CREW_OVERLAY_MARKER'
+previous_hook=$previous
 guard_status=0
 
 refuse() {
@@ -731,15 +861,24 @@ for rel in $FM_CREW_INSTRUCTION_FILES; do
     "or drop the overlay from this worktree entirely:" \\
     "  bin/fm-crew-instructions.sh remove"
 done
-exit "\$guard_status"
+[ "\$guard_status" -eq 0 ] || exit "\$guard_status"
+if [ -n "\$previous_hook" ] && [ -x "\$previous_hook" ]; then
+  exec "\$previous_hook" "\$@"
+fi
+exit 0
 EOF
 }
 
 # Select the guard through this worktree's own core.hooksPath. Per-worktree git
 # config needs extensions.worktreeConfig, which is a shared-config setting whose
 # one documented hazard is core.bare / core.worktree living in the shared file.
+# core.hooksPath is the whole hook set, not one entry in it, so taking it over
+# would silently disable every hook this worktree already ran. The path it
+# displaces is therefore remembered, its pre-commit is chained to from the
+# guard, its other hooks are forwarded, and removal puts a displaced
+# worktree-scoped value back instead of unsetting it.
 fm_crew_install_commit_guard() {  # <worktree>
-  local wt=$1 dir agents_hash claude_hash tmp
+  local wt=$1 dir agents_hash claude_hash tmp previous prior_worktree
   dir=$(fm_crew_commit_guard_dir "$wt") || {
     echo "error: could not resolve the git dir of $wt to install the crew commit guard" >&2
     return 1
@@ -758,8 +897,39 @@ fm_crew_install_commit_guard() {  # <worktree>
     echo "error: could not create the crew commit guard directory $dir" >&2
     return 1
   }
+  # Recorded before the override lands, and only on the first install, so a
+  # reinstall keeps naming what the guard originally displaced rather than
+  # itself. `--worktree` is fatal until extensions.worktreeConfig is on, which
+  # is itself the answer: there is no worktree-scoped value to put back.
+  if [ ! -f "$dir/$FM_CREW_PREVIOUS_WORKTREE_HOOKS_RECORD" ]; then
+    prior_worktree=$(git -C "$wt" config --worktree --get core.hooksPath 2>/dev/null || true)
+    if [ -n "$prior_worktree" ] && [ "$prior_worktree" != "$dir" ]; then
+      printf '%s\n' "$prior_worktree" > "$dir/$FM_CREW_PREVIOUS_WORKTREE_HOOKS_RECORD" || {
+        echo "error: could not record $wt's existing worktree-scoped core.hooksPath before the crew commit guard replaces it" >&2
+        return 1
+      }
+    fi
+  fi
+  previous=$(fm_crew_previous_hooks_dir "$wt" "$dir") || {
+    echo "error: could not resolve the hooks path the crew commit guard would displace in $wt" >&2
+    return 1
+  }
+  if [ ! -f "$dir/$FM_CREW_PREVIOUS_HOOKS_RECORD" ]; then
+    printf '%s\n' "$previous" > "$dir/$FM_CREW_PREVIOUS_HOOKS_RECORD" || {
+      echo "error: could not record the hooks path the crew commit guard displaces in $wt" >&2
+      return 1
+    }
+  fi
+  fm_crew_clear_forwarded_hooks "$dir" || {
+    echo "error: could not clear stale forwarded hooks from $dir" >&2
+    return 1
+  }
+  fm_crew_forward_previous_hooks "$dir" "$previous" || {
+    echo "error: could not forward $wt's existing hooks from $previous through the crew commit guard" >&2
+    return 1
+  }
   tmp="$dir/pre-commit.new"
-  if ! fm_crew_write_commit_guard "$tmp" "$agents_hash" "$claude_hash" ||
+  if ! fm_crew_write_commit_guard "$tmp" "$agents_hash" "$claude_hash" "$previous" ||
     ! chmod +x "$tmp" || ! mv "$tmp" "$dir/pre-commit"; then
     rm -f "$tmp"
     echo "error: could not write the crew commit guard at $dir/pre-commit" >&2
@@ -783,14 +953,25 @@ fm_crew_install_commit_guard() {  # <worktree>
   }
 }
 
+# Put back exactly what the install displaced. Unsetting the worktree-scoped
+# value uncovers the shared or global one, which is right only when the install
+# found no worktree-scoped value; a recorded one is restored instead, or the
+# worktree loses a hooks path it had before the overlay ever arrived.
 fm_crew_remove_commit_guard() {  # <worktree>
-  local wt=$1 dir
+  local wt=$1 dir prior=''
   dir=$(fm_crew_commit_guard_dir "$wt") || return 0
-  if [ "$(git -C "$wt" config --get core.hooksPath 2>/dev/null || true)" = "$dir" ]; then
-    git -C "$wt" config --worktree --unset core.hooksPath 2>/dev/null || true
+  [ -n "$dir" ] || return 0
+  if [ -f "$dir/$FM_CREW_PREVIOUS_WORKTREE_HOOKS_RECORD" ]; then
+    IFS= read -r prior < "$dir/$FM_CREW_PREVIOUS_WORKTREE_HOOKS_RECORD" || prior=''
   fi
-  rm -f "$dir/pre-commit" "$dir/pre-commit.new"
-  rmdir "$dir" 2>/dev/null || true
+  if [ "$(git -C "$wt" config --get core.hooksPath 2>/dev/null || true)" = "$dir" ]; then
+    if [ -n "$prior" ]; then
+      git -C "$wt" config --worktree core.hooksPath "$prior" 2>/dev/null || true
+    else
+      git -C "$wt" config --worktree --unset core.hooksPath 2>/dev/null || true
+    fi
+  fi
+  rm -rf "$dir"
   if [ "$(git -C "$wt" config --get core.hooksPath 2>/dev/null || true)" = "$dir" ]; then
     echo "error: could not clear the crew commit guard hooks path in $wt" >&2
     return 1
@@ -918,6 +1099,7 @@ fm_install_crew_worktree_instructions() {  # <worktree> [task-id]
     return 1
   }
   fm_root_is_secondmate_home "$wt" && return 0
+  fm_crew_refuse_deleted_instructions "$wt" || return 1
   fm_checkout_is_firstmate_shaped "$wt" || return 0
   if ! fm_checkout_is_linked_worktree "$wt"; then
     echo "error: refusing to overlay crew instructions onto a primary checkout ($wt)" >&2

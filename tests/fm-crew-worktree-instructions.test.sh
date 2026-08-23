@@ -22,8 +22,11 @@
 # with the overlay still installed, a worktree left behind by the superseded
 # skip-worktree mechanism is healed without losing either its sidelined edit or a
 # live one on the same path, the worker-facing status reports an overlay only
-# when one is really installed, and the brief-mandated bin/fm-ensure-agents-md.sh
-# stays a no-op success in an overlaid worktree.
+# when one is really installed, the hooks the worktree already had keep running
+# and their path is restored when the guard goes, a tracked instruction file the
+# worker deleted refuses the install rather than being passed over, and the
+# brief-mandated bin/fm-ensure-agents-md.sh stays a no-op success in an overlaid
+# worktree.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -1154,6 +1157,98 @@ test_fleet_command_fence_carves_out_the_test_suite() {
   pass "the overlay's fleet-command fence carves out this repository's own test suite"
 }
 
+# core.hooksPath names the whole hook set for a worktree, so pointing it at the
+# guard's own directory used to be the end of every hook the project had
+# configured: an ordinary crew commit skipped the project's formatting and
+# validation hooks, and a hook that should have refused the commit let it
+# through. The guard has to chain rather than replace.
+test_the_guard_keeps_the_projects_own_hooks_running() {
+  local repo wt hooks out status
+  repo="$TMP_ROOT/hookchain-repo"
+  wt="$TMP_ROOT/hookchain-wt"
+  make_firstmate_repo "$repo"
+  hooks="$repo/.githooks"
+  mkdir -p "$hooks"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo project-pre-commit-ran >&2' \
+    '[ -f REJECT ] && { echo project-pre-commit-refuses >&2; exit 1; }' 'exit 0' > "$hooks/pre-commit"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo project-commit-msg-ran >&2' 'exit 0' > "$hooks/commit-msg"
+  chmod +x "$hooks/pre-commit" "$hooks/commit-msg"
+  git -C "$repo" config core.hooksPath "$hooks"
+  make_linked_worktree "$repo" "$wt"
+  fm_install_crew_worktree_instructions "$wt" 'hookchain-task-h1' || fail "overlay install failed"
+  printf '%s\n' 'ordinary crew work' > "$wt/NOTES.md"
+  out=$(commit_all "$wt" 'ordinary crew commit'); status=$?
+  expect_code 0 "$status" "an ordinary crew commit must still succeed with project hooks configured: $out"
+  assert_contains "$out" 'project-pre-commit-ran' \
+    "the crew guard replaced the project's pre-commit hook instead of chaining to it"
+  assert_contains "$out" 'project-commit-msg-ran' \
+    "the crew guard's hooks path silenced the project's commit-msg hook"
+  assert_not_contains "$(git -C "$wt" show --name-only --format= HEAD)" 'AGENTS.md' \
+    "chaining to the project's hooks let the overlay into the commit"
+  printf '%s\n' 'reject marker' > "$wt/REJECT"
+  printf '%s\n' 'more crew work' > "$wt/NOTES2.md"
+  out=$(commit_all "$wt" 'commit the project hook must refuse'); status=$?
+  [ "$status" -ne 0 ] || fail "the project's pre-commit refusal was swallowed by the crew guard: $out"
+  assert_contains "$out" 'project-pre-commit-refuses' \
+    "the refusal the project's own hook raised never reached the worker"
+  pass "the crew commit guard chains to the hooks the worktree already had"
+}
+
+# Removal has to put back exactly what the install displaced. Unsetting the
+# worktree-scoped value uncovers the shared one, which silently loses a
+# worktree-scoped hooks path the worktree carried before the overlay arrived.
+test_removal_restores_a_displaced_worktree_hooks_path() {
+  local repo wt hooks
+  repo="$TMP_ROOT/hookrestore-repo"
+  wt="$TMP_ROOT/hookrestore-wt"
+  make_firstmate_repo "$repo"
+  hooks="$repo/.wthooks"
+  mkdir -p "$hooks"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$hooks/pre-commit"
+  chmod +x "$hooks/pre-commit"
+  make_linked_worktree "$repo" "$wt"
+  git -C "$wt" config extensions.worktreeConfig true
+  git -C "$wt" config --worktree core.hooksPath "$hooks"
+  fm_install_crew_worktree_instructions "$wt" 'hookrestore-task-h2' || fail "overlay install failed"
+  [ "$(git -C "$wt" config --get core.hooksPath)" != "$hooks" ] \
+    || fail "the crew commit guard never became the active hooks path"
+  fm_remove_crew_worktree_instructions "$wt" || fail "overlay removal failed"
+  [ "$(git -C "$wt" config --get core.hooksPath)" = "$hooks" ] \
+    || fail "removal dropped the worktree's own hooks path instead of restoring it (now '$(git -C "$wt" config --get core.hooksPath)')"
+  pass "removal restores the worktree-scoped hooks path the guard displaced"
+}
+
+# A tracked instruction file the worker deleted is uncommitted work with no
+# content to save. Passing it over left the launch with no crew instructions at
+# all when the deleted file was AGENTS.md, because the on-disk shape test then
+# reads a firstmate worktree as some other project and returns success.
+test_a_deleted_instruction_file_refuses_the_install() {
+  local repo wt out status
+  repo="$TMP_ROOT/deleted-repo"
+  wt="$TMP_ROOT/deleted-wt"
+  overlaid_worktree "$repo" "$wt" 'deleted-task-d1'
+  rm "$wt/CLAUDE.md" || fail "could not delete CLAUDE.md for the deletion case"
+  out=$(fm_install_crew_worktree_instructions "$wt" 'deleted-task-d1' 2>&1); status=$?
+  expect_code 1 "$status" "a relaunch over a deleted CLAUDE.md must refuse, not report success: $out"
+  assert_contains "$out" 'CLAUDE.md' "the refusal did not name the deleted file"
+  assert_contains "$out" 'git checkout HEAD -- CLAUDE.md' \
+    "the refusal did not name a remedy the worker can run"
+  assert_absent "$wt/CLAUDE.md" "the refused install recreated the file over the worker's deletion"
+  git -C "$wt" checkout HEAD -- AGENTS.md || fail "could not restore AGENTS.md between deletion cases"
+  git -C "$wt" rm -q CLAUDE.md || fail "could not stage the CLAUDE.md deletion"
+  git -C "$wt" commit -qm 'drop CLAUDE.md' || fail "could not commit the CLAUDE.md deletion"
+  fm_install_crew_worktree_instructions "$wt" 'deleted-task-d1' \
+    || fail "the install must proceed once the deletion is committed"
+  assert_corpus_is_crew "$wt" "after the deletion was committed"
+  rm "$wt/AGENTS.md" || fail "could not delete AGENTS.md for the deletion case"
+  out=$(fm_install_crew_worktree_instructions "$wt" 'deleted-task-d1' 2>&1); status=$?
+  expect_code 1 "$status" \
+    "a relaunch over a deleted AGENTS.md silently installed no crew instructions: $out"
+  assert_contains "$out" 'AGENTS.md' "the refusal did not name the deleted file"
+  assert_absent "$wt/AGENTS.md" "the refused install recreated AGENTS.md over the worker's deletion"
+  pass "a deleted tracked instruction file refuses the install instead of being passed over"
+}
+
 test_overlay_inverts_autoload_corpus
 test_overlay_is_idempotent
 test_dirty_agents_md_is_saved_then_overlaid
@@ -1188,6 +1283,9 @@ test_commit_guard_allows_an_untouched_overlay
 test_restored_agents_md_commits_the_edit
 test_ensure_agents_md_stays_a_no_op_after_overlay
 test_commit_keeps_the_overlay_out_of_the_commit
+test_the_guard_keeps_the_projects_own_hooks_running
+test_removal_restores_a_displaced_worktree_hooks_path
+test_a_deleted_instruction_file_refuses_the_install
 test_a_worktree_left_by_the_superseded_mechanism_is_healed
 test_a_live_edit_and_a_legacy_sidecar_both_survive_healing
 test_a_rescued_legacy_sidecar_stays_recoverable_after_the_slot_is_reused

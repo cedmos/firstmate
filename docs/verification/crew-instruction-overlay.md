@@ -8,6 +8,7 @@ This record supports the active guarantee that the crew instruction overlay stay
 The overlay replaces `AGENTS.md` and `CLAUDE.md` in a linked firstmate-repo task worktree.
 Because those paths are tracked, the overlay is a divergence between the worktree and the index, and the only open question is whether git is told about it.
 The checks below are why it is told, and where the edits the overlay would otherwise overwrite are kept: concealing the divergence wedges the worker with no working escape, and git's shared stash stack cannot say which task an entry belongs to.
+The last check covers the pre-commit guard the install adds alongside the overlay, because selecting that guard takes over a setting that names every hook this worktree runs.
 
 ## Concealing the overlay wedges every branch move, and both concealment bits do it
 
@@ -331,6 +332,77 @@ its AGENTS.md is the merge base: yes
 A conflicted path has stages 1, 2 and 3 and no stage 0, so "the blob the index holds" has no answer for it.
 Reading every stage and word-splitting the result is quietly accepted end to end: `update-index --cacheinfo` took all three, recording the MERGE BASE as `AGENTS.md` and inventing two paths literally named after the stage-2 and stage-3 hashes, with no command failing.
 The index read therefore selects stage 0 only, and a path git reports through `ls-files -u` refuses the save outright, because there is no version to record and the `git checkout HEAD --` that follows a save would collapse the worker's conflict without saying so.
+
+## `core.hooksPath` is the whole hook set, and `--unset` does not undo an overwrite
+
+This check ran on 2026-08-23 with git 2.50.1 (Apple Git-155) in a disposable scratch repository.
+It exists because the commit guard is selected by pointing this worktree's `core.hooksPath` at a directory the library owns.
+That is a replacement, not an addition, and the second half of the check is why removal cannot simply unset what it set.
+
+The exact script run from this repository root was:
+
+```bash
+set -eu
+git --version
+PROBE="$PWD/tmp/.crew-hookspath-probe"
+rm -rf "$PROBE"; mkdir -p "$PROBE"; cd "$PROBE"
+git init -q -b main .
+git config user.email probe@example.invalid; git config user.name probe
+printf 'base\n' > f.txt; git add -A; git commit -qm base
+
+printf '%s\n' '#!/bin/sh' 'echo "  project pre-commit ran" >&2' 'exit 0' > .git/hooks/pre-commit
+printf '%s\n' '#!/bin/sh' 'echo "  project commit-msg ran" >&2' 'exit 0' > .git/hooks/commit-msg
+chmod +x .git/hooks/pre-commit .git/hooks/commit-msg
+mkdir -p guard
+printf '%s\n' '#!/bin/sh' 'echo "  crew guard pre-commit ran" >&2' 'exit 0' > guard/pre-commit
+chmod +x guard/pre-commit
+active() { git -C "$1" config --get core.hooksPath | sed "s#^$PROBE/##"; }
+
+printf '\n### hooks that run with core.hooksPath unset\n'
+printf 'x\n' > a.txt; git add -A; git commit -qm a >/dev/null
+
+printf '\n### hooks that run once core.hooksPath names a directory holding only pre-commit\n'
+git config core.hooksPath "$PROBE/guard"
+printf 'x\n' > b.txt; git add -A; git commit -qm b >/dev/null
+
+printf '\n### what --unset restores at worktree scope\n'
+git config core.hooksPath "$PROBE/sharedhooks"
+git worktree add -q --detach wt
+git -C wt config extensions.worktreeConfig true
+git -C wt config --worktree core.hooksPath "$PROBE/wthooks"
+printf 'worktree had:    %s\n' "$(active wt)"
+git -C wt config --worktree core.hooksPath "$PROBE/guard"
+printf 'guard took over: %s\n' "$(active wt)"
+git -C wt config --worktree --unset core.hooksPath
+printf 'after --unset:   %s\n' "$(active wt)"
+cd ..; rm -rf "$PROBE"
+```
+
+Its exact output was:
+
+```
+git version 2.50.1 (Apple Git-155)
+
+### hooks that run with core.hooksPath unset
+  project pre-commit ran
+  project commit-msg ran
+
+### hooks that run once core.hooksPath names a directory holding only pre-commit
+  crew guard pre-commit ran
+
+### what --unset restores at worktree scope
+worktree had:    wthooks
+guard took over: guard
+after --unset:   sharedhooks
+```
+
+Setting `core.hooksPath` did not add the guard to the hooks the repository already ran; it replaced them.
+The default directory's `pre-commit` and `commit-msg` both stopped running the moment the guard's directory became the path, and nothing reported that they had.
+So the install remembers the directory it displaced, chains the guard to that directory's `pre-commit` once the overlay is unstaged, and forwards the other hooks it holds.
+
+The second half is why removal restores rather than unsets.
+`--unset` at worktree scope does not put back the worktree-scoped value that was overwritten; it uncovers the shared one, which here is a third, unrelated directory.
+The install therefore records any worktree-scoped value it found and writes that value back, and only unsets when it found none.
 
 ## Refreshing these facts
 
