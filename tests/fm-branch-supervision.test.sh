@@ -287,6 +287,31 @@ SH
   FM_HOME="$home" "$ROOT/bin/fm-lease.sh" check protected-main >/dev/null \
     || fail "refused cross-actor release-actor removed the main lease"
 
+  # Actor text is not authority by itself. A branch command that changes its
+  # environment to say "main" is still not descended from main's holder shell.
+  rm -f "$home/process-ready" "$home/process-release"
+  (FM_HOME="$home" FM_LEASE_HOLDER_PID="$BASHPID" "$ROOT/bin/fm-lease.sh" \
+      claim protected-process --actor main || exit
+    : > "$home/process-ready"
+    while [ ! -e "$home/process-release" ]; do sleep 0.01; done
+  ) &
+  process_holder=$!
+  for _ in $(seq 1 100); do
+    [ -e "$home/process-ready" ] && break
+    sleep 0.01
+  done
+  [ -e "$home/process-ready" ] || fail "separate main holder did not claim its lease"
+  out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=main "$ROOT/bin/fm-lease.sh" \
+    release protected-process --actor main 2>&1)
+  [ $? -eq 6 ] || fail "spoofed main actor released a sibling process lease: $out"
+  assert_contains "$out" "does not own the process" "process-bound release refusal was unclear"
+  FM_HOME="$home" FM_SUPERVISION_ACTOR=main "$ROOT/bin/fm-lease.sh" \
+    release-actor --actor main || fail "process-bound bulk release failed"
+  FM_HOME="$home" "$ROOT/bin/fm-lease.sh" check protected-process >/dev/null \
+    || fail "spoofed main actor bulk-released a sibling process lease"
+  : > "$home/process-release"
+  wait "$process_holder" || fail "separate main holder failed"
+
   # A lease held by a dead process is stale: claimable by the other actor and
   # removed by the sweep, while a live lease survives the sweep.
   printf 'branch\t999999\t123\n' > "$home/state/.lease-task-dead"

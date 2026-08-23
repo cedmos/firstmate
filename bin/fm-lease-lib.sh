@@ -27,8 +27,9 @@
 #     means the process died; the lease is cleared at the next claim, guard,
 #     or sweep. A lease held by a live pid but an abandoned conversation is
 #     cleared by the session-start sweep only when the pid proves dead;
-#     otherwise only the owning actor may release it; cross-actor release is
-#     refused so the coordination fence cannot be bypassed.
+#     otherwise only the owning actor process may release it; release checks
+#     both the actor and that the recorded holder pid is an ancestor of the
+#     command, so changing an environment actor cannot bypass the fence.
 #   - Guard semantics (fm_lease_guard): a live lease held by the OTHER actor
 #     refuses with exit FM_LEASE_REFUSE_EXIT. Otherwise an active Pi actor
 #     claims the task through fm-lease.sh and retains it until its entrypoint

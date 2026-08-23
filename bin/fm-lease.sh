@@ -16,14 +16,15 @@
 #   fm-lease.sh release <task> [--actor main|branch]
 #       Drop the calling actor's lease. Releasing a lease the actor does not
 #       hold is a silent no-op, so a retry after a partial failure is safe.
-#       The requested actor must match $FM_SUPERVISION_ACTOR (else main), so
-#       one actor can never clear the other actor's live coordination fence.
+#       The requested actor must match $FM_SUPERVISION_ACTOR (else main), and
+#       the recorded holder pid must be an ancestor of this command, so actor
+#       environment spoofing cannot clear a sibling actor's live fence.
 #   fm-lease.sh check <task>
 #       Print "<actor> <pid> <epoch> <live|stale>" for a held lease, or
 #       nothing (exit 1) when the task is unleased.
 #   fm-lease.sh release-actor --actor main|branch
 #       Drop every lease held by the calling actor during generation cleanup;
-#       the requested actor must match $FM_SUPERVISION_ACTOR (else main).
+#       actor and holder-ancestry authorization are the same as release.
 #   fm-lease.sh sweep
 #       Remove every provably stale lease in this home. Run at session start
 #       (a lease held by a dead actor is cleared at session start); safe to
@@ -150,6 +151,10 @@ case "$CMD" in
       exit "$FM_LEASE_REFUSE_EXIT"
     fi
     if fm_lease_read "$TASK"; then
+      if [ "$FM_LEASE_ACTOR" = "$ACTOR" ] && ! fm_lease_pid_is_ancestor "$FM_LEASE_PID"; then
+        echo "error: release refused - the $ACTOR actor does not own the process that holds the lease on '$TASK'" >&2
+        exit "$FM_LEASE_REFUSE_EXIT"
+      fi
       if [ "$FM_LEASE_ACTOR" = "$ACTOR" ] || [ -z "$FM_LEASE_ACTOR" ]; then
         rm -f -- "$(fm_lease_path "$TASK")"
       fi
@@ -170,7 +175,8 @@ case "$CMD" in
       [ -e "$LEASE" ] || continue
       TASK=${LEASE##*/.lease-}
       fm_lease_valid_id "$TASK" || continue
-      if fm_lease_read "$TASK" && [ "$FM_LEASE_ACTOR" = "$ACTOR" ]; then
+      if fm_lease_read "$TASK" && [ "$FM_LEASE_ACTOR" = "$ACTOR" ] \
+        && fm_lease_pid_is_ancestor "$FM_LEASE_PID"; then
         rm -f -- "$LEASE"
       fi
     done
