@@ -4,10 +4,11 @@
 # A brief truncated to zero bytes used to satisfy the existence check and launch
 # an agent that had nothing to read: the worker sat at an idle prompt while the
 # task recorded as spawned, so the fleet view showed dispatched work that was
-# never started. These tests drive the real spawn path and prove all three
-# outcomes through its exit status and messages: an empty brief is refused, a
-# missing brief is still refused under its OWN distinct message, and an ordinary
-# brief still launches a worker.
+# never started. These tests drive the real spawn path and prove every outcome
+# through its exit status and messages: an empty brief is refused, a missing
+# brief is still refused under its OWN distinct message, an empty secondmate
+# charter (the other file this one gate covers) is refused under a remediation
+# that fits it, and an ordinary brief still launches a worker.
 #
 # The two refusal cases are reached before any tmux/treehouse side effect, so
 # they create no windows or worktrees. The launch case needs the full fixture
@@ -83,8 +84,7 @@ make_launchable_case() {
   printf 'base\n' > "$project/README.md"
   git -C "$project" add README.md
   git -C "$project" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
-  git clone --quiet --bare "$project" "$origin"
-  git -C "$project" remote add origin "file://$origin"
+  fm_git_add_origin "$project" "$origin"
   head=$(git -C "$project" rev-parse HEAD)
   git -C "$project" worktree add --quiet --detach "$pool" "$head"
 
@@ -161,6 +161,41 @@ EOF
   pass "empty and missing briefs refuse under separate, non-interchangeable messages"
 }
 
+# A --secondmate spawn feeds the home's charter to the agent instead of a task
+# brief, so this one gate covers two files with two different writers. An empty
+# charter must refuse on the same terms, and the refusal must not point the
+# operator at a tool that never wrote the file in front of them.
+test_empty_charter_refuses_the_secondmate_spawn() {
+  local rec home project fakebin sm_home sm_home_abs id out status
+  id='empty-charter-refused-e5'
+  rec=$(make_home empty-charter)
+  IFS='|' read -r home project fakebin <<EOF
+$rec
+EOF
+  sm_home="$TMP_ROOT/empty-charter/secondmate-home"
+  mkdir -p "$sm_home/bin" "$sm_home/data" "$sm_home/state" "$sm_home/config" "$sm_home/projects"
+  printf '%s\n' "$id" > "$sm_home/.fm-secondmate-home"
+  printf 'firstmate\n' > "$sm_home/AGENTS.md"
+  : > "$sm_home/data/charter.md"
+  [ ! -s "$sm_home/data/charter.md" ] || fail "fixture did not produce a zero-byte charter"
+  # The spawn resolves the secondmate home before it names the file, so the
+  # expected path is the resolved one.
+  sm_home_abs=$(cd "$sm_home" && pwd -P)
+
+  out=$(TMUX="fake,1,0" FM_FAKE_PANE_PATH="$project" PATH="$fakebin:$PATH" \
+    FM_SKIP_SECONDMATE_INHERIT=1 \
+    run_spawn "$home" "$sm_home" "$id" --secondmate)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn launched a secondmate against a zero-byte charter"
+  assert_contains "$out" "the brief at $sm_home_abs/data/charter.md is empty" \
+    "refusal did not name the empty charter"
+  assert_not_contains "$out" 'fm-brief.sh' \
+    "the charter refusal named a tool that never writes the charter"
+  assert_not_contains "$out" 'spawned ' "spawn reported a launch despite an empty charter"
+  assert_absent "$home/state/$id.meta" "an empty-charter spawn still recorded a task endpoint"
+  pass "a zero-byte secondmate charter refuses the spawn without misnaming its repair"
+}
+
 # The gate must not cost a legitimate dispatch: an ordinary brief still reaches a
 # real launch. Asserted through `spawned <id>` and the recorded task endpoint,
 # not by re-checking the guard's own condition.
@@ -188,4 +223,5 @@ EOF
 
 test_empty_brief_refuses_the_spawn
 test_missing_brief_keeps_its_own_message
+test_empty_charter_refuses_the_secondmate_spawn
 test_normal_brief_still_launches

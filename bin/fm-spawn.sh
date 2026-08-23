@@ -1650,9 +1650,12 @@ fi
 # before reading it, an interrupted scaffold) still satisfies -f, and every
 # launch template pipes the brief into the agent as its whole instruction set:
 # the worker comes up at an idle prompt with nothing to do while the task
-# records as spawned. Refuse the launch instead.
+# records as spawned. Refuse the launch instead. The remediation names no tool:
+# this one gate covers a ship/scout task brief and a secondmate's charter, which
+# have different writers, and an error that names the wrong one costs the
+# operator more time than one that names none.
 [ -f "$BRIEF" ] || { echo "error: no brief at $BRIEF" >&2; exit 1; }
-[ -s "$BRIEF" ] || { echo "error: the brief at $BRIEF is empty; a worker launched on it would have no instructions to read - re-scaffold it with bin/fm-brief.sh and fill in the task before spawning" >&2; exit 1; }
+[ -s "$BRIEF" ] || { echo "error: the brief at $BRIEF is empty; a worker launched on it would have no instructions to read - restore its contents before spawning" >&2; exit 1; }
 
 delivery_rigor_rank() {  # <mode> -> 3 (most rigor) .. 1 (least); 0 = not a task mode
   case "$1" in
