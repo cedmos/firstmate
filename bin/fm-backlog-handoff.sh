@@ -600,6 +600,18 @@ remote_handoff() { # <secondmate-id> <keys...>
       return 1
     done < <(backlog_key_noncanonical_body_lines "$MAIN_BACKLOG" "$key")
   done
+  # Do not append a fresh handoff to an older recovery batch. In particular, a
+  # confirmed wake can survive when outbox cleanup fails; if new work were
+  # staged into that outbox, the old confirmation would suppress the wake for
+  # the new work. Finish receipt, wake reconciliation, and cleanup for the old
+  # batch first. A failure leaves the fresh items dispatchable in main.
+  if [ "${#to_move[@]}" -gt 0 ] && [ -f "$outbox" ] \
+    && [ "$(outbox_item_count "$outbox")" -gt 0 ]; then
+    remote_deliver_outbox "$id" "$outbox" || {
+      echo "error: previous remote handoff for secondmate $id could not be completed; nothing new was staged" >&2
+      return 1
+    }
+  fi
   seed_backlog_scaffold "$outbox"
   if [ "${#to_move[@]}" -gt 0 ]; then
     if ! mv_out=$(tasks-axi mv "${to_move[@]}" --file "$MAIN_BACKLOG" --to "$outbox" 2>&1); then

@@ -386,13 +386,20 @@ esac
 wakes_after=$(grep -cF fm-remote-secondmate-control.sh "$WAKE_LOG")
 [ "$wakes_after" -eq $((wakes_before + 1)) ] \
   || fail "remote cleanup failure did not perform exactly one receiver wake"
-handoff_env "$ROOT/bin/fm-backlog-handoff.sh" --resume-pending >/dev/null \
-  || fail "remote cleanup retry did not converge"
-[ "$(grep -cF fm-remote-secondmate-control.sh "$WAKE_LOG")" -eq "$wakes_after" ] \
-  || fail "remote cleanup retry duplicated a confirmed receiver wake"
+write_backlog '- [ ] after-cleanup - fresh work after confirmed cleanup failure (repo: alpha)'
+handoff_env "$ROOT/bin/fm-backlog-handoff.sh" ios after-cleanup >/dev/null \
+  || fail "fresh handoff did not converge an older confirmed cleanup failure"
+[ "$(grep -cF fm-remote-secondmate-control.sh "$WAKE_LOG")" -eq $((wakes_after + 1)) ] \
+  || fail "fresh handoff reused the older confirmed wake instead of waking its receiver"
+[ "$(grep -cF cleanup-retry "$REMOTE/data/backlog.md")" -eq 1 ] \
+  || fail "cleanup recovery lost or duplicated the older delivered item"
+[ "$(grep -cF after-cleanup "$REMOTE/data/backlog.md")" -eq 1 ] \
+  || fail "fresh handoff after cleanup recovery was lost or duplicated"
+assert_absent "$PARENT/data/handoff/ios.outbox.md" \
+  "fresh handoff left the recovered outbox pending"
 assert_absent "$PARENT/state/.backlog-handoff-ios.wake-pending" \
-  "remote cleanup retry left confirmed wake state behind"
-pass "remote cleanup recovery does not duplicate a confirmed receiver wake"
+  "fresh handoff left confirmed wake state behind"
+pass "fresh remote work gets a new wake after confirmed cleanup recovery"
 
 write_backlog '- [ ] route-race - remains dispatchable through retirement (repo: alpha)'
 registry_lock="$PARENT/state/.secondmate-registry.lock"
