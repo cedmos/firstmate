@@ -258,6 +258,79 @@ worktree entry restores:   VERSION W
 A per-path blob capture has no such second side: `git checkout HEAD --` then reset the index to the committed content, and the staged version was reachable from nothing.
 That is the same "an edit disappears with no error" failure this whole mechanism exists to remove, so the index blob is captured explicitly, as its own entry, whenever it differs from both the committed blob and the file on disk.
 
+## An unmerged path has no staged version to save
+
+This check ran on 2026-08-23 with git 2.50.1 (Apple Git-155) in a disposable scratch repository.
+It exists because the save reads the index with `git ls-files -s`, and that command answers a different shape during an unresolved merge or rebase.
+The route is the one this whole mechanism exists to unblock: remove the overlay, rebase onto `origin/main` after an `AGENTS.md` change, hit a genuine conflict.
+
+The exact script run from this repository root was:
+
+```bash
+set -eu
+git --version
+PROBE="$PWD/tmp/.crew-unmerged-probe"
+rm -rf "$PROBE"; mkdir -p "$PROBE"; cd "$PROBE"
+git init -q -b main .
+git config user.email probe@example.invalid; git config user.name probe
+printf 'base\n' > AGENTS.md; git add -A; git commit -qm base
+git checkout -q -b other; printf 'theirs\n' > AGENTS.md; git commit -qam theirs
+git checkout -q main; printf 'ours\n' > AGENTS.md; git commit -qam ours
+git merge other >/dev/null 2>&1 || true
+
+printf '\n### an unmerged path has three index entries and no merged one\n'
+git ls-files -s -- AGENTS.md | sed 's/^/  /'
+printf 'unfiltered `awk {print $2}` yields: %s value(s)\n' \
+  "$(git ls-files -s -- AGENTS.md | awk '{print $2}' | grep -c .)"
+printf 'stage-0 only yields:               [%s]\n' \
+  "$(git ls-files -s -- AGENTS.md | awk '$3 == "0" {print $2}')"
+printf 'ls-files -u reports it unmerged:    %s line(s)\n' \
+  "$(git ls-files -u -- AGENTS.md | grep -c .)"
+
+printf '\n### what the unfiltered value does when word-split into cacheinfo pairs\n'
+idx="$PROBE/.probe-index"; rm -f "$idx"
+GIT_INDEX_FILE=$idx git read-tree HEAD
+pairs="AGENTS.md=$(git ls-files -s -- AGENTS.md | awk '{print $2}')"
+for pair in $pairs; do
+  rel=${pair%%=*}; blob=${pair#*=}
+  GIT_INDEX_FILE=$idx git update-index --add --cacheinfo "100644,$blob,$rel" \
+    && printf 'accepted path %s\n' "$rel"
+done
+tree=$(GIT_INDEX_FILE=$idx git write-tree); rm -f "$idx"
+printf 'resulting tree records:\n'; git ls-tree --name-only "$tree" | sed 's/^/  /'
+printf 'its AGENTS.md is the merge base: %s\n' \
+  "$([ "$(git rev-parse "$tree:AGENTS.md")" = "$(git rev-parse "$(git merge-base main other):AGENTS.md")" ] && echo yes || echo no)"
+cd ..; rm -rf "$PROBE"
+```
+
+Its exact output was:
+
+```
+git version 2.50.1 (Apple Git-155)
+
+### an unmerged path has three index entries and no merged one
+  100644 df967b96a579e45a18b8251732d16804b2e56a55 1	AGENTS.md
+  100644 b19a1e93bec1317dc6097229e12afaffbfa74dc2 2	AGENTS.md
+  100644 950b81b7eee953d050aa05a641f8e056c85dd1bd 3	AGENTS.md
+unfiltered `awk {print $2}` yields: 3 value(s)
+stage-0 only yields:               []
+ls-files -u reports it unmerged:    3 line(s)
+
+### what the unfiltered value does when word-split into cacheinfo pairs
+accepted path AGENTS.md
+accepted path b19a1e93bec1317dc6097229e12afaffbfa74dc2
+accepted path 950b81b7eee953d050aa05a641f8e056c85dd1bd
+resulting tree records:
+  950b81b7eee953d050aa05a641f8e056c85dd1bd
+  AGENTS.md
+  b19a1e93bec1317dc6097229e12afaffbfa74dc2
+its AGENTS.md is the merge base: yes
+```
+
+A conflicted path has stages 1, 2 and 3 and no stage 0, so "the blob the index holds" has no answer for it.
+Reading every stage and word-splitting the result is quietly accepted end to end: `update-index --cacheinfo` took all three, recording the MERGE BASE as `AGENTS.md` and inventing two paths literally named after the stage-2 and stage-3 hashes, with no command failing.
+The index read therefore selects stage 0 only, and a path git reports through `ls-files -u` refuses the save outright, because there is no version to record and the `git checkout HEAD --` that follows a save would collapse the worker's conflict without saying so.
+
 ## Refreshing these facts
 
 [`tests/fm-crew-worktree-instructions.test.sh`](../../tests/fm-crew-worktree-instructions.test.sh) enforces the resulting behavior on every CI run through the real library and real git.

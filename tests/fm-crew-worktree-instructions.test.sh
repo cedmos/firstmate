@@ -94,7 +94,13 @@ wip_ref_count() {  # <worktree> <owner>
 }
 
 saved_agents_md() {  # <worktree> <owner> <n>
-  git -C "$1" show "refs/fm-crew/$2/instruction-wip/$3:AGENTS.md" 2>&1
+  git -C "$1" show "$(wip_ref "$1" "$2" "$3"):AGENTS.md" 2>&1
+}
+
+# The <n>th entry's ref for <owner>, derived the way the library derives it
+# rather than spelled out, so a namespace change stays a single-place change.
+wip_ref() {  # <worktree> <owner> <n>
+  printf '%s/%s\n' "$(fm_crew_wip_ref_base "$1" "$2")" "$3"
 }
 
 # The restore command a report advertised for <rel>, taken from the report the
@@ -274,7 +280,7 @@ test_saved_edits_stay_with_the_task_that_saved_them() {
   out=$("$CREW_INSTRUCTIONS" recover "$wt" 2>&1); status=$?
   expect_code 1 "$status" "the next occupant must not be able to restore another task's edits: $out"
   assert_contains "$out" 'task-beta-b2' "the refusal did not name the task it looked for"
-  assert_contains "$out" 'refs/fm-crew/task-beta-b2/instruction-wip' \
+  assert_contains "$out" "$(fm_crew_wip_ref_base "$wt" 'task-beta-b2')" \
     "the refusal did not name the ref namespace it searched"
   assert_not_contains "$(cat "$wt/AGENTS.md")" 'EDIT OWNED BY TASK ALPHA' \
     "the refused recovery still applied the previous task's edits"
@@ -293,7 +299,7 @@ test_recover_restores_this_task_s_own_saved_edit() {
   fm_install_crew_worktree_instructions "$wt" 'recover-task-c3' 2>/dev/null || fail "relaunch overlay failed"
   out=$("$CREW_INSTRUCTIONS" saved "$wt" 2>&1); status=$?
   expect_code 0 "$status" "saved must list this task's own entries: $out"
-  assert_contains "$out" 'refs/fm-crew/recover-task-c3/instruction-wip/1' \
+  assert_contains "$out" "$(wip_ref "$wt" 'recover-task-c3' 1)" \
     "saved did not name the entry this task owns"
   advertised=$(advertised_restore "$out" AGENTS.md)
   [ -n "$advertised" ] || fail "saved advertised no restore command for AGENTS.md: $out"
@@ -338,8 +344,8 @@ test_a_staged_and_a_working_tree_version_both_survive_a_relaunch() {
     || fail "relaunch over a staged plus a working-tree version failed"
   expect_code 2 "$(wip_ref_count "$wt" 'staged-task-s9')" \
     "the staged version and the working-tree version did not both survive as entries"
-  staged_ref='refs/fm-crew/staged-task-s9/instruction-wip/1'
-  worktree_ref='refs/fm-crew/staged-task-s9/instruction-wip/2'
+  staged_ref=$(wip_ref "$wt" 'staged-task-s9' 1)
+  worktree_ref=$(wip_ref "$wt" 'staged-task-s9' 2)
   assert_contains "$(git -C "$wt" show "$staged_ref:AGENTS.md")" 'VERSION S the worker staged' \
     "the staged version was dropped"
   assert_not_contains "$(git -C "$wt" show "$staged_ref:AGENTS.md")" 'VERSION W the worker edited afterwards' \
@@ -398,6 +404,131 @@ test_a_task_id_git_refuses_as_a_ref_component_still_launches() {
   pass "a task id git refuses as a ref component still launches and still saves its edits"
 }
 
+# A conflicted index carries three stages for the path and no merged version, so
+# there is nothing single to record and no restore that would not collapse the
+# conflict. Taking every stage recorded the MERGE BASE as the worker's staged
+# edit and invented junk paths named after the other two hashes, then reported
+# success. This is reachable by the route the redesign exists to unblock: remove
+# the overlay, rebase onto origin/main after an AGENTS.md change, hit a conflict.
+test_a_conflicted_instruction_file_refuses_the_save() {
+  local repo wt out status
+  repo="$TMP_ROOT/conflict-repo"
+  wt="$TMP_ROOT/conflict-wt"
+  overlaid_worktree "$repo" "$wt" 'conflict-task-x1'
+  fm_remove_crew_worktree_instructions "$wt" || fail "overlay removal failed"
+  git -C "$wt" checkout -q -b conflict-side
+  printf '%s\n' "$IDENTITY_LINE" 'OURS DIVERGED HERE' > "$wt/AGENTS.md"
+  git -C "$wt" commit -qam 'ours'
+  printf '%s\n' "$IDENTITY_LINE" 'THEIRS DIVERGED HERE' > "$repo/AGENTS.md"
+  git -C "$repo" commit -qam 'theirs'
+  git -C "$repo" push -q origin main
+  git -C "$wt" fetch -q origin
+  git -C "$wt" merge origin/main -m merge >/dev/null 2>&1 \
+    && fail "the fixture did not produce a real merge conflict"
+  [ -n "$(git -C "$wt" ls-files -u -- AGENTS.md)" ] \
+    || fail "the fixture left no unmerged index stages, so this case proves nothing"
+  out=$(fm_crew_save_instruction_wip "$wt" 'conflict-task-x1' 2>&1); status=$?
+  expect_code 1 "$status" "a conflicted instruction file must refuse the save, not record a stage: $out"
+  assert_contains "$out" 'AGENTS.md' "the refusal did not name the conflicted path"
+  assert_contains "$out" 'unresolved merge conflicts' "the refusal did not say why it refused"
+  expect_code 0 "$(wip_ref_count "$wt" 'conflict-task-x1')" \
+    "the refused save still recorded an entry"
+  # The conflict must survive the refusal rather than being collapsed away.
+  [ -n "$(git -C "$wt" ls-files -u -- AGENTS.md)" ] \
+    || fail "the refused save collapsed the worker's conflict"
+  assert_contains "$(cat "$wt/AGENTS.md")" 'OURS DIVERGED HERE' \
+    "the refused save overwrote the conflicted working tree"
+  out=$(fm_install_crew_worktree_instructions "$wt" 'conflict-task-x1' 2>&1); status=$?
+  expect_code 1 "$status" "installing over a conflicted instruction file must refuse: $out"
+  pass "a conflicted instruction file refuses the save instead of recording a merge stage"
+}
+
+# The readable part of the namespace has to be folded to satisfy git's ref
+# grammar, and folding is lossy: `probe..v2.lock` and `probe.v2` both fold to
+# `probe.v2`, so a pooled slot used by one and later the other let the second
+# list and restore the first's entries. Both ids pass fm_task_id_creation_valid.
+test_two_task_ids_that_fold_alike_keep_separate_namespaces() {
+  local repo wt out status folded plain
+  repo="$TMP_ROOT/collide-repo"
+  wt="$TMP_ROOT/collide-wt"
+  folded='probe..v2.lock'
+  plain='probe.v2'
+  make_firstmate_repo "$repo"
+  make_linked_worktree "$repo" "$wt"
+  fm_task_id_creation_valid "$folded" \
+    || fail "the folded fixture id is not one firstmate itself accepts"
+  fm_task_id_creation_valid "$plain" \
+    || fail "the plain fixture id is not one firstmate itself accepts"
+  [ "$(fm_crew_wip_ref_base "$wt" "$folded")" != "$(fm_crew_wip_ref_base "$wt" "$plain")" ] \
+    || fail "two distinct task ids share one namespace: $(fm_crew_wip_ref_base "$wt" "$folded")"
+  printf '%s\n' 'EDIT OWNED BY THE FOLDED ID' >> "$wt/AGENTS.md"
+  fm_install_crew_worktree_instructions "$wt" "$folded" 2>/dev/null \
+    || fail "install under the folded id failed"
+  expect_code 1 "$(wip_ref_count "$wt" "$folded")" "the folded id saved no entry"
+  expect_code 0 "$(wip_ref_count "$wt" "$plain")" \
+    "the other id can see entries it never created"
+  # The pooled slot is reused by the id that folds onto the same readable slug.
+  fm_remove_crew_worktree_instructions "$wt" || fail "pooled removal failed"
+  fm_install_crew_worktree_instructions "$wt" "$plain" || fail "install under the plain id failed"
+  out=$("$CREW_INSTRUCTIONS" recover "$wt" 2>&1); status=$?
+  expect_code 1 "$status" "the second id must not recover the first id's edits: $out"
+  assert_not_contains "$(cat "$wt/AGENTS.md")" 'EDIT OWNED BY THE FOLDED ID' \
+    "the second id received the first id's instruction edits"
+  assert_contains "$(saved_agents_md "$wt" "$folded" 1)" 'EDIT OWNED BY THE FOLDED ID' \
+    "the first id's saved edit was destroyed by the second"
+  pass "two task ids that fold to one slug still keep separate saved-edit namespaces"
+}
+
+# `git add -A` stages the overlay like any other modification, and the
+# pre-commit guard only unstages at commit time, so the index can hold the
+# overlay blob while the worker edits the file on disk. Launch scaffolding is
+# not a version of the worker's work and must not be reported back as one.
+test_a_staged_overlay_is_not_reported_as_a_worker_edit() {
+  local repo wt out status
+  repo="$TMP_ROOT/staged-overlay-repo"
+  wt="$TMP_ROOT/staged-overlay-wt"
+  overlaid_worktree "$repo" "$wt" 'staged-overlay-task-o2'
+  git -C "$wt" add -A || fail "could not stage the overlay the way a crew would"
+  [ "$(git -C "$wt" ls-files -s -- AGENTS.md | awk '$3 == "0" {print $2}')" \
+    = "$(fm_crew_overlay_blob_hash "$wt" AGENTS.md)" ] \
+    || fail "the fixture did not leave the overlay blob staged, so this case proves nothing"
+  git -C "$wt" checkout HEAD -- AGENTS.md
+  git -C "$wt" reset -q HEAD -- AGENTS.md
+  git -C "$wt" update-index --cacheinfo \
+    "100644,$(fm_crew_overlay_blob_hash "$wt" AGENTS.md),AGENTS.md" \
+    || fail "could not restore the staged-overlay fixture state"
+  printf '%s\n' 'THE ONLY REAL WORKER EDIT' >> "$wt/AGENTS.md"
+  fm_install_crew_worktree_instructions "$wt" 'staged-overlay-task-o2' 2>/dev/null \
+    || fail "relaunch over a staged overlay failed"
+  expect_code 1 "$(wip_ref_count "$wt" 'staged-overlay-task-o2')" \
+    "the staged overlay was recorded as a second version of the worker's work"
+  assert_contains "$(saved_agents_md "$wt" 'staged-overlay-task-o2' 1)" 'THE ONLY REAL WORKER EDIT' \
+    "the worker's real edit was not the entry that was saved"
+  out=$("$CREW_INSTRUCTIONS" saved "$wt" 2>&1); status=$?
+  expect_code 0 "$status" "saved must list the worker's real entry: $out"
+  assert_not_contains "$out" 'staged instruction edits' \
+    "saved offered the launch overlay as one of the worker's staged edits"
+  pass "a staged overlay is not reported back as a version of the worker's own edits"
+}
+
+# The temporary index must never appear in the working tree: freshen refuses on
+# any porcelain output, so a leftover would permanently block the pooled slot.
+test_saving_leaves_no_untracked_artifact_in_the_worktree() {
+  local repo wt
+  repo="$TMP_ROOT/tmpindex-repo"
+  wt="$TMP_ROOT/tmpindex-wt"
+  overlaid_worktree "$repo" "$wt" 'tmpindex-task-t4'
+  git -C "$wt" checkout HEAD -- AGENTS.md
+  printf '%s\n' 'AN EDIT THAT FORCES A SAVE' >> "$wt/AGENTS.md"
+  fm_install_crew_worktree_instructions "$wt" 'tmpindex-task-t4' 2>/dev/null \
+    || fail "relaunch failed"
+  assert_not_contains "$(git -C "$wt" status --porcelain)" 'fm-crew-wip-index' \
+    "the save left its temporary index visible in the worktree"
+  [ -z "$(git -C "$wt" status --porcelain | fm_crew_filter_overlay_status "$wt")" ] \
+    || fail "the save left work a cleanliness check reads as unlanded: $(git -C "$wt" status --porcelain)"
+  pass "saving an instruction edit leaves no untracked artifact in the worktree"
+}
+
 # The readable slug cannot always be repaired into a legal component, so the
 # namespace falls back to one derived from the owner's content. It must stay
 # legal and stay the same base every time it is derived for that owner.
@@ -425,7 +556,7 @@ test_recover_refuses_loudly_when_this_task_saved_nothing() {
   overlaid_worktree "$repo" "$wt" 'empty-task-e4'
   out=$("$CREW_INSTRUCTIONS" recover "$wt" 2>&1); status=$?
   expect_code 1 "$status" "recovery with nothing saved must refuse rather than do nothing: $out"
-  assert_contains "$out" 'refs/fm-crew/empty-task-e4/instruction-wip' \
+  assert_contains "$out" "$(fm_crew_wip_ref_base "$wt" 'empty-task-e4')" \
     "the refusal did not name what it looked for"
   out=$("$CREW_INSTRUCTIONS" saved "$wt" 2>&1); status=$?
   expect_code 1 "$status" "listing with nothing saved must refuse rather than print an empty list: $out"
@@ -964,6 +1095,10 @@ test_recover_refuses_loudly_when_this_task_saved_nothing
 test_a_staged_and_a_working_tree_version_both_survive_a_relaunch
 test_a_task_id_git_refuses_as_a_ref_component_still_launches
 test_an_unrepairable_owner_still_yields_a_stable_legal_namespace
+test_two_task_ids_that_fold_alike_keep_separate_namespaces
+test_a_conflicted_instruction_file_refuses_the_save
+test_a_staged_overlay_is_not_reported_as_a_worker_edit
+test_saving_leaves_no_untracked_artifact_in_the_worktree
 test_branch_move_is_escapable_by_the_worker
 test_crew_instructions_status_tracks_a_real_overlay
 test_crew_instructions_cli_clears_a_branch_move

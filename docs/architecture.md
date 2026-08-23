@@ -212,11 +212,14 @@ The same concealment also hides a worker's genuine uncommitted instruction edit 
 Telling git the truth costs one visible modification and buys back every standard remedy, so git's own advice terminates, and `bin/fm-crew-instructions.sh` gives the worker a one-command removal as well.
 Consumers that must not read the overlay as unlanded work filter it through the library, which drops the modification only while the file holds the overlay byte for byte, so a real edit stays visible as the uncommitted work it is.
 
-In-progress instruction edits found at launch or relaunch are saved as commits under `refs/fm-crew/<task-id>/instruction-wip/<n>`, one ref per save, rather than in a private sidecar or on git's shared stash stack.
+In-progress instruction edits found at launch or relaunch are saved as commits under `refs/fm-crew/<task-id>-<digest>/instruction-wip/<n>`, one ref per save, rather than in a private sidecar or on git's shared stash stack.
+The readable part of that component has to be folded to satisfy git's ref grammar, and folding is lossy, so a digest of the exact task id keeps the mapping injective and two task ids can never share one namespace.
 A private sidecar was overwritten by the next relaunch and lost with no error, and a stash entry carries no owner identity while `git stash pop` is position-based, so a pooled slot's next occupant could pop a previous task's instruction edits onto its own branch.
 A ref name carries the owning task, is addressed by name rather than by stack position, cannot be consumed by another task or by the primary checkout, and lives in the common git dir, so each save survives a second relaunch and outlives the disposable worktree.
 The owning task id is recorded in the worktree's own git dir, so `bin/fm-crew-instructions.sh saved` and `recover` offer only what this worktree's task saved and refuse loudly, naming the ref namespace they searched, when it saved nothing.
 A version the worker had staged and a version they had only on disk are two distinct versions of their own work, and the restore that follows a save rewrites the index as well as the file, so each becomes its own entry named in its subject rather than the staged one being dropped.
+The overlay itself is excluded from that staged capture, because `git add -A` stages launch scaffolding like any other modification and scaffolding is not a version of the worker's work.
+An instruction file whose index carries unmerged stages has no single version to record and no restore that would not collapse the conflict, so the save refuses it loudly instead of picking a stage.
 A task id firstmate accepts can still be illegal as a git ref component, so the namespace folds `..` and a trailing `.lock` out of the owner and falls back to a digest of it if git still refuses, rather than letting a name firstmate issued abort the launch.
 
 The install also adds a pre-commit guard, because `git add -A` stages the overlay like any other modification.
