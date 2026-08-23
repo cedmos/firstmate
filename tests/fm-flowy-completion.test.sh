@@ -718,7 +718,7 @@ test_a_hung_endpoint_cannot_stall_the_poll_loop() {
 # derives one from POLL, so a fractional poll must still leave the per-pass drain
 # enough room to POST rather than tearing it down before it reaches the endpoint.
 test_a_fractional_poll_still_drains_pending_records() {
-  local home rc pid receipt= i=0
+  local home rc pid receipt='' i=0
   home=$(make_home fractional-poll)
   status_line "$home" queued 'done: fractional poll result'
   rc=$(outbox "$home" --status "$home/state/queued.status" --no-drain)
