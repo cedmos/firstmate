@@ -292,6 +292,18 @@ const bashTool = session.options.customTools.find((tool) => tool.name === "bash"
 const hooked = bashTool.__options.spawnHook({ command: "true", cwd: "/x", env: { PATH: "/bin" } });
 if (hooked.env.FM_SUPERVISION_ACTOR !== "branch") throw new Error("branch bash does not inject the branch actor");
 if (!/^[0-9]+$/.test(String(hooked.env.FM_LEASE_HOLDER_PID))) throw new Error("branch bash does not pin the lease holder pid");
+const { spawnSync } = await import("node:child_process");
+for (const command of [
+  "FM_SUPERVISION_ACTOR=main bin/fm-pr-merge.sh task-x https://example.com/pr/1",
+  "unset FM_SUPERVISION_ACTOR; bin/fm-pr-merge.sh task-x https://example.com/pr/1",
+  "env FM_SUPERVISION_ACTOR=main bin/fm-pr-merge.sh task-x https://example.com/pr/1",
+]) {
+  const fenced = bashTool.__options.spawnHook({ command, cwd: realRoot, env: { ...process.env, PATH: process.env.PATH } });
+  const attempt = spawnSync("bash", ["-c", fenced.command], { cwd: realRoot, encoding: "utf8", env: fenced.env });
+  if (attempt.status === 0 || !/(readonly variable|actor override refused|supervision branch never performs)/.test(attempt.stderr)) {
+    throw new Error(`branch actor override escaped its authority fence (${attempt.status}): ${command}\n${attempt.stderr}`);
+  }
+}
 
 // 3. Shared per-home prompt_cache_key: overrides only payloads that already
 // carry one, stable within the home.
@@ -715,7 +727,7 @@ const bashRun = bashTool.execute("bash-call", { command: "long lifecycle action"
 await settle(() => typeof globalThis.__fmResolveBash === "function", "active branch bash tool");
 const claim = spawnSync("bash", [`${process.env.FM_ROOT_OVERRIDE}/bin/fm-lease.sh`, "claim", "shutdown-task", "--actor", "branch"], {
   encoding: "utf8",
-  env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: `${home}/state`, FM_LEASE_HOLDER_PID: String(process.pid), FM_LEASE_GENERATION: generation },
+  env: { ...process.env, FM_HOME: home, FM_STATE_OVERRIDE: `${home}/state`, FM_SUPERVISION_ACTOR: "branch", FM_LEASE_HOLDER_PID: String(process.pid), FM_LEASE_GENERATION: generation },
 });
 if (claim.status !== 0) throw new Error(`branch fixture lease claim failed: ${claim.stderr}`);
 const sessionCtx = {
@@ -848,7 +860,7 @@ test_secondary_session_cannot_mutate_primary_branch_state() {
   sleep 30 &
   owner=$!
   printf 'primary-marker\n' > "$home/state/.pi-branch-extension-loaded"
-  FM_HOME="$home" FM_LEASE_HOLDER_PID="$owner" "$ROOT/bin/fm-lease.sh" claim primary-task --actor branch \
+  FM_HOME="$home" FM_SUPERVISION_ACTOR=branch FM_LEASE_HOLDER_PID="$owner" "$ROOT/bin/fm-lease.sh" claim primary-task --actor branch \
     || fail "could not seed the primary branch lease"
   out=$(PLUGIN="$repo/.pi/extensions/fm-branch-supervision.ts" FM_HOME="$home" FM_ROOT_OVERRIDE="$ROOT" \
     FM_TEST_LOCK_PID="$owner" DRIVER_PRELUDE="$DRIVER_PRELUDE" node --input-type=module 2>&1 <<'EOF'

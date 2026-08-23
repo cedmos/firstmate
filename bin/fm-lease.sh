@@ -102,6 +102,11 @@ esac
 
 case "$CMD" in
   claim)
+    CALLER=$(fm_lease_actor) || exit "$FM_LEASE_REFUSE_EXIT"
+    if [ "$ACTOR" != "$CALLER" ]; then
+      echo "error: claim refused - the $CALLER supervision actor cannot claim a lease as $ACTOR on '$TASK'" >&2
+      exit "$FM_LEASE_REFUSE_EXIT"
+    fi
     LEASE=$(fm_lease_path "$TASK")
     if [ "$ACTOR" = branch ] && [ -n "${FM_LEASE_GENERATION:-}" ]; then
       ACTIVE_GENERATION=$(cat "$STATE/.pi-branch-generation" 2>/dev/null || true)

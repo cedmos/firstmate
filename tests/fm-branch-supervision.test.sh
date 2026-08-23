@@ -199,7 +199,7 @@ test_lease_exclusivity_release_stale_and_sweep() {
   mkdir -p "$home/state"
 
   # Claim, exclusivity, same-actor refresh.
-  FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim task-1 --actor branch \
+  FM_HOME="$home" FM_SUPERVISION_ACTOR=branch FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim task-1 --actor branch \
     || fail "branch claim failed"
   out=$(FM_HOME="$home" "$ROOT/bin/fm-lease.sh" check task-1) || fail "check missed a held lease"
   case "$out" in
@@ -218,7 +218,7 @@ test_lease_exclusivity_release_stale_and_sweep() {
     (FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim "$task" --actor main \
       >"$home/main-$round.out" 2>&1; echo $? >"$home/main-$round.status") &
     main_pid=$!
-    (FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim "$task" --actor branch \
+    (FM_HOME="$home" FM_SUPERVISION_ACTOR=branch FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim "$task" --actor branch \
       >"$home/branch-$round.out" 2>&1; echo $? >"$home/branch-$round.status") &
     branch_pid=$!
     wait "$main_pid" "$branch_pid"
@@ -325,7 +325,7 @@ SH
   [ -e "$home/state/.lease-task-dead" ] || fail "sweep removed a live lease"
 
   # The reserved backlog resource claims like any task.
-  FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim backlog --actor branch \
+  FM_HOME="$home" FM_SUPERVISION_ACTOR=branch FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim backlog --actor branch \
     || fail "backlog lease claim failed"
   out=$(FM_HOME="$home" FM_SUPERVISION_ACTOR=main FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim backlog 2>&1)
   [ $? -eq 6 ] || fail "backlog lease did not enforce exclusivity"
@@ -342,7 +342,7 @@ test_mutating_scripts_refuse_the_other_actors_lease() {
   git init -q -b main "$root"
   git -C "$root" commit -q --allow-empty -m init
   ln -s "$ROOT/bin" "$root/bin"
-  FM_HOME="$home" FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim task-held --actor branch \
+  FM_HOME="$home" FM_SUPERVISION_ACTOR=branch FM_LEASE_HOLDER_PID=$$ "$ROOT/bin/fm-lease.sh" claim task-held --actor branch \
     || fail "fixture lease claim failed"
 
   # fm-control: refused while the branch holds the lease; the ordinary no-task

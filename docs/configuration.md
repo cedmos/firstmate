@@ -37,6 +37,7 @@ This preference is local to each Firstmate home and is not part of secondmate in
 
 On a Pi primary, ordinary actionable fleet wakes that pass the unchanged watcher classifier are handled by a persistent in-process supervision branch that keeps the captain's conversation clean; [docs/pi-supervision-branch.md](pi-supervision-branch.md) owns the architecture.
 The gitignored `config/pi-supervision-branch` file under the effective home controls it: absent, empty, or `on` enables the branch, and `off` disables it so every wake reaches the captain-facing conversation exactly as before the branch existed.
+This is a Pi-primary routing preference under the captain-approved architecture, not a grant of additional autonomy: the branch cannot merge, land, or freshly spawn, and every existing captain gate remains unchanged.
 Any other value also disables the branch, failing toward today's behavior rather than guessing.
 The file is read fresh at every wake offer, so a toggle takes effect without restarting Pi.
 Homes on any other primary harness never read this file and are entirely unaffected.

@@ -102,7 +102,9 @@ function branchEnabled(): boolean {
   try {
     value = readFileSync(configFile, "utf8").trim();
   } catch {
-    return true; // absent = enabled for every Pi home
+    // The captain-approved Pi routing architecture adopts the branch for Pi
+    // primaries; this toggle controls routing, not any additional authority.
+    return true;
   }
   return value === "" || value === "on";
 }
@@ -525,12 +527,17 @@ export default function (pi: ExtensionAPI) {
     const bashTool = createBashToolDefinition(fmRoot, {
       spawnHook: (context) => ({
         ...context,
+        // Keep the actor fence immutable in the shell that executes the model's
+        // command. The lease scripts also bind it to the active generation, so
+        // an assignment prefix or unset cannot turn a branch command into MAIN.
+        command: `readonly FM_SUPERVISION_ACTOR FM_LEASE_HOLDER_PID FM_LEASE_GENERATION FM_PI_BRANCH_GENERATION\n${context.command}`,
         env: {
           ...context.env,
           ...scriptEnv,
           FM_SUPERVISION_ACTOR: "branch",
           FM_LEASE_HOLDER_PID: String(process.pid),
           FM_LEASE_GENERATION: generationToken,
+          FM_PI_BRANCH_GENERATION: generationToken,
         },
       }),
     });

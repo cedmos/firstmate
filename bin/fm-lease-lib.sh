@@ -17,10 +17,12 @@
 #     refresh). Lease commands in one home serialize through the portable
 #     state/.fm-lease-command.lock before inspecting or changing any lease.
 #   - Actors: exactly "main" and "branch". The current actor is
-#     $FM_SUPERVISION_ACTOR when set, else "main". The branch's shell gets
-#     FM_SUPERVISION_ACTOR=branch injected deterministically by the Pi branch
-#     extension's bash tool, not by agent memory. Any other value is refused
-#     loudly - an unknown actor is a wiring bug, not a third role.
+#     $FM_SUPERVISION_ACTOR when set, else "main". The branch's shell gets an
+#     immutable FM_SUPERVISION_ACTOR=branch plus its active generation injected
+#     deterministically by the Pi branch extension's bash-tool spawnHook, not
+#     by agent memory. The lease layer binds that generation to BRANCH and
+#     rejects a conflicting actor. Any other value is refused loudly - an
+#     unknown actor is a wiring bug, not a third role.
 #   - Staleness: the recorded pid is the long-lived supervising process (the
 #     session-lock holder, or FM_LEASE_HOLDER_PID - see bin/fm-lease.sh), and
 #     both actors live inside that one pi process, so a dead recorded pid
@@ -57,14 +59,27 @@ FM_LEASE_REFUSE_EXIT=6
 # fm_lease_actor: print the current actor after validating it. Returns 1 (with
 # stderr) for an unknown FM_SUPERVISION_ACTOR value.
 fm_lease_actor() {
-  local actor=${FM_SUPERVISION_ACTOR:-main}
+  local actor=${FM_SUPERVISION_ACTOR:-main} active_generation branch_generation
   case "$actor" in
-    main|branch) printf '%s\n' "$actor" ;;
+    main|branch) ;;
     *)
       echo "error: unknown FM_SUPERVISION_ACTOR '$actor' (expected main or branch)" >&2
       return 1
       ;;
   esac
+  branch_generation=${FM_LEASE_GENERATION:-${FM_PI_BRANCH_GENERATION:-}}
+  if [ -n "$branch_generation" ]; then
+    active_generation=$(cat "$STATE/.pi-branch-generation" 2>/dev/null || true)
+    if [ -n "$active_generation" ] && [ "$branch_generation" = "$active_generation" ]; then
+      if [ "$actor" != branch ]; then
+        echo "error: actor override refused - the active branch generation cannot impersonate main" >&2
+        return 1
+      fi
+      printf '%s\n' branch
+      return 0
+    fi
+  fi
+  printf '%s\n' "$actor"
 }
 
 # fm_lease_valid_id <id>: 0 iff the task/resource id is safe to embed in a
