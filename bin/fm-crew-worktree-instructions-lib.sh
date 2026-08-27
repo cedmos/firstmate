@@ -29,15 +29,17 @@
 # per-worktree `core.hooksPath`, so the primary checkout's hooks are never
 # touched.
 # fm_remove_crew_worktree_instructions undoes all of it: skip-worktree bits,
-# the committed file contents, the saved sidecars, and the guard. A sidecar is
-# the only durable copy of the edits the overlay displaced and info/exclude
-# hides it from the pooled clean check, so removal folds it back onto its
-# instruction file as ordinary uncommitted work rather than deleting it: the
-# next worker in the same pooled slot never inherits the file, and the refresh
-# refuses instead of discarding the work.
-# bin/fm-spawn.sh calls it before
-# it refreshes a pooled worktree, so a slot returned with the overlay still on
-# it self-heals instead of wedging the next `git reset --hard`.
+# the committed file contents, the saved sidecars, and the guard. An instruction
+# file the worker edited on top of the overlay is left alone rather than checked
+# out away, because skip-worktree made that edit the only copy of the work.
+# A sidecar is the only durable copy of the edits the overlay displaced and
+# info/exclude hides it from the pooled clean check, so removal folds it back
+# onto its instruction file as ordinary uncommitted work rather than deleting
+# it: the next worker in the same pooled slot never inherits the file, and the
+# refresh refuses instead of discarding the work.
+# bin/fm-spawn.sh calls it before it refreshes a pooled worktree, so a slot
+# returned with the overlay still on it self-heals instead of wedging the next
+# `git reset --hard`.
 # A secondmate home, a primary checkout, and a non-firstmate project are
 # left untouched.
 # Spawn refuses when the overlay cannot be installed or still presents
@@ -387,10 +389,20 @@ fm_remove_crew_worktree_instructions() {  # <worktree>
         failed=1
         continue
       fi
-      if ! git -C "$wt" checkout HEAD -- "$rel"; then
-        echo "error: could not restore the committed $rel in $wt" >&2
-        failed=1
-        continue
+      # A crewmate can edit the overlaid file in place, and skip-worktree makes
+      # that edit the only copy of the work. Restore the committed file only
+      # when the working copy is still the untouched overlay; otherwise clearing
+      # the bit already turns the edit into visible uncommitted work, and the
+      # pooled clean check refuses on it instead of it being checked out away.
+      if fm_crew_file_is_installed_overlay "$wt" "$rel" ||
+        ! fm_crew_file_differs_from_head "$wt" "$rel"; then
+        if ! git -C "$wt" checkout HEAD -- "$rel"; then
+          echo "error: could not restore the committed $rel in $wt" >&2
+          failed=1
+          continue
+        fi
+      else
+        echo "warning: $rel in $wt was edited on top of the crew overlay; leaving those edits as uncommitted work instead of restoring the committed file" >&2
       fi
     fi
     sidecar=$(fm_crew_sidecar_rel "$rel")

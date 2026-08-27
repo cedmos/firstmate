@@ -451,6 +451,35 @@ test_spawn_refuses_a_pool_holding_saved_instruction_work() {
   pass "spawn refuses a pooled slot whose saved instruction work would otherwise be discarded"
 }
 
+test_removal_keeps_a_direct_overlay_edit_as_visible_work() {
+  local repo wt
+  repo="$TMP_ROOT/overlay-edit-repo"
+  wt="$TMP_ROOT/overlay-edit-wt"
+  overlaid_worktree "$repo" "$wt"
+  printf '%s\n' 'crew work written straight onto the overlaid AGENTS.md' >> "$wt/AGENTS.md"
+  fm_remove_crew_worktree_instructions "$wt" 2>/dev/null || fail "overlay removal failed"
+  assert_grep 'crew work written straight onto the overlaid AGENTS.md' "$wt/AGENTS.md" \
+    "overlay removal destroyed the crew's direct edit to the overlaid AGENTS.md"
+  assert_not_skip_worktree "$wt" AGENTS.md "removal left AGENTS.md skip-worktree"
+  assert_contains "$(git -C "$wt" status --porcelain)" 'AGENTS.md' \
+    "the surviving AGENTS.md edit is still invisible to the pooled clean check"
+  pass "overlay removal keeps a direct edit to the overlaid file as visible uncommitted work"
+}
+
+test_spawn_refuses_a_pool_holding_a_direct_overlay_edit() {
+  local out status
+  make_spawn_case "$TMP_ROOT/overlay-edit-spawn-case"
+  out=$(spawn_into_pool 'crew-role-overlay-edit-a1'); status=$?
+  expect_code 0 "$status" "first spawn into the pool should succeed: $out"
+  printf '%s\n' 'crew work the next spawn must not silently destroy' >> "$SPAWN_POOL/AGENTS.md"
+  out=$(spawn_into_pool 'crew-role-overlay-edit-b2'); status=$?
+  [ "$status" -ne 0 ] || fail "spawn reused a pool whose overlaid AGENTS.md was edited: $out"
+  assert_contains "$out" 'not clean' "spawn refusal did not name the uncommitted work it protected"
+  assert_grep 'crew work the next spawn must not silently destroy' "$SPAWN_POOL/AGENTS.md" \
+    "the refused spawn still destroyed the previous crew's direct AGENTS.md edit"
+  pass "spawn refuses a pooled slot whose overlaid instruction file carries crew edits"
+}
+
 test_untracked_instruction_file_is_saved_before_overlay() {
   local repo wt out status
   repo="$TMP_ROOT/untracked-repo"
@@ -579,8 +608,10 @@ test_ensure_agents_md_stays_a_no_op_after_overlay
 test_commit_guard_refuses_committing_the_overlay
 test_commit_guard_refuses_while_a_saved_sidecar_survives
 test_removal_folds_saved_sidecars_back_into_visible_work
+test_removal_keeps_a_direct_overlay_edit_as_visible_work
 test_untracked_instruction_file_is_saved_before_overlay
 test_removal_unwedges_a_pooled_reset
 test_spawn_overlays_firstmate_shaped_pool
 test_spawn_reuses_a_pool_the_previous_crew_overlaid
 test_spawn_refuses_a_pool_holding_saved_instruction_work
+test_spawn_refuses_a_pool_holding_a_direct_overlay_edit
