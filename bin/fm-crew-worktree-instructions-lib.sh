@@ -29,9 +29,12 @@
 # per-worktree `core.hooksPath`, so the primary checkout's hooks are never
 # touched.
 # fm_remove_crew_worktree_instructions undoes all of it: skip-worktree bits,
-# the committed file contents, the saved sidecars, and the guard. A sidecar
-# that outlived its task would otherwise be handed to the next worker in the
-# same pooled slot as its own in-progress work.
+# the committed file contents, the saved sidecars, and the guard. A sidecar is
+# the only durable copy of the edits the overlay displaced and info/exclude
+# hides it from the pooled clean check, so removal folds it back onto its
+# instruction file as ordinary uncommitted work rather than deleting it: the
+# next worker in the same pooled slot never inherits the file, and the refresh
+# refuses instead of discarding the work.
 # bin/fm-spawn.sh calls it before
 # it refreshes a pooled worktree, so a slot returned with the overlay still on
 # it self-heals instead of wedging the next `git reset --hard`.
@@ -179,14 +182,17 @@ fm_crew_exclude_path() {  # <worktree> <rel>
   grep -qxF "$rel" "$excl" 2>/dev/null || printf '%s\n' "$rel" >> "$excl"
 }
 
-# Return 0 when the working copy of <rel> differs from the committed blob.
+# Return 0 when the working copy of <rel> holds content no commit in this
+# worktree already carries: a different committed blob, or no committed blob at
+# all because the file is untracked or new since HEAD. A missing HEAD blob is
+# the strongest case for saving, not a reason to skip it.
 # Compares hashes rather than asking `git diff`, because skip-worktree makes
 # git report a modified instruction file as unchanged.
 fm_crew_file_differs_from_head() {  # <worktree> <rel>
   local wt=$1 rel=$2 head_hash disk_hash
-  head_hash=$(git -C "$wt" rev-parse --verify --quiet "HEAD:$rel" 2>/dev/null) || return 1
   disk_hash=$(git -C "$wt" hash-object --no-filters -- "$wt/$rel" 2>/dev/null) || return 1
-  [ -n "$head_hash" ] && [ -n "$disk_hash" ] || return 1
+  [ -n "$disk_hash" ] || return 1
+  head_hash=$(git -C "$wt" rev-parse --verify --quiet "HEAD:$rel" 2>/dev/null || true)
   [ "$head_hash" != "$disk_hash" ]
 }
 
@@ -358,30 +364,54 @@ fm_crew_remove_commit_guard() {  # <worktree>
   }
 }
 
+fm_crew_sidecar_rel() {  # <rel>
+  case $1 in
+    CLAUDE.md) printf '%s\n' "$FM_CREW_CLAUDE_WIP" ;;
+    *) printf '%s\n' "$FM_CREW_AGENTS_WIP" ;;
+  esac
+}
+
 # Undo the overlay: clear the skip-worktree bits, restore the committed
-# instruction files, and drop the commit guard.
+# instruction files, fold any saved sidecar back onto its instruction file, and
+# drop the commit guard.
 # A worktree that never carried the overlay is a no-op, so a pooled slot can
 # call this unconditionally before it refreshes its base.
 fm_remove_crew_worktree_instructions() {  # <worktree>
-  local wt=${1:-} rel failed=0
+  local wt=${1:-} rel sidecar failed=0
   [ -n "$wt" ] && [ -d "$wt" ] || return 0
   git -C "$wt" rev-parse --git-dir >/dev/null 2>&1 || return 0
   for rel in $FM_CREW_INSTRUCTION_FILES; do
-    fm_crew_is_skip_worktree "$wt" "$rel" || continue
-    if ! git -C "$wt" update-index --no-skip-worktree -- "$rel"; then
-      echo "error: could not clear the skip-worktree bit on $rel in $wt" >&2
+    if fm_crew_is_skip_worktree "$wt" "$rel"; then
+      if ! git -C "$wt" update-index --no-skip-worktree -- "$rel"; then
+        echo "error: could not clear the skip-worktree bit on $rel in $wt" >&2
+        failed=1
+        continue
+      fi
+      if ! git -C "$wt" checkout HEAD -- "$rel"; then
+        echo "error: could not restore the committed $rel in $wt" >&2
+        failed=1
+        continue
+      fi
+    fi
+    sidecar=$(fm_crew_sidecar_rel "$rel")
+    [ -e "$wt/$sidecar" ] || continue
+    # The sidecar holds the only durable copy of the in-progress edits the
+    # overlay displaced. Put them back on the instruction file so they are
+    # visible uncommitted work again; deleting the sidecar here would drop them
+    # where no clean check can see the loss.
+    if fm_crew_file_differs_from_head "$wt" "$rel" &&
+      ! fm_crew_file_is_installed_overlay "$wt" "$rel"; then
+      echo "error: $sidecar and $rel both hold in-progress edits in $wt; refusing to discard either" >&2
       failed=1
       continue
     fi
-    if ! git -C "$wt" checkout HEAD -- "$rel"; then
-      echo "error: could not restore the committed $rel in $wt" >&2
+    if ! mv -f "$wt/$sidecar" "$wt/$rel"; then
+      echo "error: could not restore the in-progress $rel saved in $sidecar in $wt" >&2
       failed=1
+      continue
     fi
+    echo "warning: restored the in-progress $rel saved in $sidecar in $wt" >&2
   done
-  if ! rm -f "$wt/$FM_CREW_AGENTS_WIP" "$wt/$FM_CREW_CLAUDE_WIP"; then
-    echo "error: could not remove the saved instruction sidecars in $wt" >&2
-    failed=1
-  fi
   fm_crew_remove_commit_guard "$wt" || failed=1
   [ "$failed" -eq 0 ]
 }

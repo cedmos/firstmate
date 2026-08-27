@@ -411,7 +411,7 @@ test_commit_guard_refuses_while_a_saved_sidecar_survives() {
   pass "a commit made while a relaunch sidelined instruction-file work fails loudly"
 }
 
-test_removal_drops_saved_sidecars() {
+test_removal_folds_saved_sidecars_back_into_visible_work() {
   local repo wt
   repo="$TMP_ROOT/sidecar-reuse-repo"
   wt="$TMP_ROOT/sidecar-reuse-wt"
@@ -421,12 +421,54 @@ test_removal_drops_saved_sidecars() {
   printf '%s\n' 'work belonging to the previous task' >> "$wt/AGENTS.md"
   fm_install_crew_worktree_instructions "$wt" 2>/dev/null || fail "overlay reinstall failed"
   assert_present "$wt/.fm-agents-md-edit" "fixture did not produce a saved sidecar"
-  fm_remove_crew_worktree_instructions "$wt" || fail "overlay removal failed"
-  assert_absent "$wt/.fm-agents-md-edit" "overlay removal kept the previous task's saved AGENTS.md edits"
+  fm_remove_crew_worktree_instructions "$wt" 2>/dev/null || fail "overlay removal failed"
+  assert_absent "$wt/.fm-agents-md-edit" "the previous task's sidecar was handed to the next worker"
   assert_absent "$wt/.fm-claude-md-edit" "overlay removal kept a saved CLAUDE.md sidecar"
-  fm_install_crew_worktree_instructions "$wt" || fail "overlay reinstall after removal failed"
-  assert_absent "$wt/.fm-agents-md-edit" "a previous task's sidecar reappeared for the next worker"
-  pass "saved instruction sidecars do not survive overlay removal into the next task"
+  assert_grep 'work belonging to the previous task' "$wt/AGENTS.md" \
+    "overlay removal destroyed the only durable copy of the saved AGENTS.md edits"
+  assert_contains "$(git -C "$wt" status --porcelain)" 'AGENTS.md' \
+    "restored AGENTS.md work is still invisible to the pooled clean check"
+  pass "overlay removal folds a saved sidecar back into visible uncommitted work"
+}
+
+test_spawn_refuses_a_pool_holding_saved_instruction_work() {
+  local out status
+  make_spawn_case "$TMP_ROOT/sidecar-spawn-case"
+  out=$(spawn_into_pool 'crew-role-sidecar-a1'); status=$?
+  expect_code 0 "$status" "first spawn into the pool should succeed: $out"
+  git -C "$SPAWN_POOL" update-index --no-skip-worktree -- AGENTS.md \
+    || fail "documented restore could not clear skip-worktree"
+  git -C "$SPAWN_POOL" checkout HEAD -- AGENTS.md || fail "documented restore failed"
+  printf '%s\n' 'crew work the next spawn must not silently destroy' >> "$SPAWN_POOL/AGENTS.md"
+  fm_install_crew_worktree_instructions "$SPAWN_POOL" 2>/dev/null \
+    || fail "relaunch overlay reinstall failed"
+  assert_present "$SPAWN_POOL/.fm-agents-md-edit" "fixture did not sideline the crew's AGENTS.md work"
+  out=$(spawn_into_pool 'crew-role-sidecar-b2'); status=$?
+  [ "$status" -ne 0 ] || fail "spawn reused a pool still holding saved instruction work: $out"
+  assert_contains "$out" 'not clean' "spawn refusal did not name the uncommitted work it protected"
+  assert_grep 'crew work the next spawn must not silently destroy' "$SPAWN_POOL/AGENTS.md" \
+    "the refused spawn still destroyed the previous crew's saved AGENTS.md work"
+  pass "spawn refuses a pooled slot whose saved instruction work would otherwise be discarded"
+}
+
+test_untracked_instruction_file_is_saved_before_overlay() {
+  local repo wt out status
+  repo="$TMP_ROOT/untracked-repo"
+  wt="$TMP_ROOT/untracked-wt"
+  make_firstmate_repo "$repo"
+  make_linked_worktree "$repo" "$wt"
+  git -C "$wt" rm -q --cached CLAUDE.md || fail "fixture could not untrack CLAUDE.md"
+  git -C "$wt" commit -qm 'drop CLAUDE.md from HEAD' || fail "fixture commit failed"
+  printf '%s\n' 'in-progress CLAUDE.md that HEAD has never seen' > "$wt/CLAUDE.md"
+  [ -z "$(git -C "$wt" rev-parse --verify --quiet HEAD:CLAUDE.md)" ] \
+    || fail "fixture did not produce an instruction file without a HEAD blob"
+  out=$(fm_install_crew_worktree_instructions "$wt" 2>&1); status=$?
+  [ "$status" -ne 0 ] || fail "overlay of an untracked instruction file should refuse: $out"
+  assert_present "$wt/.fm-claude-md-edit" \
+    "an instruction file with no HEAD blob was overwritten without being saved"
+  assert_grep 'in-progress CLAUDE.md that HEAD has never seen' "$wt/.fm-claude-md-edit" \
+    "the saved sidecar omitted the untracked CLAUDE.md content"
+  pass "an instruction file with no HEAD blob is saved before the overlay replaces it"
 }
 
 test_removal_unwedges_a_pooled_reset() {
@@ -536,7 +578,9 @@ test_restored_agents_md_commits_the_edit
 test_ensure_agents_md_stays_a_no_op_after_overlay
 test_commit_guard_refuses_committing_the_overlay
 test_commit_guard_refuses_while_a_saved_sidecar_survives
-test_removal_drops_saved_sidecars
+test_removal_folds_saved_sidecars_back_into_visible_work
+test_untracked_instruction_file_is_saved_before_overlay
 test_removal_unwedges_a_pooled_reset
 test_spawn_overlays_firstmate_shaped_pool
 test_spawn_reuses_a_pool_the_previous_crew_overlaid
+test_spawn_refuses_a_pool_holding_saved_instruction_work
